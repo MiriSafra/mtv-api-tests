@@ -17,6 +17,7 @@ from ocp_resources.storage_map import StorageMap
 from packaging.version import InvalidVersion, Version
 from paramiko.ssh_exception import AuthenticationException, ChannelException, NoValidConnectionsError, SSHException
 from pyhelper_utils.exceptions import CommandExecFailed
+from pyhelper_utils.shell import run_ssh_commands
 from pytest_testconfig import py_config
 from simple_logger.logger import get_logger
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
@@ -111,6 +112,98 @@ def check_ssh_connectivity(
             raise ConnectionError("SSH connectivity test failed: Host is not connective")
 
         LOGGER.info(f"SSH connectivity to VM {vm_name} verified successfully")
+
+
+def verify_shared_disk_data(
+    vm1_name: str,
+    vm2_name: str,
+    vm_ssh_connections: SSHConnectionManager,
+    source_provider_data: dict[str, Any],
+    vm1_info: dict[str, Any],
+    vm2_info: dict[str, Any],
+    shared_disk_device: str = "/dev/vdc",
+) -> None:
+    """Verify shared disk is accessible from both VMs by writing/reading data.
+
+    Args:
+        vm1_name (str): Name of the first VM (owner).
+        vm2_name (str): Name of the second VM (consumer).
+        vm_ssh_connections (SSHConnectionManager): SSH connection manager.
+        source_provider_data (dict[str, Any]): Provider configuration from .providers.json.
+        vm1_info (dict[str, Any]): VM1 information including OS type.
+        vm2_info (dict[str, Any]): VM2 information including OS type.
+        shared_disk_device (str): Shared disk device path. Defaults to "/dev/vdc".
+
+    Raises:
+        AssertionError: If shared disk data verification fails.
+    """
+    LOGGER.info(f"Verifying shared disk between {vm1_name} and {vm2_name}")
+
+    vm1_user, vm1_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm1_info)
+    vm2_user, vm2_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm2_info)
+
+    ssh_vm1 = vm_ssh_connections.create(vm_name=vm1_name, username=vm1_user, password=vm1_pass)
+    ssh_vm2 = vm_ssh_connections.create(vm_name=vm2_name, username=vm2_user, password=vm2_pass)
+
+    mount_point = "/mnt/shared_disk"
+    test_file = f"{mount_point}/test.txt"
+    partition = f"{shared_disk_device}1"
+
+    # VM1: Prepare and write
+    with ssh_vm1:
+        run_ssh_commands(
+            ssh_vm1.rrmngmnt_host,
+            [
+                f"echo -e 'n\\np\\n1\\n\\n\\nw' | sudo fdisk {shared_disk_device} || true",
+                f"sudo mkfs.ext4 -F {partition}",
+                f"sudo mkdir -p {mount_point}",
+                f"sudo mount {partition} {mount_point}",
+                f"echo 'Data from VM1' | sudo tee {test_file}",
+                "sudo sync",
+            ],
+        )
+
+    # VM2: Mount and verify VM1's data
+    with ssh_vm2:
+        results = run_ssh_commands(
+            ssh_vm2.rrmngmnt_host,
+            [
+                "sudo partprobe",
+                f"sudo mkdir -p {mount_point}",
+                f"sudo mount {partition} {mount_point}",
+                f"cat {test_file}",
+            ],
+        )
+        vm2_data = results[-1].out.strip()
+        assert "Data from VM1" in vm2_data, f"VM2 cannot read VM1's data: {vm2_data}"
+
+    # VM2: Append data
+    with ssh_vm2:
+        run_ssh_commands(
+            ssh_vm2.rrmngmnt_host,
+            [
+                f"echo 'Data from VM2' | sudo tee -a {test_file}",
+                "sudo sync",
+                f"sudo umount {mount_point}",
+            ],
+        )
+
+    # VM1: Remount and verify bidirectional access
+    with ssh_vm1:
+        results = run_ssh_commands(
+            ssh_vm1.rrmngmnt_host,
+            [
+                f"sudo umount {mount_point}",
+                f"sudo mount {partition} {mount_point}",
+                f"cat {test_file}",
+                f"sudo umount {mount_point}",
+            ],
+        )
+        final_data = results[2].out.strip()
+        assert "Data from VM1" in final_data, f"VM1 lost its data: {final_data}"
+        assert "Data from VM2" in final_data, f"VM1 cannot read VM2's data: {final_data}"
+
+    LOGGER.info("Shared disk verification successful")
 
 
 def _parse_windows_network_config(ipconfig_output: str) -> dict[str, dict[str, Any]]:

@@ -9,8 +9,9 @@ from utilities.mtv_migration import (
     execute_migration,
     get_network_migration_map,
     get_storage_migration_map,
+    verify_pvc_count_for_vm,
 )
-from utilities.post_migration import check_vms
+from utilities.post_migration import check_vms, verify_shared_disk_data
 from utilities.utils import get_value_from_py_config, populate_vm_ids
 
 
@@ -278,4 +279,197 @@ class TestColdRemoteOcp:
             source_vms_namespace=source_vms_namespace,
             source_provider_inventory=source_provider_inventory,
             vm_ssh_connections=vm_ssh_connections,
+        )
+
+
+@pytest.mark.incremental
+@pytest.mark.parametrize(
+    "class_plan_config",
+    [
+        pytest.param(
+            py_config["tests_params"]["test_shared_disk_migration"],
+        )
+    ],
+    indirect=True,
+    ids=["shared-disk"],
+)
+@pytest.mark.usefixtures("cleanup_migrated_vms")
+class TestSharedDiskMigration:
+    """MTV-4548: Verify migration with shared disks (migrateSharedDisks: false)."""
+
+    storage_map: StorageMap
+    network_map: NetworkMap
+    plan_resource_vm1: Plan
+    plan_resource_vm2: Plan
+
+    def test_create_storagemap(
+        self,
+        prepared_plan,
+        fixture_store,
+        ocp_admin_client,
+        source_provider,
+        destination_provider,
+        source_provider_inventory,
+        target_namespace,
+    ):
+        """Create StorageMap resource for both VMs."""
+        vms = [vm["name"] for vm in prepared_plan["virtual_machines"]]
+        self.__class__.storage_map = get_storage_migration_map(
+            fixture_store=fixture_store,
+            source_provider=source_provider,
+            destination_provider=destination_provider,
+            source_provider_inventory=source_provider_inventory,
+            ocp_admin_client=ocp_admin_client,
+            target_namespace=target_namespace,
+            vms=vms,
+        )
+        assert self.storage_map, "StorageMap creation failed"
+
+    def test_create_networkmap(
+        self,
+        prepared_plan,
+        fixture_store,
+        ocp_admin_client,
+        source_provider,
+        destination_provider,
+        source_provider_inventory,
+        target_namespace,
+        multus_network_name,
+    ):
+        """Create NetworkMap resource for both VMs."""
+        vms = [vm["name"] for vm in prepared_plan["virtual_machines"]]
+        self.__class__.network_map = get_network_migration_map(
+            fixture_store=fixture_store,
+            source_provider=source_provider,
+            destination_provider=destination_provider,
+            source_provider_inventory=source_provider_inventory,
+            ocp_admin_client=ocp_admin_client,
+            target_namespace=target_namespace,
+            multus_network_name=multus_network_name,
+            vms=vms,
+        )
+        assert self.network_map, "NetworkMap creation failed"
+
+    def test_create_plan_vm1(
+        self,
+        prepared_plan_1,
+        fixture_store,
+        ocp_admin_client,
+        source_provider,
+        destination_provider,
+        target_namespace,
+        source_provider_inventory,
+    ):
+        """Create MTV Plan CR resource for VM1 (migrateSharedDisks=true)."""
+        populate_vm_ids(prepared_plan_1, source_provider_inventory)
+        migrate_shared_disks = prepared_plan_1["virtual_machines"][0].get("migrate_shared_disks")
+
+        self.__class__.plan_resource_vm1 = create_plan_resource(
+            ocp_admin_client=ocp_admin_client,
+            fixture_store=fixture_store,
+            source_provider=source_provider,
+            destination_provider=destination_provider,
+            storage_map=self.storage_map,
+            network_map=self.network_map,
+            virtual_machines_list=prepared_plan_1["virtual_machines"],
+            target_namespace=target_namespace,
+            warm_migration=prepared_plan_1.get("warm_migration", False),
+            migrate_shared_disks=migrate_shared_disks,
+            target_power_state=prepared_plan_1.get("target_power_state"),
+        )
+        assert self.plan_resource_vm1, "Plan creation for VM1 failed"
+
+    def test_migrate_vm1(
+        self,
+        fixture_store,
+        ocp_admin_client,
+        target_namespace,
+    ):
+        """Execute migration for VM1."""
+        execute_migration(
+            ocp_admin_client=ocp_admin_client,
+            fixture_store=fixture_store,
+            plan=self.plan_resource_vm1,
+            target_namespace=target_namespace,
+        )
+
+    def test_create_plan_vm2(
+        self,
+        prepared_plan_2,
+        fixture_store,
+        ocp_admin_client,
+        source_provider,
+        destination_provider,
+        target_namespace,
+        source_provider_inventory,
+    ):
+        """Create MTV Plan CR resource for VM2 (migrateSharedDisks=false)."""
+        populate_vm_ids(prepared_plan_2, source_provider_inventory)
+        migrate_shared_disks = prepared_plan_2["virtual_machines"][0].get("migrate_shared_disks")
+
+        self.__class__.plan_resource_vm2 = create_plan_resource(
+            ocp_admin_client=ocp_admin_client,
+            fixture_store=fixture_store,
+            source_provider=source_provider,
+            destination_provider=destination_provider,
+            storage_map=self.storage_map,
+            network_map=self.network_map,
+            virtual_machines_list=prepared_plan_2["virtual_machines"],
+            target_namespace=target_namespace,
+            warm_migration=prepared_plan_2.get("warm_migration", False),
+            migrate_shared_disks=migrate_shared_disks,
+            target_power_state=prepared_plan_2.get("target_power_state"),
+        )
+        assert self.plan_resource_vm2, "Plan creation for VM2 failed"
+
+    def test_migrate_vm2(
+        self,
+        fixture_store,
+        ocp_admin_client,
+        target_namespace,
+    ):
+        """Execute migration for VM2."""
+        execute_migration(
+            ocp_admin_client=ocp_admin_client,
+            fixture_store=fixture_store,
+            plan=self.plan_resource_vm2,
+            target_namespace=target_namespace,
+        )
+
+    def test_verify_pvc_count(
+        self,
+        prepared_plan,
+        ocp_admin_client,
+        target_namespace,
+    ):
+        """Verify VM2 has only 2 PVCs (no duplicate shared disk PVC)."""
+        expected_pvc_count = prepared_plan["expected_pvc_count_vm2"]
+        verify_pvc_count_for_vm(
+            ocp_admin_client=ocp_admin_client,
+            target_namespace=target_namespace,
+            plan_name=self.plan_resource_vm2.name,
+            expected_pvc_count=expected_pvc_count,
+        )
+
+    def test_verify_shared_disk_data(
+        self,
+        prepared_plan,
+        vm_ssh_connections,
+        source_provider_data,
+    ):
+        """Verify shared disk read/write access from both VMs."""
+        vm1_name = prepared_plan["virtual_machines"][0]["name"]
+        vm2_name = prepared_plan["virtual_machines"][1]["name"]
+        shared_disk_device = prepared_plan["shared_disk_device"]
+        vm1_info = prepared_plan["source_vms_data"][vm1_name]
+        vm2_info = prepared_plan["source_vms_data"][vm2_name]
+
+        verify_shared_disk_data(
+            vm1_name=vm1_name,
+            vm2_name=vm2_name,
+            vm_ssh_connections=vm_ssh_connections,
+            source_provider_data=source_provider_data,
+            vm1_info=vm1_info,
+            vm2_info=vm2_info,
+            shared_disk_device=shared_disk_device,
         )
