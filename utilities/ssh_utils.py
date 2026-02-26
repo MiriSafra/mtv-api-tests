@@ -246,6 +246,9 @@ class VMSSHConnection:
         self.rrmngmnt_host.users.append(user)
         self.rrmngmnt_user = user
 
+        # CRITICAL: Set port on the executor factory so ALL executors use the port-forward port
+        self.rrmngmnt_host.executor_factory.port = self.local_port
+
         connected = False
         try:
             executor = self.rrmngmnt_host.executor(user=user)

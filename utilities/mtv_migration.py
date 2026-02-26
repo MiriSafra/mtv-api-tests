@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any
 
 from ocp_resources.migration import Migration
 from ocp_resources.network_map import NetworkMap
-from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
 from ocp_resources.plan import Plan
 from ocp_resources.storage_map import StorageMap
 from pytest_testconfig import py_config
@@ -576,45 +575,6 @@ def verify_vm_disk_count(destination_provider, plan, target_namespace):
             f"Expected {expected_disks} disks on migrated VM '{source_vm_name}', but found {num_disks_migrated}."
         )
         LOGGER.info(f"Successfully verified {expected_disks} disks on the migrated VM '{source_vm_name}'.")
-
-
-def verify_pvc_count_for_vm(
-    ocp_admin_client: DynamicClient,
-    target_namespace: str,
-    plan_name: str,
-    expected_pvc_count: int,
-) -> None:
-    """Verify the number of PVCs created for a migration plan.
-
-    Used for shared disk testing: the consumer VM plan should create fewer PVCs
-    because it reuses the shared disk PVC from the owner VM plan.
-
-    Args:
-        ocp_admin_client (DynamicClient): OpenShift admin client.
-        target_namespace (str): Namespace where PVCs were created.
-        plan_name (str): Plan name to filter PVCs by (matched as substring of PVC name).
-        expected_pvc_count (int): Expected number of PVCs.
-
-    Raises:
-        AssertionError: If actual PVC count doesn't match expected count.
-    """
-    LOGGER.info(f"Verifying PVC count for plan '{plan_name}' in namespace '{target_namespace}'.")
-
-    all_pvcs = list(PersistentVolumeClaim.get(dyn_client=ocp_admin_client, namespace=target_namespace))
-    plan_pvcs = [pvc for pvc in all_pvcs if plan_name in pvc.name]
-
-    actual_count = len(plan_pvcs)
-    LOGGER.info(f"Found {actual_count} PVCs for plan '{plan_name}'. Expected: {expected_pvc_count}")
-
-    if actual_count != expected_pvc_count:
-        pvc_names = [pvc.name for pvc in plan_pvcs]
-        LOGGER.error(f"PVC count mismatch. Found PVCs: {pvc_names}")
-
-    assert actual_count == expected_pvc_count, (
-        f"Expected {expected_pvc_count} PVCs for plan '{plan_name}', but found {actual_count}"
-    )
-
-    LOGGER.info(f"Successfully verified {expected_pvc_count} PVCs for plan '{plan_name}'.")
 
 
 def wait_for_concurrent_migration_execution(plan_list: list[Plan], timeout: int = 120) -> None:

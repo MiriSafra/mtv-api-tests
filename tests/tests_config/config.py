@@ -493,16 +493,18 @@ tests_params: dict = {
     "test_shared_disk_migration": {
         "virtual_machines": [
             {
-                "name": "msafra-RHEL9-shared-1",
+                 "name": "mtv-feature-shared-rhel1",
                 "source_vm_power": "off",
                 "guest_agent": True,
                 "migrate_shared_disks": True,
+                "target_power_state": "on",
             },
             {
-                "name": "msafra-RHEL9-shared-2",
+                "name": "mtv-feature-shared-rhel2",
                 "source_vm_power": "off",
                 "guest_agent": True,
                 "migrate_shared_disks": False,
+                "target_power_state": "on",
             },
         ],
         "warm_migration": False,

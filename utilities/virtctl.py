@@ -21,19 +21,33 @@ def _check_existing_virtctl(download_dir: Path) -> Path | None:
         download_dir: Directory where virtctl might be downloaded
 
     Returns:
-        Path to existing virtctl binary, or None if not found
+        Path to virtctl in download_dir (may be symlink), or None if not found
     """
-    # Check if virtctl is in PATH
-    existing_virtctl = shutil.which("virtctl")
-    if existing_virtctl:
-        LOGGER.info(f"virtctl already available in PATH at {existing_virtctl}")
-        return Path(existing_virtctl)
-
-    # Check if previously downloaded
     virtctl_binary = download_dir / "virtctl"
+
+    # Check if already in download_dir
     if virtctl_binary.exists() and os.access(virtctl_binary, os.X_OK):
         LOGGER.info(f"virtctl already exists at {virtctl_binary}")
         return virtctl_binary
+
+    # Check if virtctl is in PATH (from system installation)
+    existing_virtctl = shutil.which("virtctl")
+    if existing_virtctl:
+        LOGGER.info(f"virtctl found in PATH at {existing_virtctl}, creating symlink in {download_dir}")
+        try:
+            # Create symlink in download_dir for pytest-xdist workers to share
+            virtctl_binary.symlink_to(existing_virtctl)
+            LOGGER.info(f"Created symlink: {virtctl_binary} -> {existing_virtctl}")
+            return virtctl_binary
+        except FileExistsError:
+            # Race condition: another worker just created the symlink
+            if virtctl_binary.exists() and os.access(virtctl_binary, os.X_OK):
+                LOGGER.info(f"Symlink already exists at {virtctl_binary}")
+                return virtctl_binary
+            raise
+        except Exception as e:
+            LOGGER.warning(f"Failed to create symlink for virtctl: {e}. Will download from cluster instead.")
+            return None
 
     return None
 
