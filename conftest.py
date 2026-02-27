@@ -239,11 +239,14 @@ def pytest_sessionfinish(session, exitstatus):
     reporter.summary_stats()
 
     if session.config.getoption("analyze_with_ai"):
-        try:
-            LOGGER.info("Starting AI-powered test failure analysis")
-            enrich_junit_xml(session)
-        except Exception as exp:
-            LOGGER.warning(f"jenkins-job-insight: failed to enrich JUnit XML, original preserved. Error: {exp}")
+        if exitstatus == 0:
+            LOGGER.info("No test failures (exit code %d), skipping AI analysis", exitstatus)
+
+        else:
+            try:
+                enrich_junit_xml(session)
+            except Exception:
+                LOGGER.exception("Failed to enrich JUnit XML, original preserved")
 
 
 def pytest_collection_modifyitems(session, config, items):
