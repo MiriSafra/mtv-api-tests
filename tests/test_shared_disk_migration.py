@@ -1,4 +1,4 @@
-"""Shared disk migration tests (MTV-4548).
+"""Shared disk migration tests (MTV-454).
 
 Tests for migrating VMs with shared disks using the migrateSharedDisks flag.
 The owner VM (migrateSharedDisks=true) migrates the shared disk PVC, while
@@ -35,7 +35,7 @@ from utilities.utils import populate_vm_ids
 )
 @pytest.mark.usefixtures("cleanup_migrated_vms")
 class TestSharedDiskMigration:
-    """MTV-4548: Verify migration with shared disks (migrateSharedDisks: false)."""
+    """MTV-454: Verify migration with shared disks (owner and consumer VMs)."""
 
     storage_map: StorageMap
     network_map: NetworkMap
@@ -220,7 +220,6 @@ class TestSharedDiskMigration:
         source_provider,
         destination_provider,
         source_provider_data,
-        target_namespace,
         source_vms_namespace,
         source_provider_inventory,
         vm_ssh_connections,
