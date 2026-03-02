@@ -514,6 +514,28 @@ tests_params: dict = {
         "post_hook": {"expected_result": "fail"},
         "expected_migration_result": "fail",
     },
+    "test_shared_disk_migration": {
+        "virtual_machines": [
+            {
+                "name": "mtv-feature-shared-rhel1",
+                "source_vm_power": "off",
+                "guest_agent": True,
+                "migrate_shared_disks": True,
+                "target_power_state": "on",
+            },
+            {
+                "name": "mtv-feature-shared-rhel2",
+                "source_vm_power": "off",
+                "guest_agent": True,
+                "migrate_shared_disks": False,
+                "target_power_state": "on",
+            },
+        ],
+        "warm_migration": False,
+        "shared_disk_device": "/dev/vdc",
+        "expected_pvc_count_vm2": 2,
+        "target_power_state": "on",
+    },
 }
 
 for _dir in dir():

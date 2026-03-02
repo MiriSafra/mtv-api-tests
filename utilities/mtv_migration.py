@@ -151,6 +151,7 @@ def create_plan_resource(
     target_labels: dict[str, str] | None = None,
     target_affinity: dict[str, Any] | None = None,
     vm_target_namespace: str | None = None,
+    migrate_shared_disks: bool | None = None,
     target_power_state: str | None = None,
 ) -> Plan:
     """Create MTV Plan CR resource.
@@ -182,6 +183,7 @@ def create_plan_resource(
         target_labels (dict[str, str] | None): Optional custom labels to apply to migrated VM metadata. Defaults to None.
         target_affinity (dict[str, Any] | None): Optional Kubernetes pod affinity/anti-affinity configuration. Defaults to None.
         vm_target_namespace (str | None): Custom target namespace for VMs. Defaults to None.
+        migrate_shared_disks (bool | None): Whether to migrate shared disks. True for owner VM (creates PVC), False for consumer VM (reuses PVC). Defaults to None (omits field).
         target_power_state (str | None): Target power state for VMs after migration (e.g., 'on', 'off'). Defaults to None.
 
     Returns:
@@ -234,6 +236,9 @@ def create_plan_resource(
 
     if target_affinity:
         plan_kwargs["target_affinity"] = target_affinity
+
+    if migrate_shared_disks is not None:
+        plan_kwargs["migrate_shared_disks"] = migrate_shared_disks
 
     # Add copy-offload specific parameters if enabled
     if copyoffload:

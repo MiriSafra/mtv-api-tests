@@ -899,6 +899,14 @@ def prepared_plan(
                 vm_name_suffix=vm_name_suffix,
             )
 
+        # Track original VM names and cloned objects for shared disk relinking (only if needed)
+        # Check for `is not None` because the field can be True (owner VM) or False (consumer VM),
+        # and both need relinking. We only skip VMs without this field at all.
+        has_shared_disk_config = any(vm.get("migrate_shared_disks") is not None for vm in virtual_machines)
+        if has_shared_disk_config:
+            original_source_vm_names: list[str] = [vm["name"] for vm in virtual_machines]
+            cloned_vm_objects: list[Any] = []
+
         for vm in virtual_machines:
             # Get VM object first (without full vm_dict analysis)
             # Add enable_ctk flag for warm migrations
@@ -910,6 +918,8 @@ def prepared_plan(
                 session_uuid=fixture_store["session_uuid"],
                 clone_options=clone_options,
             )
+            if has_shared_disk_config:
+                cloned_vm_objects.append(provider_vm_api)
 
             # Power state control: "on" = start VM, "off" = stop VM, not set = leave unchanged
             source_vm_power = vm.get("source_vm_power")  # Optional - if not set, VM power state unchanged
@@ -944,6 +954,15 @@ def prepared_plan(
             vm["snapshots_before_migration"] = source_vm_details["snapshots_data"]
             # Store complete source VM data separately (keeps virtual_machines clean for Plan CR serialization)
             plan["source_vms_data"][vm["name"]] = source_vm_details
+
+        # Relink shared disks between clones (VMware-specific)
+        # When VMs with shared disks are cloned, each clone gets independent disk copies,
+        # breaking the shared disk relationship. This restores it on the clones.
+        if has_shared_disk_config and hasattr(source_provider, "relink_shared_disks"):
+            source_provider.relink_shared_disks(
+                source_vm_names=original_source_vm_names,
+                cloned_vms=cloned_vm_objects,
+            )
 
     # Create Hooks if configured
     create_hook_if_configured(plan, "pre_hook", "pre", fixture_store, ocp_admin_client, target_namespace)
