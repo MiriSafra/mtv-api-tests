@@ -246,7 +246,9 @@ class VMSSHConnection:
         self.rrmngmnt_host.users.append(user)
         self.rrmngmnt_user = user
 
-        # CRITICAL: Set port on the executor factory so ALL executors use the port-forward port
+        # CRITICAL: Set port on the executor factory so ALL executors use the port-forward port.
+        # Without this, run_ssh_commands() creates new executors that try to connect to port 22
+        # instead of the port-forward port, causing connection failures.
         self.rrmngmnt_host.executor_factory.port = self.local_port
 
         connected = False

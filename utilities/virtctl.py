@@ -35,7 +35,8 @@ def _check_existing_virtctl(download_dir: Path) -> Path | None:
     if existing_virtctl:
         LOGGER.info(f"virtctl found in PATH at {existing_virtctl}, creating symlink in {download_dir}")
         try:
-            # Create symlink in download_dir for pytest-xdist workers to share
+            # Create symlink in download_dir so pytest-xdist workers can find it.
+            # Workers don't share PATH but do share the download_dir via pytest-shared temp directory.
             virtctl_binary.symlink_to(existing_virtctl)
             LOGGER.info(f"Created symlink: {virtctl_binary} -> {existing_virtctl}")
             return virtctl_binary
