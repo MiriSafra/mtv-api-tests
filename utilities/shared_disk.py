@@ -71,7 +71,9 @@ def verify_shared_disk_data(
         # Note: Using 'tee' instead of shell redirect (>) to avoid quoting issues over SSH.
         # Shell redirect can fail silently due to permission and escaping problems.
         LOGGER.info("VM1: Writing test data")
-        run_ssh_commands(ssh_vm1.rrmngmnt_host, ["sh", "-c", f"echo 'Data from VM1' | sudo tee {test_file_vm1} > /dev/null"])
+        run_ssh_commands(
+            ssh_vm1.rrmngmnt_host, ["sh", "-c", f"echo 'Data from VM1' | sudo tee {test_file_vm1} > /dev/null"]
+        )
         run_ssh_commands(ssh_vm1.rrmngmnt_host, ["sudo", "sync"])
 
     # VM2: Mount shared disk and verify VM1's data
@@ -89,7 +91,9 @@ def verify_shared_disk_data(
 
         # Write test data from VM2
         LOGGER.info("VM2: Writing test data")
-        run_ssh_commands(ssh_vm2.rrmngmnt_host, ["sh", "-c", f"echo 'Data from VM2' | sudo tee {test_file_vm2} > /dev/null"])
+        run_ssh_commands(
+            ssh_vm2.rrmngmnt_host, ["sh", "-c", f"echo 'Data from VM2' | sudo tee {test_file_vm2} > /dev/null"]
+        )
         run_ssh_commands(ssh_vm2.rrmngmnt_host, ["sudo", "sync"])
 
         # Unmount to prevent concurrent access when VM1 remounts

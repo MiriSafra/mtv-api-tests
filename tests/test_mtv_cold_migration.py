@@ -279,5 +279,3 @@ class TestColdRemoteOcp:
             source_provider_inventory=source_provider_inventory,
             vm_ssh_connections=vm_ssh_connections,
         )
-
-
