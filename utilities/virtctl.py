@@ -46,7 +46,9 @@ def _check_existing_virtctl(download_dir: Path) -> Path | None:
                 LOGGER.info(f"Symlink already exists at {virtctl_binary}")
                 return virtctl_binary
             # File exists but is not executable (corrupted/partial download)
-            LOGGER.warning(f"virtctl binary exists at {virtctl_binary} but is not executable. Will download from cluster instead.")
+            LOGGER.warning(
+                f"virtctl binary exists at {virtctl_binary} but is not executable. Will download from cluster instead."
+            )
             return None
         except Exception as e:
             LOGGER.warning(f"Failed to create symlink for virtctl: {e}. Will download from cluster instead.")
