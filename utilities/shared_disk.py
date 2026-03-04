@@ -1,6 +1,6 @@
 """Shared disk migration utilities.
 
-This module provides utilities for testing and validating shared disk migrations (MTV-4548).
+This module provides utilities for testing and validating shared disk migrations (MTV-454).
 Includes functions for verifying shared disk accessibility between VMs and PVC count validation.
 """
 
