@@ -958,7 +958,12 @@ def prepared_plan(
         # Relink shared disks between clones (VMware-specific)
         # When VMs with shared disks are cloned, each clone gets independent disk copies,
         # breaking the shared disk relationship. This restores it on the clones.
-        if has_shared_disk_config and hasattr(source_provider, "relink_shared_disks"):
+        if has_shared_disk_config:
+            if not hasattr(source_provider, "relink_shared_disks"):
+                raise ValueError(
+                    f"Shared-disk migration requested, but provider '{source_provider.type}' "
+                    "does not implement relink_shared_disks"
+                )
             source_provider.relink_shared_disks(
                 source_vm_names=original_source_vm_names,
                 cloned_vms=cloned_vm_objects,
