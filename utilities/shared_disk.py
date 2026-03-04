@@ -146,7 +146,7 @@ def verify_pvc_count_for_vm(
     """
     LOGGER.info(f"Verifying PVC count for plan '{plan_name}' in namespace '{target_namespace}'.")
 
-    all_pvcs = list(PersistentVolumeClaim.get(dyn_client=ocp_admin_client, namespace=target_namespace))
+    all_pvcs = list(PersistentVolumeClaim.get(client=ocp_admin_client, namespace=target_namespace))
     plan_pvcs = [pvc for pvc in all_pvcs if plan_name in pvc.name]
 
     actual_count = len(plan_pvcs)
