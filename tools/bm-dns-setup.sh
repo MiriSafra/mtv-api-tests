@@ -62,7 +62,7 @@ get_domain_interface() {
     while IFS= read -r line; do
         if [[ "$line" =~ $link_re ]]; then
             current_iface="${BASH_REMATCH[1]}"
-        elif [[ -n "$current_iface" && "$line" =~ DNS\ Domain:.*${escaped_domain} ]]; then
+        elif [[ -n "$current_iface" && "$line" =~ DNS\ Domain:.*(^|[[:space:]])~?${escaped_domain}([[:space:]]|$) ]]; then
             found_iface="$current_iface"
             break
         fi
