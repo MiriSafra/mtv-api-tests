@@ -34,7 +34,7 @@ validate_ip() {
 
 validate_domain() {
     local domain="$1"
-    [[ "$domain" != *..* ]] || die "Invalid domain: $domain"
+    [[ "$domain" != *..* && "$domain" != *. ]] || die "Invalid domain: $domain"
 
     local label
     local -a labels
