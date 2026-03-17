@@ -34,8 +34,15 @@ validate_ip() {
 
 validate_domain() {
     local domain="$1"
-    [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || die "Invalid domain: $domain"
     [[ "$domain" != *..* ]] || die "Invalid domain: $domain"
+
+    local label
+    local -a labels
+    IFS='.' read -r -a labels <<< "$domain"
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 ]] || die "Invalid domain: $domain"
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || die "Invalid domain: $domain"
+    done
 }
 
 # --- Linux helpers (resolvectl) ---
