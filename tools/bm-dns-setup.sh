@@ -32,6 +32,12 @@ validate_ip() {
     [[ "$ip" =~ ^${octet}\.${octet}\.${octet}\.${octet}$ ]] || die "Invalid IP address: $ip"
 }
 
+validate_domain() {
+    local domain="$1"
+    [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || die "Invalid domain: $domain"
+    [[ "$domain" != *..* ]] || die "Invalid domain: $domain"
+}
+
 # --- Linux helpers (resolvectl) ---
 
 get_interface() {
@@ -48,6 +54,7 @@ get_interface() {
 
 get_domain_interface() {
     local domain="$1"
+    local escaped_domain="${domain//./\\.}"
     local current_iface=""
     local found_iface=""
 
@@ -55,7 +62,7 @@ get_domain_interface() {
     while IFS= read -r line; do
         if [[ "$line" =~ $link_re ]]; then
             current_iface="${BASH_REMATCH[1]}"
-        elif [[ -n "$current_iface" && "$line" =~ DNS\ Domain:.*${domain} ]]; then
+        elif [[ -n "$current_iface" && "$line" =~ DNS\ Domain:.*${escaped_domain} ]]; then
             found_iface="$current_iface"
             break
         fi
@@ -98,7 +105,7 @@ enable_macos() {
     sudo mkdir -p /etc/resolver
     printf 'nameserver %s\n' "$ip" | sudo tee "/etc/resolver/$domain" >/dev/null
     echo "DNS setup enabled. Verifying..."
-    sleep 1
+    sleep 1  # Allow macOS resolver cache to refresh
     scutil --dns | grep -A5 "$domain" || echo "Resolver added (may take a moment to activate)"
 }
 
@@ -150,20 +157,26 @@ case "$ACTION" in
         shift
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                --domain) DOMAIN="$2"; shift 2 ;;
+                --domain)
+                    [[ -n "${2:-}" ]] || die "--domain requires a value"
+                    DOMAIN="$2"; shift 2 ;;
                 *) die "Unknown option: $1" ;;
             esac
         done
         validate_ip "$IP"
+        validate_domain "$DOMAIN"
         run_enable "$IP" "$DOMAIN"
         ;;
     disable)
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                --domain) DOMAIN="$2"; shift 2 ;;
+                --domain)
+                    [[ -n "${2:-}" ]] || die "--domain requires a value"
+                    DOMAIN="$2"; shift 2 ;;
                 *) die "Unknown option: $1" ;;
             esac
         done
+        validate_domain "$DOMAIN"
         run_disable "$DOMAIN"
         ;;
 esac
