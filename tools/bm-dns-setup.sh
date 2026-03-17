@@ -113,7 +113,7 @@ enable_macos() {
     printf 'nameserver %s\n' "$ip" | sudo tee "/etc/resolver/$domain" >/dev/null
     echo "DNS setup enabled. Verifying..."
     sleep 1  # Allow macOS resolver cache to refresh
-    scutil --dns | grep -A5 "$domain" || echo "Resolver added (may take a moment to activate)"
+    scutil --dns | grep -F -A5 "$domain" || echo "Resolver added (may take a moment to activate)"
 }
 
 disable_macos() {
