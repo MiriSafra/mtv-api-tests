@@ -1,23 +1,35 @@
 #!/bin/bash
 set -euo pipefail
 
-USAGE="Usage: $(basename "$0") enable <bm-host-ip>
-       $(basename "$0") disable
+DOMAIN="mtv.local"
+
+USAGE="Usage: $(basename "$0") enable <bm-host-ip> [--domain <domain>]
+       $(basename "$0") disable [--domain <domain>]
 
 Configure DNS resolution for bare-metal host.
 Auto-detects OS (Linux uses resolvectl, macOS uses /etc/resolver).
 
+Options:
+  --domain <domain>  DNS domain to configure (default: $DOMAIN)
+
 Commands:
-  enable <ip>  Set the BM host IP as DNS server for mtv.local domain
+  enable <ip>  Set the BM host IP as DNS server for the domain
   disable      Revert DNS settings
 
 Examples:
   $(basename "$0") enable 10.46.248.80
+  $(basename "$0") enable 10.46.248.80 --domain custom.local
   $(basename "$0") disable"
 
 die() {
     echo "Error: $1" >&2
     exit 1
+}
+
+validate_ip() {
+    local ip="$1"
+    local octet="(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"
+    [[ "$ip" =~ ^${octet}\.${octet}\.${octet}\.${octet}$ ]] || die "Invalid IP address: $ip"
 }
 
 # --- Linux helpers (resolvectl) ---
@@ -34,7 +46,8 @@ get_interface() {
     echo "$iface"
 }
 
-get_mtv_interface() {
+get_domain_interface() {
+    local domain="$1"
     local current_iface=""
     local found_iface=""
 
@@ -42,34 +55,36 @@ get_mtv_interface() {
     while IFS= read -r line; do
         if [[ "$line" =~ $link_re ]]; then
             current_iface="${BASH_REMATCH[1]}"
-        elif [[ -n "$current_iface" && "$line" =~ DNS\ Domain:.*mtv\.local ]]; then
+        elif [[ -n "$current_iface" && "$line" =~ DNS\ Domain:.*${domain} ]]; then
             found_iface="$current_iface"
             break
         fi
     done < <(resolvectl status 2>/dev/null)
 
-    [[ -n "$found_iface" ]] || die "No interface found with mtv.local DNS domain configured"
+    [[ -n "$found_iface" ]] || die "No interface found with $domain DNS domain configured"
     echo "$found_iface"
 }
 
 enable_linux() {
     local ip="$1"
+    local domain="$2"
     local iface
     iface="$(get_interface "$ip")"
     echo "Detected interface: $iface"
-    echo "Setting DNS server $ip on $iface"
+    echo "Setting DNS server $ip on $iface for ~$domain"
     sudo resolvectl dns "$iface" "$ip"
-    sudo resolvectl domain "$iface" '~mtv.local'
+    sudo resolvectl domain "$iface" "~$domain"
     echo "DNS setup enabled for $ip on $iface"
 }
 
 disable_linux() {
+    local domain="$1"
     local iface
-    iface="$(get_mtv_interface)"
+    iface="$(get_domain_interface "$domain")"
     echo "Detected interface: $iface"
-    echo "Removing mtv.local DNS domain from $iface"
+    echo "Removing $domain DNS domain from $iface"
     sudo resolvectl domain "$iface" ""
-    echo "Removing BM DNS server from $iface"
+    echo "Removing DNS server from $iface"
     sudo resolvectl dns "$iface" ""
     echo "DNS setup disabled on $iface"
 }
@@ -78,23 +93,45 @@ disable_linux() {
 
 enable_macos() {
     local ip="$1"
-    echo "Setting up DNS resolver for mtv.local -> $ip"
+    local domain="$2"
+    echo "Setting up DNS resolver for $domain -> $ip"
     sudo mkdir -p /etc/resolver
-    echo "nameserver $ip" | sudo tee /etc/resolver/mtv.local
-    echo ""
+    printf 'nameserver %s\n' "$ip" | sudo tee "/etc/resolver/$domain" >/dev/null
     echo "DNS setup enabled. Verifying..."
     sleep 1
-    scutil --dns | grep -A5 "mtv.local" || echo "Resolver added (may take a moment to activate)"
+    scutil --dns | grep -A5 "$domain" || echo "Resolver added (may take a moment to activate)"
 }
 
 disable_macos() {
-    if [[ -f /etc/resolver/mtv.local ]]; then
-        echo "Removing mtv.local DNS resolver"
-        sudo rm /etc/resolver/mtv.local
+    local domain="$1"
+    if [[ -f "/etc/resolver/$domain" ]]; then
+        echo "Removing $domain DNS resolver"
+        sudo rm "/etc/resolver/$domain"
         echo "DNS setup disabled"
     else
-        echo "No mtv.local resolver found"
+        echo "No $domain resolver found"
     fi
+}
+
+# --- OS dispatch ---
+
+run_enable() {
+    local ip="$1"
+    local domain="$2"
+    case "$(uname -s)" in
+        Linux)  enable_linux "$ip" "$domain" ;;
+        Darwin) enable_macos "$ip" "$domain" ;;
+        *)      die "Unsupported OS: $(uname -s). Supported: Linux, macOS." ;;
+    esac
+}
+
+run_disable() {
+    local domain="$1"
+    case "$(uname -s)" in
+        Linux)  disable_linux "$domain" ;;
+        Darwin) disable_macos "$domain" ;;
+        *)      die "Unsupported OS: $(uname -s). Supported: Linux, macOS." ;;
+    esac
 }
 
 # --- Main ---
@@ -102,26 +139,31 @@ disable_macos() {
 [[ $# -ge 1 ]] || { echo "$USAGE" >&2; exit 1; }
 
 ACTION="$1"
-OS="$(uname -s)"
+shift
 
 [[ "$ACTION" == "enable" || "$ACTION" == "disable" ]] || die "Invalid action '$ACTION'. Must be 'enable' or 'disable'."
 
 case "$ACTION" in
     enable)
-        [[ $# -eq 2 ]] || { echo "$USAGE" >&2; exit 1; }
-        IP="$2"
-        case "$OS" in
-            Linux)  enable_linux "$IP" ;;
-            Darwin) enable_macos "$IP" ;;
-            *)      die "Unsupported OS: $OS. Supported: Linux, macOS." ;;
-        esac
+        [[ $# -ge 1 ]] || { echo "$USAGE" >&2; exit 1; }
+        IP="$1"
+        shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --domain) DOMAIN="$2"; shift 2 ;;
+                *) die "Unknown option: $1" ;;
+            esac
+        done
+        validate_ip "$IP"
+        run_enable "$IP" "$DOMAIN"
         ;;
     disable)
-        [[ $# -eq 1 ]] || { echo "$USAGE" >&2; exit 1; }
-        case "$OS" in
-            Linux)  disable_linux ;;
-            Darwin) disable_macos ;;
-            *)      die "Unsupported OS: $OS. Supported: Linux, macOS." ;;
-        esac
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --domain) DOMAIN="$2"; shift 2 ;;
+                *) die "Unknown option: $1" ;;
+            esac
+        done
+        run_disable "$DOMAIN"
         ;;
 esac
