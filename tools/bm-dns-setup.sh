@@ -150,6 +150,17 @@ run_disable() {
 
 # --- Main ---
 
+parse_options() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain)
+                [[ -n "${2:-}" ]] || die "--domain requires a value"
+                DOMAIN="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+}
+
 [[ $# -ge 1 ]] || { echo "$USAGE" >&2; exit 1; }
 
 ACTION="$1"
@@ -162,27 +173,13 @@ case "$ACTION" in
         [[ $# -ge 1 ]] || { echo "$USAGE" >&2; exit 1; }
         IP="$1"
         shift
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                --domain)
-                    [[ -n "${2:-}" ]] || die "--domain requires a value"
-                    DOMAIN="$2"; shift 2 ;;
-                *) die "Unknown option: $1" ;;
-            esac
-        done
+        parse_options "$@"
         validate_ip "$IP"
         validate_domain "$DOMAIN"
         run_enable "$IP" "$DOMAIN"
         ;;
     disable)
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                --domain)
-                    [[ -n "${2:-}" ]] || die "--domain requires a value"
-                    DOMAIN="$2"; shift 2 ;;
-                *) die "Unknown option: $1" ;;
-            esac
-        done
+        parse_options "$@"
         validate_domain "$DOMAIN"
         run_disable "$DOMAIN"
         ;;
