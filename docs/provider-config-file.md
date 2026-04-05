@@ -29,6 +29,8 @@
 | `guest_vm_linux_user` / `guest_vm_linux_password` | Linux guest login | Used for SSH-based post-migration validation, not for connecting to the source provider. |
 | `guest_vm_win_user` / `guest_vm_win_password` | Windows guest login | Also used for post-migration validation, not provider login. |
 | `vddk_init_image` | vSphere-specific provider field | Passed through to the MTV `Provider` resource when set. |
+| `endpoint_type` | vSphere-specific provider field | Optional. `"vcenter"` (default) or `"esxi"` for direct ESXi host connections. Maps to `sdkEndpoint` in the MTV `Provider` resource settings. |
+| `clone_provider` | vSphere ESXi-specific field | Name of a vCenter provider entry that handles `CloneVM_Task` on behalf of an ESXi provider. See [ESXi cloning via clone_provider](#esxi-cloning-via-clone_provider). |
 | `copyoffload` | vSphere-only nested settings | Used by copy-offload tests to build storage secrets and storage-map plugin config. |
 
 ## Guest credentials
@@ -78,7 +80,8 @@ Key points:
   "guest_vm_linux_password": "LINUX VMS PASSWORD",  # pragma: allowlist secret
   "guest_vm_win_user": "WINDOWS VMS USERNAME",
   "guest_vm_win_password": "WINDOWS VMS PASSWORD",  # pragma: allowlist secret
-  "vddk_init_image": "<PATH TO VDDK INIT IMAGE>"
+  "vddk_init_image": "<PATH TO VDDK INIT IMAGE>",
+  "endpoint_type": "vcenter"
 }
 ```
 
@@ -90,6 +93,40 @@ What matters for vSphere:
 - `username` and `password` are the vSphere credentials used by the harness.
 - The Linux and Windows guest credentials are used only for guest-level validation after migration.
 - `vddk_init_image` is passed to the MTV `Provider` resource when present.
+- `endpoint_type` is optional. Valid values are `"vcenter"` (default) or `"esxi"`. Set it to `"esxi"` for direct ESXi host connections. When set, the value maps to `sdkEndpoint` in the MTV `Provider` resource settings.
+
+### ESXi cloning via clone_provider
+
+ESXi hosts do not support the `CloneVM_Task` API -- that is a vCenter-only operation. To enable VM cloning for test isolation when the source provider is an ESXi host, configure a `clone_provider` field that references a vCenter provider entry capable of performing the clone on behalf of the ESXi provider.
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `clone_provider` | Only for ESXi entries that need cloning | Name of another provider entry (must be `type: "vsphere"` / vCenter) that handles `CloneVM_Task` for this ESXi host. |
+
+How it works:
+
+- The `clone_provider` value must match a top-level key in `.providers.json` whose `type` is `"vsphere"` and that points to a vCenter instance.
+- The vCenter must manage the same ESXi host that the ESXi entry connects to.
+- When `clone_provider` is set, the test harness creates a separate `VMWareProvider` connection to the referenced vCenter and uses it exclusively for cloning operations.
+- If `clone_provider` is not set, the harness uses the source provider for cloning (which works for vCenter entries but will fail for ESXi).
+
+*ESXi provider example:*
+
+```json
+"vsphere-esxi": {
+  "type": "vsphere",
+  "version": "8.0",
+  "fqdn": "esxi-host.example.com",
+  "api_url": "esxi-host.example.com/sdk",
+  "username": "root",
+  "password": "PASSWORD",
+  "endpoint_type": "esxi",
+  "vddk_init_image": "quay.io/example/vddk:latest",
+  "clone_provider": "vsphere"
+}
+```
+
+In this example, `"clone_provider": "vsphere"` references the `"vsphere"` entry shown earlier, which must be a vCenter that manages `esxi-host.example.com`.
 
 > **Tip:** Keep a separate vSphere entry for copy-offload, like the example’s `vsphere-copy-offload`. That makes it easy to switch between regular and copy-offload test runs by changing only `source_provider`.
 
