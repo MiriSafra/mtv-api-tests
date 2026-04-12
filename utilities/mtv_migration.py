@@ -142,6 +142,7 @@ def create_plan_resource(
     target_labels: dict[str, str] | None = None,
     target_affinity: dict[str, Any] | None = None,
     vm_target_namespace: str | None = None,
+    migrate_shared_disks: bool | None = None,
     target_power_state: str | None = None,
 ) -> Plan:
     """Create MTV Plan CR resource.
@@ -173,6 +174,8 @@ def create_plan_resource(
         target_labels (dict[str, str] | None): Optional custom labels to apply to migrated VM metadata. Defaults to None.
         target_affinity (dict[str, Any] | None): Optional Kubernetes pod affinity/anti-affinity configuration. Defaults to None.
         vm_target_namespace (str | None): Custom target namespace for VMs. Defaults to None.
+        migrate_shared_disks (bool | None): Whether to migrate shared disks at plan level. True enables shared disk
+            migration for all VMs by default. Individual VMs can override via per-VM migrateSharedDisks. Defaults to None.
         target_power_state (str | None): Target power state for VMs after migration (e.g., 'on', 'off'). Defaults to None.
 
     Returns:
@@ -187,6 +190,13 @@ def create_plan_resource(
 
     if not destination_provider.ocp_resource:
         raise ValueError("destination_provider.ocp_resource is not set")
+
+    # Convert per-VM migrate_shared_disks (snake_case config) to migrateSharedDisks (camelCase API)
+    # The Plan class passes virtual_machines_list directly to spec.vms, so any key in the
+    # VM dict ends up in the CR. We rename here to match the Kubernetes API field name.
+    for vm in virtual_machines_list:
+        if "migrate_shared_disks" in vm:
+            vm["migrateSharedDisks"] = vm.pop("migrate_shared_disks")
 
     plan_kwargs: dict[str, Any] = {
         "client": ocp_admin_client,
@@ -225,6 +235,9 @@ def create_plan_resource(
 
     if target_affinity:
         plan_kwargs["target_affinity"] = target_affinity
+
+    if migrate_shared_disks is not None:
+        plan_kwargs["migrate_shared_disks"] = migrate_shared_disks
 
     # Add copy-offload specific parameters if enabled
     if copyoffload:
