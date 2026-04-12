@@ -1060,6 +1060,14 @@ def prepared_plan(
         # Use vCenter clone provider if configured (e.g., for ESXi sources that can't clone directly)
         clone_provider = vcenter_clone_provider or source_provider
 
+        # Track original VM names and cloned objects for shared disk relinking.
+        # Check for `is not None` because the field can be True (owner) or False (consumer),
+        # and both need relinking. We only skip VMs without this field at all.
+        has_shared_disk_config = any(vm.get("migrate_shared_disks") is not None for vm in virtual_machines)
+        if has_shared_disk_config:
+            original_source_vm_names: list[str] = [vm["name"] for vm in virtual_machines]
+            cloned_vm_objects: list[Any] = []
+
         for vm in virtual_machines:
             clone_options = {**vm, "enable_ctk": warm_migration}
             provider_vm_api = clone_provider.get_vm_by_name(
@@ -1069,6 +1077,8 @@ def prepared_plan(
                 session_uuid=fixture_store["session_uuid"],
                 clone_options=clone_options,
             )
+            if has_shared_disk_config:
+                cloned_vm_objects.append(provider_vm_api)
 
             # Power state control: "on" = start VM, "off" = stop VM, not set = leave unchanged
             source_vm_power = vm.get("source_vm_power")  # Optional - if not set, VM power state unchanged
@@ -1134,6 +1144,20 @@ def prepared_plan(
         session_uuid = fixture_store["session_uuid"]
         for vm in virtual_machines:
             vm["targetName"] = sanitize_kubernetes_name(f"{session_uuid}-{vm['name']}")
+
+        # Relink shared disks between clones (VMware-specific)
+        # When VMs with shared disks are cloned, each clone gets independent disk copies,
+        # breaking the shared disk relationship. This restores it on the clones.
+        if has_shared_disk_config:
+            if not hasattr(source_provider, "relink_shared_disks"):
+                raise ValueError(
+                    f"Shared-disk migration requested, but provider '{source_provider.type}' "
+                    "does not implement relink_shared_disks"
+                )
+            source_provider.relink_shared_disks(
+                source_vm_names=original_source_vm_names,
+                cloned_vms=cloned_vm_objects,
+            )
 
     # Create Hooks if configured
     create_hook_if_configured(plan, "pre_hook", "pre", fixture_store, ocp_admin_client, target_namespace)
