@@ -29,8 +29,8 @@ if TYPE_CHECKING:
     from kubernetes.dynamic import DynamicClient
 
     from libs.base_provider import BaseProvider
-    from libs.providers.ocp import OCPProvider
-    from utilities.forklift_inventory import ForkliftInventory
+    from libs.forklift_inventory import ForkliftInventory
+    from libs.providers.openshift import OCPProvider
     from utilities.ssh_utils import SSHConnectionManager
 
 
