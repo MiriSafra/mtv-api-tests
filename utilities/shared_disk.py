@@ -1,26 +1,24 @@
 """Shared disk migration verification utilities.
 
 Provides functions for verifying shared disk accessibility between VMs
-and PVC count validation after migration.
+after migration.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from simple_logger.logger import get_logger
 
+from exceptions.exceptions import GuestCommandError
 from utilities.post_migration import get_ssh_credentials_from_provider_config
-from utilities.ssh_utils import SSHConnectionManager
-
-if TYPE_CHECKING:
-    from kubernetes.dynamic import DynamicClient
+from utilities.ssh_utils import SSHConnectionManager, VMSSHConnection
 
 LOGGER = get_logger(name=__name__)
 
 
 def _run_cmd_on_vm(
-    ssh_conn: Any,
+    ssh_conn: VMSSHConnection,
     cmd: list[str],
     description: str,
 ) -> str:
@@ -30,7 +28,7 @@ def _run_cmd_on_vm(
     creates an executor with the correct user and port-forward port.
 
     Args:
-        ssh_conn: VMSSHConnection object (must be connected via context manager).
+        ssh_conn (VMSSHConnection): SSH connection object (must be connected via context manager).
         cmd (list[str]): Command to execute.
         description (str): Human-readable description for logging.
 
@@ -38,14 +36,35 @@ def _run_cmd_on_vm(
         str: Command stdout.
 
     Raises:
-        RuntimeError: If the command fails (non-zero return code).
+        GuestCommandError: If the command fails (non-zero return code).
     """
-    executor = ssh_conn.rrmngmnt_host.executor(user=ssh_conn.rrmngmnt_user)
+    executor = ssh_conn.rrmngmnt_host.executor(user=ssh_conn.rrmngmnt_user)  # type: ignore[union-attr]
     executor.port = ssh_conn.local_port
     rc, stdout, stderr = executor.run_cmd(cmd)
     if rc != 0:
-        raise RuntimeError(f"{description} failed (rc={rc}): {stderr}")
+        raise GuestCommandError(f"{description} failed (rc={rc}): {stderr}")
     return stdout
+
+
+def _mount_shared_partition(ssh_conn: VMSSHConnection, partition: str, mount_point: str, vm_label: str) -> None:
+    """Mount a shared disk partition on a VM."""
+    _run_cmd_on_vm(ssh_conn, ["sudo", "mkdir", "-p", mount_point], f"{vm_label} mkdir")
+    _run_cmd_on_vm(ssh_conn, ["sudo", "mount", partition, mount_point], f"{vm_label} mount")
+
+
+def _umount_shared_partition(ssh_conn: VMSSHConnection, mount_point: str, vm_label: str) -> None:
+    """Unmount a shared disk partition on a VM."""
+    _run_cmd_on_vm(ssh_conn, ["sudo", "umount", mount_point], f"{vm_label} umount")
+
+
+def _write_marker(ssh_conn: VMSSHConnection, file_path: str, content: str, vm_label: str) -> None:
+    """Write a marker file and sync to disk."""
+    _run_cmd_on_vm(
+        ssh_conn,
+        ["sh", "-c", f"echo '{content}' | sudo tee {file_path} > /dev/null"],
+        f"{vm_label} write test data",
+    )
+    _run_cmd_on_vm(ssh_conn, ["sudo", "sync"], f"{vm_label} sync")
 
 
 def verify_shared_disk_data(
@@ -78,7 +97,7 @@ def verify_shared_disk_data(
 
     Raises:
         AssertionError: If shared disk data verification fails.
-        RuntimeError: If SSH commands fail.
+        GuestCommandError: If SSH commands fail.
     """
     LOGGER.info(f"Verifying shared disk between {vm1_name} and {vm2_name}")
 
@@ -96,35 +115,21 @@ def verify_shared_disk_data(
     # VM1: Mount shared disk and write test data
     LOGGER.info(f"VM1 ({vm1_name}): Mounting shared disk {partition}")
     with ssh_vm1:
-        _run_cmd_on_vm(ssh_vm1, ["sudo", "mkdir", "-p", mount_point], "VM1 mkdir")
-        _run_cmd_on_vm(ssh_vm1, ["sudo", "mount", partition, mount_point], "VM1 mount")
-        _run_cmd_on_vm(
-            ssh_vm1,
-            ["sh", "-c", f"echo 'Data from VM1' | sudo tee {test_file_vm1} > /dev/null"],
-            "VM1 write test data",
-        )
-        _run_cmd_on_vm(ssh_vm1, ["sudo", "sync"], "VM1 sync")
-        _run_cmd_on_vm(ssh_vm1, ["sudo", "umount", mount_point], "VM1 umount")
+        _mount_shared_partition(ssh_vm1, partition, mount_point, "VM1")
+        _write_marker(ssh_vm1, test_file_vm1, "Data from VM1", "VM1")
+        _umount_shared_partition(ssh_vm1, mount_point, "VM1")
 
     # VM2: Mount shared disk, verify VM1's data, write own data
     LOGGER.info(f"VM2 ({vm2_name}): Mounting shared disk {partition}")
     with ssh_vm2:
-        _run_cmd_on_vm(ssh_vm2, ["sudo", "mkdir", "-p", mount_point], "VM2 mkdir")
-        _run_cmd_on_vm(ssh_vm2, ["sudo", "mount", partition, mount_point], "VM2 mount")
+        _mount_shared_partition(ssh_vm2, partition, mount_point, "VM2")
 
-        # Read VM1's data
         vm2_read_data = _run_cmd_on_vm(ssh_vm2, ["sudo", "cat", test_file_vm1], "VM2 read VM1 data")
         assert "Data from VM1" in vm2_read_data.strip(), f"VM2 cannot read VM1's data: {vm2_read_data}"
         LOGGER.info(f"VM2 ({vm2_name}): Successfully read VM1's data")
 
-        # Write VM2's data
-        _run_cmd_on_vm(
-            ssh_vm2,
-            ["sh", "-c", f"echo 'Data from VM2' | sudo tee {test_file_vm2} > /dev/null"],
-            "VM2 write test data",
-        )
-        _run_cmd_on_vm(ssh_vm2, ["sudo", "sync"], "VM2 sync")
-        _run_cmd_on_vm(ssh_vm2, ["sudo", "umount", mount_point], "VM2 umount")
+        _write_marker(ssh_vm2, test_file_vm2, "Data from VM2", "VM2")
+        _umount_shared_partition(ssh_vm2, mount_point, "VM2")
 
     # VM1: Verify bidirectional access (remount with cache flush)
     LOGGER.info(f"VM1 ({vm1_name}): Verifying bidirectional access")
@@ -139,6 +144,6 @@ def verify_shared_disk_data(
         assert "Data from VM2" in vm1_read_data.strip(), f"VM1 cannot read VM2's data: {vm1_read_data}"
         LOGGER.info(f"VM1 ({vm1_name}): Successfully read VM2's data")
 
-        _run_cmd_on_vm(ssh_vm1, ["sudo", "umount", mount_point], "VM1 final umount")
+        _umount_shared_partition(ssh_vm1, mount_point, "VM1 final")
 
     LOGGER.info("Shared disk verification successful - bidirectional access confirmed")

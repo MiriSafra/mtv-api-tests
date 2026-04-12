@@ -321,14 +321,12 @@ def pytest_collection_modifyitems(session, config, items):
                     if "warm" in item.keywords:
                         item.add_marker(pytest.mark.jira("MTV-2846", run=False))
 
-            # Skip copy-offload tests for non-vSphere providers (vSphere-only feature).
+            # Skip vSphere-only tests for non-vSphere providers.
             if source_provider_type != Provider.ProviderType.VSPHERE:
-                copyoffload_skip = pytest.mark.skip(
-                    reason="Copy-offload tests are only applicable to vSphere source providers"
-                )
+                vsphere_only_skip = pytest.mark.skip(reason="Test is only applicable to vSphere source providers")
                 for item in items:
-                    if "copyoffload" in item.keywords:
-                        item.add_marker(copyoffload_skip)
+                    if "copyoffload" in item.keywords or "shared_disk" in item.keywords:
+                        item.add_marker(vsphere_only_skip)
 
     _session_store = get_fixture_store(session)
     vms_for_current_session: set = set()
@@ -1063,7 +1061,10 @@ def prepared_plan(
         # Track original VM names and cloned objects for shared disk relinking.
         # Check for `is not None` because the field can be True (owner) or False (consumer),
         # and both need relinking. We only skip VMs without this field at all.
-        has_shared_disk_config = any(vm.get("migrate_shared_disks") is not None for vm in virtual_machines)
+        plan_level_shared_disks = bool(plan.get("migrate_shared_disks"))
+        has_shared_disk_config = plan_level_shared_disks or any(
+            vm.get("migrate_shared_disks") is not None for vm in virtual_machines
+        )
         if has_shared_disk_config:
             original_source_vm_names: list[str] = [vm["name"] for vm in virtual_machines]
             cloned_vm_objects: list[Any] = []

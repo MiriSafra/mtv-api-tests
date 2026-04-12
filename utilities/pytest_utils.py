@@ -358,7 +358,8 @@ def teardown_resources(
                         leftovers.setdefault("orphaned_vmdks", []).append({"path": _vmdk_path})
         except Exception as exc:
             LOGGER.error(f"Failed to connect to VMware provider for cleanup: {exc}")
-            leftovers.setdefault(Provider.ProviderType.VSPHERE, vmware_cloned_vms)
+            leftovers.setdefault(Provider.ProviderType.VSPHERE, []).extend(vmware_cloned_vms)
+            leftovers.setdefault("orphaned_vmdks", []).extend(orphaned_vmdks)
 
     if openstack_cloned_vms:
         try:

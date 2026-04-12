@@ -1497,11 +1497,10 @@ class VMWareProvider(BaseProvider):
 
             owner_disk = self._find_disk_by_scsi_position(owner_clone, owner_bus, owner_unit)
             if not owner_disk:
-                LOGGER.warning(
-                    f"Could not find shared disk on owner clone '{owner_clone.name}' "
-                    f"at SCSI({owner_bus}:{owner_unit}), skipping"
+                raise VmCloneError(
+                    f"Expected shared disk not found on owner clone '{owner_clone.name}' "
+                    f"at SCSI({owner_bus}:{owner_unit})"
                 )
-                continue
 
             owner_vmdk = owner_disk.backing.fileName
             LOGGER.info(f"Owner clone '{owner_clone.name}' shared disk VMDK: {owner_vmdk}")
@@ -1512,11 +1511,10 @@ class VMWareProvider(BaseProvider):
 
                 consumer_disk = self._find_disk_by_scsi_position(consumer_clone, consumer_bus, consumer_unit)
                 if not consumer_disk:
-                    LOGGER.warning(
-                        f"Could not find shared disk on consumer clone '{consumer_clone.name}' "
-                        f"at SCSI({consumer_bus}:{consumer_unit}), skipping"
+                    raise VmCloneError(
+                        f"Expected shared disk not found on consumer clone '{consumer_clone.name}' "
+                        f"at SCSI({consumer_bus}:{consumer_unit})"
                     )
-                    continue
 
                 old_vmdk = consumer_disk.backing.fileName
                 LOGGER.info(f"Relinking '{consumer_clone.name}' shared disk: {old_vmdk} -> {owner_vmdk}")
