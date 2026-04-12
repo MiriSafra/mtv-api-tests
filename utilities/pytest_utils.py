@@ -153,6 +153,7 @@ def teardown_resources(
     namespaces = session_teardown_resources.get(Namespace.kind, [])
     storagemaps = session_teardown_resources.get(StorageMap.kind, [])
     vmware_cloned_vms = session_teardown_resources.get(Provider.ProviderType.VSPHERE, [])
+    orphaned_vmdks = session_teardown_resources.get("orphaned_vmdks", [])
     openstack_cloned_vms = session_teardown_resources.get(Provider.ProviderType.OPENSTACK, [])
     rhv_cloned_vms = session_teardown_resources.get(Provider.ProviderType.RHV, [])
     openstack_volume_snapshots = session_teardown_resources.get("VolumeSnapshot", [])
@@ -347,6 +348,14 @@ def teardown_resources(
                         leftovers.setdefault(vmware_provider.type, []).append({
                             "cloned_vm_name": _cloned_vm_name,
                         })
+
+                for _vmdk in orphaned_vmdks:
+                    _vmdk_path = _vmdk["path"]
+                    try:
+                        vmware_provider.delete_vmdk(vmdk_path=_vmdk_path)
+                    except Exception as exc:
+                        LOGGER.error(f"Failed to delete orphaned VMDK {_vmdk_path}: {exc}")
+                        leftovers.setdefault("orphaned_vmdks", []).append({"path": _vmdk_path})
         except Exception as exc:
             LOGGER.error(f"Failed to connect to VMware provider for cleanup: {exc}")
             leftovers.setdefault(Provider.ProviderType.VSPHERE, vmware_cloned_vms)

@@ -1536,6 +1536,20 @@ class VMWareProvider(BaseProvider):
                 )
                 LOGGER.info(f"Successfully relinked shared disk on '{consumer_clone.name}'")
 
+                if self.fixture_store:
+                    self.fixture_store["teardown"].setdefault("orphaned_vmdks", []).append({"path": old_vmdk})
+
+    def delete_vmdk(self, vmdk_path: str) -> None:
+        """Delete an orphaned VMDK file from a vSphere datastore.
+
+        Args:
+            vmdk_path (str): Datastore path of the VMDK (e.g., "[datastore2] folder/file.vmdk").
+        """
+        datacenter = self.api.content.rootFolder.childEntity[0]
+        task = self.content.fileManager.DeleteDatastoreFile_Task(name=vmdk_path, datacenter=datacenter)
+        self.wait_task(task=task, action_name=f"Deleting orphaned VMDK '{vmdk_path}'")
+        LOGGER.info(f"Deleted orphaned VMDK: {vmdk_path}")
+
     def delete_vm(self, vm_name: str) -> None:
         vm = self.get_obj(vimtype=[vim.VirtualMachine], name=vm_name)
         self.stop_vm(vm=vm)
