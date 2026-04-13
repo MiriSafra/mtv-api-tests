@@ -194,7 +194,9 @@ def create_plan_resource(
     # Convert per-VM migrate_shared_disks (snake_case config) to migrateSharedDisks (camelCase API)
     # The Plan class passes virtual_machines_list directly to spec.vms, so any key in the
     # VM dict ends up in the CR. We rename here to match the Kubernetes API field name.
-    for vm in virtual_machines_list:
+    # Work on copies to avoid mutating the caller's prepared_plan data.
+    vms_for_plan = [dict(vm) for vm in virtual_machines_list]
+    for vm in vms_for_plan:
         if "migrate_shared_disks" in vm:
             vm["migrateSharedDisks"] = vm.pop("migrate_shared_disks")
 
@@ -211,7 +213,7 @@ def create_plan_resource(
         "storage_map_namespace": storage_map.namespace,
         "network_map_name": network_map.name,
         "network_map_namespace": network_map.namespace,
-        "virtual_machines_list": virtual_machines_list,
+        "virtual_machines_list": vms_for_plan,
         "target_namespace": vm_target_namespace or target_namespace,
         "warm_migration": warm_migration,
         "pre_hook_name": pre_hook_name,

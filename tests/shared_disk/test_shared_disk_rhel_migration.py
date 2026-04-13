@@ -124,7 +124,7 @@ class TestSharedDiskRhelMigration:
             network_map=self.network_map,
             virtual_machines_list=prepared_plan["virtual_machines"],
             target_namespace=target_namespace,
-            warm_migration=prepared_plan.get("warm_migration", False),
+            warm_migration=prepared_plan["warm_migration"],
             migrate_shared_disks=prepared_plan["migrate_shared_disks"],
             target_power_state=prepared_plan["target_power_state"],
         )

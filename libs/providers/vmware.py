@@ -1543,6 +1543,8 @@ class VMWareProvider(BaseProvider):
         Args:
             vmdk_path (str): Datastore path of the VMDK (e.g., "[datastore2] folder/file.vmdk").
         """
+        # Assumes single datacenter environment. Multi-datacenter would need
+        # datacenter resolution from the VMDK's datastore path.
         datacenter = self.api.content.rootFolder.childEntity[0]
         task = self.content.fileManager.DeleteDatastoreFile_Task(name=vmdk_path, datacenter=datacenter)
         self.wait_task(task=task, action_name=f"Deleting orphaned VMDK '{vmdk_path}'")

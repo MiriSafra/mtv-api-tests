@@ -6,6 +6,7 @@ after migration.
 
 from __future__ import annotations
 
+import shlex
 from typing import Any
 
 from simple_logger.logger import get_logger
@@ -47,21 +48,50 @@ def _run_cmd_on_vm(
 
 
 def _mount_shared_partition(ssh_conn: VMSSHConnection, partition: str, mount_point: str, vm_label: str) -> None:
-    """Mount a shared disk partition on a VM."""
+    """Mount a shared disk partition on a VM.
+
+    Args:
+        ssh_conn (VMSSHConnection): Active SSH connection to the VM.
+        partition (str): Device partition path (e.g., "/dev/vdc1").
+        mount_point (str): Mount target directory.
+        vm_label (str): Label for log messages (e.g., "VM1").
+
+    Raises:
+        GuestCommandError: If mkdir or mount command fails.
+    """
     _run_cmd_on_vm(ssh_conn, ["sudo", "mkdir", "-p", mount_point], f"{vm_label} mkdir")
     _run_cmd_on_vm(ssh_conn, ["sudo", "mount", partition, mount_point], f"{vm_label} mount")
 
 
 def _umount_shared_partition(ssh_conn: VMSSHConnection, mount_point: str, vm_label: str) -> None:
-    """Unmount a shared disk partition on a VM."""
+    """Unmount a shared disk partition on a VM.
+
+    Args:
+        ssh_conn (VMSSHConnection): Active SSH connection to the VM.
+        mount_point (str): Mount point to unmount.
+        vm_label (str): Label for log messages (e.g., "VM1").
+
+    Raises:
+        GuestCommandError: If umount command fails.
+    """
     _run_cmd_on_vm(ssh_conn, ["sudo", "umount", mount_point], f"{vm_label} umount")
 
 
 def _write_marker(ssh_conn: VMSSHConnection, file_path: str, content: str, vm_label: str) -> None:
-    """Write a marker file and sync to disk."""
+    """Write a marker file and sync to disk.
+
+    Args:
+        ssh_conn (VMSSHConnection): Active SSH connection to the VM.
+        file_path (str): Absolute path for the marker file.
+        content (str): Text content to write.
+        vm_label (str): Label for log messages (e.g., "VM1").
+
+    Raises:
+        GuestCommandError: If write or sync command fails.
+    """
     _run_cmd_on_vm(
         ssh_conn,
-        ["sh", "-c", f"echo '{content}' | sudo tee {file_path} > /dev/null"],
+        ["sh", "-c", f"echo {shlex.quote(content)} | sudo tee {shlex.quote(file_path)} > /dev/null"],
         f"{vm_label} write test data",
     )
     _run_cmd_on_vm(ssh_conn, ["sudo", "sync"], f"{vm_label} sync")
@@ -74,7 +104,7 @@ def verify_shared_disk_data(
     source_provider_data: dict[str, Any],
     vm1_info: dict[str, Any],
     vm2_info: dict[str, Any],
-    shared_disk_device: str = "/dev/vdc",
+    shared_disk_device: str,
 ) -> None:
     """Verify shared disk is accessible from both VMs by writing and reading data.
 
@@ -93,7 +123,7 @@ def verify_shared_disk_data(
         source_provider_data (dict[str, Any]): Provider configuration from .providers.json.
         vm1_info (dict[str, Any]): VM1 source data including OS type.
         vm2_info (dict[str, Any]): VM2 source data including OS type.
-        shared_disk_device (str): Shared disk device path. Defaults to "/dev/vdc".
+        shared_disk_device (str): Shared disk device path (e.g., "/dev/vdc").
 
     Raises:
         AssertionError: If shared disk data verification fails.
