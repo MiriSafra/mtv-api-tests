@@ -1065,6 +1065,13 @@ def prepared_plan(
         has_shared_disk_config = plan_level_shared_disks or any(
             vm.get("migrate_shared_disks") is not None for vm in virtual_machines
         )
+        # Fail early before cloning if shared-disk relinking is requested on an unsupported provider.
+        if has_shared_disk_config and not isinstance(source_provider, VMWareProvider):
+            raise ValueError(
+                f"Shared-disk migration requested, but provider '{source_provider.type}' "
+                "does not implement relink_shared_disks"
+            )
+
         original_source_vm_names: list[str] = [vm["name"] for vm in virtual_machines] if has_shared_disk_config else []
         cloned_vm_objects: list[Any] = []
 
@@ -1149,11 +1156,6 @@ def prepared_plan(
         # When VMs with shared disks are cloned, each clone gets independent disk copies,
         # breaking the shared disk relationship. This restores it on the clones.
         if has_shared_disk_config:
-            if not isinstance(source_provider, VMWareProvider):
-                raise ValueError(
-                    f"Shared-disk migration requested, but provider '{source_provider.type}' "
-                    "does not implement relink_shared_disks"
-                )
             source_provider.relink_shared_disks(
                 source_vm_names=original_source_vm_names,
                 cloned_vms=cloned_vm_objects,
