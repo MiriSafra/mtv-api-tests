@@ -98,13 +98,9 @@ def _write_marker(ssh_conn: VMSSHConnection, file_path: str, content: str, vm_la
 
 
 def verify_shared_disk_data(
-    vm1_name: str,
-    vm2_name: str,
+    prepared_plan: dict[str, Any],
     vm_ssh_connections: SSHConnectionManager,
     source_provider_data: dict[str, Any],
-    vm1_info: dict[str, Any],
-    vm2_info: dict[str, Any],
-    shared_disk_device: str,
 ) -> None:
     """Verify shared disk is accessible from both VMs by writing and reading data.
 
@@ -117,19 +113,23 @@ def verify_shared_disk_data(
     3. VM1: flush block device cache, remount, read VM2's data, unmount
 
     Args:
-        vm1_name (str): Name of the first VM (owner).
-        vm2_name (str): Name of the second VM (consumer).
+        prepared_plan (dict[str, Any]): Plan config with virtual_machines, source_vms_data,
+            and shared_disk_device.
         vm_ssh_connections (SSHConnectionManager): SSH connection manager.
         source_provider_data (dict[str, Any]): Provider configuration from .providers.json.
-        vm1_info (dict[str, Any]): VM1 source data including OS type.
-        vm2_info (dict[str, Any]): VM2 source data including OS type.
-        shared_disk_device (str): Shared disk device path (e.g., "/dev/vdc").
 
     Raises:
         AssertionError: If shared disk data verification fails.
         GuestCommandError: If SSH commands fail.
     """
+    vm1_name = prepared_plan["virtual_machines"][0]["name"]
+    vm2_name = prepared_plan["virtual_machines"][1]["name"]
+    shared_disk_device: str = prepared_plan["shared_disk_device"]
+
     LOGGER.info(f"Verifying shared disk between {vm1_name} and {vm2_name}")
+
+    vm1_info = prepared_plan["source_vms_data"][vm1_name]
+    vm2_info = prepared_plan["source_vms_data"][vm2_name]
 
     vm1_user, vm1_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm1_info)
     vm2_user, vm2_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm2_info)
@@ -142,28 +142,27 @@ def verify_shared_disk_data(
     test_file_vm1 = f"{mount_point}/test-vm1.txt"
     test_file_vm2 = f"{mount_point}/test-vm2.txt"
 
-    # VM1: Mount shared disk and write test data
+    # VM1: Mount shared disk, write test data, unmount (keep connection open for verify phase)
     LOGGER.info(f"VM1 ({vm1_name}): Mounting shared disk {partition}")
     with ssh_vm1:
         _mount_shared_partition(ssh_vm1, partition, mount_point, "VM1")
         _write_marker(ssh_vm1, test_file_vm1, "Data from VM1", "VM1")
         _umount_shared_partition(ssh_vm1, mount_point, "VM1")
 
-    # VM2: Mount shared disk, verify VM1's data, write own data
-    LOGGER.info(f"VM2 ({vm2_name}): Mounting shared disk {partition}")
-    with ssh_vm2:
-        _mount_shared_partition(ssh_vm2, partition, mount_point, "VM2")
+        # VM2: Mount shared disk, verify VM1's data, write own data, unmount
+        LOGGER.info(f"VM2 ({vm2_name}): Mounting shared disk {partition}")
+        with ssh_vm2:
+            _mount_shared_partition(ssh_vm2, partition, mount_point, "VM2")
 
-        vm2_read_data = _run_cmd_on_vm(ssh_vm2, ["sudo", "cat", test_file_vm1], "VM2 read VM1 data")
-        assert "Data from VM1" in vm2_read_data.strip(), f"VM2 cannot read VM1's data: {vm2_read_data}"
-        LOGGER.info(f"VM2 ({vm2_name}): Successfully read VM1's data")
+            vm2_read_data = _run_cmd_on_vm(ssh_vm2, ["sudo", "cat", test_file_vm1], "VM2 read VM1 data")
+            assert "Data from VM1" in vm2_read_data.strip(), f"VM2 cannot read VM1's data: {vm2_read_data}"
+            LOGGER.info(f"VM2 ({vm2_name}): Successfully read VM1's data")
 
-        _write_marker(ssh_vm2, test_file_vm2, "Data from VM2", "VM2")
-        _umount_shared_partition(ssh_vm2, mount_point, "VM2")
+            _write_marker(ssh_vm2, test_file_vm2, "Data from VM2", "VM2")
+            _umount_shared_partition(ssh_vm2, mount_point, "VM2")
 
-    # VM1: Verify bidirectional access (remount with cache flush)
-    LOGGER.info(f"VM1 ({vm1_name}): Verifying bidirectional access")
-    with ssh_vm1:
+        # Verify bidirectional access (remount with cache flush)
+        LOGGER.info(f"VM1 ({vm1_name}): Verifying bidirectional access")
         # Flush block device buffers to clear stale kernel cache.
         # XFS (non-cluster filesystem) retains metadata in kernel buffer cache.
         # Without this, VM1 won't see VM2's newly written files even after remount.

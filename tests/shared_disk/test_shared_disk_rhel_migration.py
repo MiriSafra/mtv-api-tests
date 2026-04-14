@@ -151,19 +151,10 @@ class TestSharedDiskRhelMigration:
         source_provider_data: dict[str, Any],
     ) -> None:
         """Verify shared disk read/write access from both VMs."""
-        vm1_name = prepared_plan["virtual_machines"][0]["name"]
-        vm2_name = prepared_plan["virtual_machines"][1]["name"]
-        vm1_info = prepared_plan["source_vms_data"][vm1_name]
-        vm2_info = prepared_plan["source_vms_data"][vm2_name]
-
         verify_shared_disk_data(
-            vm1_name=vm1_name,
-            vm2_name=vm2_name,
+            prepared_plan=prepared_plan,
             vm_ssh_connections=vm_ssh_connections,
             source_provider_data=source_provider_data,
-            vm1_info=vm1_info,
-            vm2_info=vm2_info,
-            shared_disk_device=prepared_plan["shared_disk_device"],
         )
 
     def test_check_vms(

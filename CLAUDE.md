@@ -500,6 +500,10 @@ class TestNameHere:
 - **Shared state**: Store resources on class with `self.__class__.attribute`
 - **Test ordering**: Use `@pytest.mark.incremental` at class level for sequential test dependencies
 - **5-step pattern**: storagemap -> networkmap -> plan -> migrate -> check_vms
+- **6-step shared-disk pattern**: storagemap -> networkmap -> plan -> migrate -> verify_shared_disk_data -> check_vms
+  Shared disk tests insert `test_verify_shared_disk_data` before `test_check_vms`. This step mounts,
+  writes, and reads a shared disk from both VMs to verify bidirectional access after migration.
+  Uses `verify_shared_disk_data()` from `utilities/shared_disk.py`.
 - **6-step copy-offload pattern**: storagemap -> networkmap -> plan -> migrate -> check_vms -> check_xcopy_used
   Copy-offload tests extend the base pattern with `test_check_xcopy_used` which calls
   `verify_xcopy_used()` from `utilities/copyoffload_migration.py`. This is a separate step because it

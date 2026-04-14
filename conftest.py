@@ -1156,7 +1156,7 @@ def prepared_plan(
         # When VMs with shared disks are cloned, each clone gets independent disk copies,
         # breaking the shared disk relationship. This restores it on the clones.
         if has_shared_disk_config:
-            source_provider.relink_shared_disks(
+            clone_provider.relink_shared_disks(
                 source_vm_names=original_source_vm_names,
                 cloned_vms=cloned_vm_objects,
             )
@@ -1166,6 +1166,27 @@ def prepared_plan(
     create_hook_if_configured(plan, "post_hook", "post", fixture_store, ocp_admin_client, target_namespace)
 
     yield plan
+
+    # Reattach orphaned VMDKs to consumer clones so normal VM deletion cleans them up.
+    # During relink, consumer clones' shared disks are redirected to the owner's VMDK,
+    # leaving the consumer's original VMDK orphaned. Reattaching it here means
+    # teardown's delete_vm will automatically remove it — no separate VMDK cleanup needed.
+    vmdks_to_reattach: list[dict[str, Any]] = fixture_store["teardown"].pop("orphaned_vmdks_to_reattach", [])
+    if vmdks_to_reattach:
+        reattach_provider = vcenter_clone_provider or source_provider
+        for vmdk_info in vmdks_to_reattach:
+            try:
+                reattach_provider.reattach_orphaned_vmdk(
+                    vm_name=vmdk_info["vm_name"],
+                    vmdk_path=vmdk_info["vmdk_path"],
+                    bus_number=vmdk_info["bus_number"],
+                    unit_number=vmdk_info["unit_number"],
+                )
+            except Exception:
+                LOGGER.warning(
+                    f"Failed to reattach VMDK '{vmdk_info['vmdk_path']}' to '{vmdk_info['vm_name']}', "
+                    "VMDK may need manual cleanup"
+                )
 
     # Note: VMs are cleaned up by cleanup_migrated_vms at class scope.
     # Session-level registration is intentionally omitted to prevent double cleanup.
