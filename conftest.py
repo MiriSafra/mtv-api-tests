@@ -1145,12 +1145,6 @@ def prepared_plan(
                         f"Failed to detect IP origins via Guest Operations for VM {vm['name']}: {e}. "
                         "Static IP verification may not work for this VM."
                     )
-    else:
-        # OVA VMs aren't cloned — add unique targetName to prevent destination VM name conflicts
-        # across parallel test sessions. The source VM name stays unchanged (must match OVA file).
-        session_uuid = fixture_store["session_uuid"]
-        for vm in virtual_machines:
-            vm["targetName"] = sanitize_kubernetes_name(f"{session_uuid}-{vm['name']}")
 
         # Relink shared disks between clones (VMware-specific)
         # When VMs with shared disks are cloned, each clone gets independent disk copies,
@@ -1160,6 +1154,12 @@ def prepared_plan(
                 source_vm_names=original_source_vm_names,
                 cloned_vms=cloned_vm_objects,
             )
+    else:
+        # OVA VMs aren't cloned — add unique targetName to prevent destination VM name conflicts
+        # across parallel test sessions. The source VM name stays unchanged (must match OVA file).
+        session_uuid = fixture_store["session_uuid"]
+        for vm in virtual_machines:
+            vm["targetName"] = sanitize_kubernetes_name(f"{session_uuid}-{vm['name']}")
 
     # Create Hooks if configured
     create_hook_if_configured(plan, "pre_hook", "pre", fixture_store, ocp_admin_client, target_namespace)
