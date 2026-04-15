@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 
 @pytest.mark.shared_disk
+@pytest.mark.tier0
 @pytest.mark.incremental
 @pytest.mark.parametrize(
     "class_plan_config",
