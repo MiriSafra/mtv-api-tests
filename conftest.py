@@ -86,7 +86,7 @@ from utilities.utils import (
     resolve_providers_json_path,
 )
 from utilities.virtctl import add_to_path, download_virtctl_from_cluster
-from utilities.vmware_guest_operations import detect_vmware_ip_origins_via_guest_ops
+from utilities.vmware_guest_operations import detect_guest_nic_names, detect_vmware_ip_origins_via_guest_ops
 from utilities.worker_node_selection import get_worker_nodes, select_node_by_available_memory
 
 RESULTS_PATH = Path("./.xdist_results/")
@@ -1149,6 +1149,16 @@ def prepared_plan(
                         f"Failed to detect IP origins via Guest Operations for VM {vm['name']}: {e}. "
                         "Static IP verification may not work for this VM."
                     )
+
+                try:
+                    detect_guest_nic_names(
+                        source_provider=source_provider,
+                        vm=provider_vm_api,
+                        source_provider_data=fixture_store["source_provider_data"],
+                        vm_details=source_vm_details,
+                    )
+                except Exception as e:
+                    LOGGER.warning(f"Failed to detect guest NIC names for VM {vm['name']}: {e}")
 
         # Relink shared disks between clones (VMware-specific)
         # When VMs with shared disks are cloned, each clone gets independent disk copies,

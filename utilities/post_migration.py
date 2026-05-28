@@ -708,6 +708,42 @@ def check_network(source_vm: dict[str, Any], destination_vm: dict[str, Any], net
         assert destination_vm_nic["network"] == expected_network_name
 
 
+def check_nic_name_preservation(source_vm_data: dict[str, Any], destination_vm: dict[str, Any]) -> None:
+    """Verify that guest OS NIC names are preserved after migration.
+
+    Compares source NIC names (collected via VMware Guest Operations before migration)
+    against destination NIC names (reported by guest agent on KubeVirt VMI).
+    Matches NICs by MAC address.
+
+    Args:
+        source_vm_data: Source VM data from plan["source_vms_data"], containing
+            network_interfaces with guest_nic_name field
+        destination_vm: Destination VM data from vm_dict(), containing
+            network_interfaces with guest_interface_name field
+
+    Raises:
+        AssertionError: If any NIC name doesn't match between source and destination
+    """
+    source_nics = source_vm_data.get("network_interfaces", [])
+    dest_nics = destination_vm.get("network_interfaces", [])
+
+    for source_nic in source_nics:
+        source_nic_name = source_nic.get("guest_nic_name")
+        if not source_nic_name:
+            continue
+
+        source_mac = source_nic.get("macAddress", "").lower()
+
+        for dest_nic in dest_nics:
+            if dest_nic.get("macAddress", "").lower() == source_mac:
+                dest_nic_name = dest_nic.get("guest_interface_name", "")
+                assert dest_nic_name == source_nic_name, (
+                    f"NIC name mismatch: source {source_nic_name} != destination {dest_nic_name} (MAC {source_mac})"
+                )
+                LOGGER.info(f"NIC name preserved: {source_nic_name} (MAC {source_mac})")
+                break
+
+
 def check_storage(source_vm: dict[str, Any], destination_vm: dict[str, Any], storage_map_resource: StorageMap) -> None:
     destination_disks = destination_vm["disks"]
     source_vm_disks_storage = [disk["storage"]["name"] for disk in source_vm["disks"]]
@@ -1395,6 +1431,16 @@ def check_vms(
                     )
                 except Exception as exp:
                     res[vm_name].append(f"check_static_ip_preservation - {str(exp)}")
+
+            # NIC name preservation check - for vSphere VMs with guest NIC names collected
+            if source_vm_data and source_provider.type == Provider.ProviderType.VSPHERE:
+                try:
+                    check_nic_name_preservation(
+                        source_vm_data=source_vm_data,
+                        destination_vm=destination_vm,
+                    )
+                except Exception as exp:
+                    res[vm_name].append(f"check_nic_name_preservation - {str(exp)}")
         elif vm_ssh_connections:
             LOGGER.info(
                 f"Skipping SSH connectivity check for VM {vm_name} - destination VM is not powered on "
