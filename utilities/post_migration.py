@@ -1439,7 +1439,12 @@ def check_vms(
                     res[vm_name].append(f"check_static_ip_preservation - {str(exp)}")
 
             # NIC name preservation check - for vSphere VMs with guest NIC names collected
-            if source_vm_data and source_provider.type == Provider.ProviderType.VSPHERE:
+            # Requires guest agent to be running so destination VM has guest_interface_name populated
+            if (
+                source_vm_data
+                and destination_vm.get("guest_agent_running")
+                and source_provider.type == Provider.ProviderType.VSPHERE
+            ):
                 try:
                     check_nic_name_preservation(
                         source_vm_data=source_vm_data,

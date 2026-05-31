@@ -275,6 +275,7 @@ def detect_guest_nic_names(
     Raises:
         ValueError: If guest credentials are not found in provider config
         GuestCommandError: If the guest command fails
+        json.JSONDecodeError: If the command output is not valid JSON
     """
     try:
         guest_username = source_provider_data["guest_vm_linux_user"]
