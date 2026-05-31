@@ -1150,15 +1150,12 @@ def prepared_plan(
                         "Static IP verification may not work for this VM."
                     )
 
-                try:
-                    detect_guest_nic_names(
-                        source_provider=source_provider,
-                        vm=provider_vm_api,
-                        source_provider_data=fixture_store["source_provider_data"],
-                        vm_details=source_vm_details,
-                    )
-                except Exception as e:
-                    LOGGER.warning(f"Failed to detect guest NIC names for VM {vm['name']}: {e}")
+                detect_guest_nic_names(
+                    source_provider=source_provider,
+                    vm=provider_vm_api,
+                    source_provider_data=fixture_store["source_provider_data"],
+                    vm_details=source_vm_details,
+                )
 
         # Relink shared disks between clones (VMware-specific)
         # When VMs with shared disks are cloned, each clone gets independent disk copies,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shlex
 import ssl
 import urllib.request
@@ -259,8 +260,11 @@ def detect_guest_nic_names(
 ) -> None:
     """Detect guest OS NIC names via VMware Guest Operations API.
 
-    Runs 'ip link' inside the guest to collect NIC name and MAC address pairs,
+    Runs 'ip -j link show' inside the guest to collect NIC name and MAC address pairs,
     then stores the guest NIC name on matching network interfaces in vm_details.
+
+    Note: Only supports Linux guest operating systems. The caller must ensure this
+    is only invoked for VMs running a Linux guest OS.
 
     Args:
         source_provider: VMware provider instance with content and host attributes
@@ -291,27 +295,20 @@ def detect_guest_nic_names(
     if vcenter_host is None:
         raise ValueError(f"vCenter host not available for provider used by VM {vm.name}")
 
-    script = (
-        "ip -o link show | awk -F': ' '{print $2}' | while read dev; do "
-        "mac=$(cat /sys/class/net/$dev/address 2>/dev/null); "
-        '[ -n "$mac" ] && [ "$dev" != "lo" ] && printf "%s|%s\\n" "$dev" "$mac"; '
-        "done"
-    )
-
     output = run_command_in_vmware_guest(
         content=source_provider.content,
         vm=vm,
         auth=auth,
-        command=script,
+        command="ip -j link show",
         vcenter_host=vcenter_host,
     )
 
-    for line in output.strip().splitlines():
-        if "|" not in line:
+    interfaces = json.loads(output)
+    for iface in interfaces:
+        nic_name = iface.get("ifname", "")
+        mac = iface.get("address", "").lower()
+        if not mac or nic_name == "lo":
             continue
-        nic_name, mac = line.split("|", 1)
-        nic_name = nic_name.strip()
-        mac = mac.strip().lower()
 
         for nic in vm_details.get("network_interfaces", []):
             if nic.get("macAddress", "").lower() == mac:

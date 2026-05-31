@@ -722,10 +722,16 @@ def check_nic_name_preservation(source_vm_data: dict[str, Any], destination_vm: 
             network_interfaces with guest_interface_name field
 
     Raises:
+        ValueError: If source or destination has no network interfaces
         AssertionError: If any NIC name doesn't match between source and destination
     """
     source_nics = source_vm_data.get("network_interfaces", [])
     dest_nics = destination_vm.get("network_interfaces", [])
+
+    if not source_nics:
+        raise ValueError("Source VM has no network interfaces — cannot verify NIC name preservation")
+    if not dest_nics:
+        raise ValueError("Destination VM has no network interfaces — cannot verify NIC name preservation")
 
     for source_nic in source_nics:
         source_nic_name = source_nic.get("guest_nic_name")
