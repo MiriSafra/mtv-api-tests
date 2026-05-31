@@ -13,7 +13,6 @@ remote_ocp_cluster: str = ""
 snapshots_interval: int = 2
 mins_before_cutover: int = 5
 plan_wait_timeout: int = 3600
-
 tests_params: dict = {
     "test_sanity_warm_mtv_migration": {
         "virtual_machines": [
@@ -605,6 +604,12 @@ tests_params: dict = {
         "pre_hook": {"expected_result": "succeed"},
         "post_hook": {"expected_result": "fail"},
         "expected_migration_result": "fail",
+    },
+    "test_upgrade_cold_migration": {
+        "virtual_machines": [
+            {"name": "mtv-tests-rhel8", "guest_agent": True},
+        ],
+        "warm_migration": False,
     },
 }
 
