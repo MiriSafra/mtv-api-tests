@@ -1076,6 +1076,14 @@ def prepared_plan(
                 "does not implement relink_shared_disks"
             )
 
+        if plan.get("preserve_static_ips"):
+            for vm in virtual_machines:
+                if vm.get("source_vm_power") != "on":
+                    raise ValueError(
+                        f"preserve_static_ips requires source_vm_power='on' for VM '{vm['name']}'. "
+                        "Guest tools must be running to collect static IP and NIC name data."
+                    )
+
         original_source_vm_names: list[str] = [vm["name"] for vm in virtual_machines] if has_shared_disk_config else []
         cloned_vm_objects: list[Any] = []
 
