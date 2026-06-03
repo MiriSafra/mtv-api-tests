@@ -117,6 +117,8 @@ def _get_shared_disk_device(prepared_plan: dict[str, Any], vm_name: str) -> str:
     disks: list[dict[str, Any]] = prepared_plan["source_vms_data"][vm_name]["disks"]
     if not disks:
         raise ValueError(f"No disks found for VM '{vm_name}' in source_vms_data")
+    # Shared disk is on a separate SCSI controller (Multi-writer requires bus sharing).
+    # Assumes no non-shared disks on separate controllers — valid for current test VM layout.
     sorted_disks = sorted(disks, key=lambda d: (d["controller_key"], d["unit_number"]))
     boot_controller: int = sorted_disks[0]["controller_key"]
     for index, disk in enumerate(sorted_disks):
