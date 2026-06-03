@@ -637,7 +637,6 @@ tests_params: dict = {
         ],
         "warm_migration": False,
         "migrate_shared_disks": True,
-        "shared_disk_device": "/dev/vdc",
         "target_power_state": "on",
     },
     "test_upgrade_cold_migration": {

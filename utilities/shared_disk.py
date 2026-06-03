@@ -97,6 +97,34 @@ def _write_marker(ssh_conn: VMSSHConnection, file_path: str, content: str, vm_la
     _run_cmd_on_vm(ssh_conn, ["sudo", "sync"], f"{vm_label} sync")
 
 
+def _get_shared_disk_device(prepared_plan: dict[str, Any], vm_name: str) -> str:
+    """Determine the shared disk device path from source VM disk layout.
+
+    The shared disk is on a separate SCSI controller (Multi-writer requires
+    bus sharing). After migration, KubeVirt assigns /dev/vdX in the same
+    order as the source SCSI layout.
+
+    Args:
+        prepared_plan (dict[str, Any]): Plan config with source_vms_data.
+        vm_name (str): Name of the VM to find the shared disk for.
+
+    Returns:
+        str: Device path (e.g., "/dev/vdc").
+
+    Raises:
+        ValueError: If no shared disk found (no disk on a different controller).
+    """
+    disks: list[dict[str, Any]] = prepared_plan["source_vms_data"][vm_name]["disks"]
+    sorted_disks = sorted(disks, key=lambda d: (d["controller_key"], d["unit_number"]))
+    boot_controller: int = sorted_disks[0]["controller_key"]
+    for index, disk in enumerate(sorted_disks):
+        if disk["controller_key"] != boot_controller:
+            device_path = f"/dev/vd{chr(ord('a') + index)}"
+            LOGGER.info(f"Detected shared disk for VM '{vm_name}' at index {index}: {device_path}")
+            return device_path
+    raise ValueError(f"No shared disk found for VM '{vm_name}' — all disks on same SCSI controller")
+
+
 def verify_shared_disk_data(
     prepared_plan: dict[str, Any],
     vm_ssh_connections: SSHConnectionManager,
@@ -113,8 +141,7 @@ def verify_shared_disk_data(
     3. VM1: flush block device cache, remount, read VM2's data, unmount
 
     Args:
-        prepared_plan (dict[str, Any]): Plan config with virtual_machines, source_vms_data,
-            and shared_disk_device.
+        prepared_plan (dict[str, Any]): Plan config with virtual_machines and source_vms_data.
         vm_ssh_connections (SSHConnectionManager): SSH connection manager.
         source_provider_data (dict[str, Any]): Provider configuration from .providers.json.
 
@@ -124,7 +151,7 @@ def verify_shared_disk_data(
     """
     vm1_name = prepared_plan["virtual_machines"][0]["name"]
     vm2_name = prepared_plan["virtual_machines"][1]["name"]
-    shared_disk_device: str = prepared_plan["shared_disk_device"]
+    shared_disk_device = _get_shared_disk_device(prepared_plan, vm1_name)
 
     LOGGER.info(f"Verifying shared disk between {vm1_name} and {vm2_name}")
 
