@@ -104,6 +104,12 @@ def _get_shared_disk_device(prepared_plan: dict[str, Any], vm_name: str) -> str:
     bus sharing). After migration, KubeVirt assigns /dev/vdX in the same
     order as the source SCSI layout.
 
+    Note:
+        Assumes exactly two SCSI controllers with the shared disk alone on the
+        non-boot controller. This matches the current test VM layout. If VMs
+        gain additional controllers with non-shared disks, this logic would need
+        to match by exact SCSI position instead.
+
     Args:
         prepared_plan (dict[str, Any]): Plan config with source_vms_data.
         vm_name (str): Name of the VM to find the shared disk for.
