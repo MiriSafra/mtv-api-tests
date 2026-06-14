@@ -115,7 +115,7 @@ def _get_pvc_names_from_vm(
         vm_name (str): Destination VM name (already sanitized for Kubernetes).
 
     Returns:
-        list[str]: PVC claim names in volume order (cloud-init excluded).
+        list[str]: PVC claim names in volume order.
 
     Raises:
         ValueError: If the VM has no running instance (VMI).
@@ -184,6 +184,11 @@ def _get_shared_disk_devices(
     if not shared_pvcs:
         raise ValueError(
             f"No shared PVC between '{vm1_dest_name}' and '{vm2_dest_name}'. VM1 PVCs: {vm1_pvcs}, VM2 PVCs: {vm2_pvcs}"
+        )
+    if len(shared_pvcs) > 1:
+        raise ValueError(
+            f"Multiple shared PVCs between '{vm1_dest_name}' and '{vm2_dest_name}': {shared_pvcs}. "
+            "Only single shared disk is supported."
         )
 
     shared_pvc = shared_pvcs.pop()
