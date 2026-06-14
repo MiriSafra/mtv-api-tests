@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import json
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -212,6 +213,84 @@ def verify_data_integrity(
         f"marker file {DATA_INTEGRITY_FILE} exists with expected content {marker_content!r}. "
         f"Pre-migration data survived the migration process."
     )
+
+
+def _find_luks_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Recursively search lsblk blockdevice tree for LUKS-encrypted devices.
+
+    Args:
+        devices (list[dict[str, Any]]): List of blockdevice dicts from lsblk -J -f output.
+
+    Returns:
+        list[dict[str, Any]]: Blockdevice entries with fstype == "crypto_LUKS".
+    """
+    found: list[dict[str, Any]] = []
+    for dev in devices:
+        if dev.get("fstype") == "crypto_LUKS":
+            found.append(dev)
+        found.extend(_find_luks_devices(dev.get("children", [])))
+    return found
+
+
+def verify_luks_encryption(
+    vm_name: str,
+    vm_ssh_connections: SSHConnectionManager,
+    source_provider_data: dict[str, Any],
+    source_vm_info: dict[str, Any],
+    timeout: int = 300,
+    retry_delay: int = 15,
+) -> None:
+    """Verify that LUKS disk encryption is active on the migrated VM.
+
+    SSHs into the migrated VM, runs lsblk -J -f for structured JSON output,
+    and searches the blockdevice tree for crypto_LUKS entries.
+
+    Args:
+        vm_name (str): Name of the migrated VM.
+        vm_ssh_connections (SSHConnectionManager): SSH connection manager.
+        source_provider_data (dict[str, Any]): Provider configuration with guest credentials.
+        source_vm_info (dict[str, Any]): VM information including OS type.
+        timeout (int): Maximum seconds to wait for SSH connectivity.
+        retry_delay (int): Seconds between SSH retry attempts.
+
+    Raises:
+        AssertionError: If no LUKS-encrypted devices are found.
+        TimeoutExpiredError: If SSH connectivity cannot be established.
+    """
+    LOGGER.info(f"Verifying LUKS encryption on migrated VM {vm_name}")
+
+    ssh_username, ssh_password = get_ssh_credentials_from_provider_config(source_provider_data, source_vm_info)
+    ssh_conn = vm_ssh_connections.create(vm_name=vm_name, username=ssh_username, password=ssh_password)
+
+    def _check_luks() -> list[dict[str, Any]] | None:
+        try:
+            with ssh_conn:
+                if not ssh_conn.rrmngmnt_host:
+                    LOGGER.warning(f"SSH connection not established for VM {vm_name} - retrying...")
+                    return None
+                executor = ssh_conn.rrmngmnt_host.executor(user=ssh_conn.rrmngmnt_user)
+                executor.port = ssh_conn.local_port
+                rc, stdout, err = executor.run_cmd(["lsblk", "-J", "-f"])
+                if rc != 0:
+                    LOGGER.warning(f"lsblk failed on VM {vm_name}: {err} - retrying...")
+                    return None
+                lsblk_data: dict[str, Any] = json.loads(stdout)
+                return _find_luks_devices(lsblk_data["blockdevices"])
+        except (SSHException, AuthenticationException, NoValidConnectionsError, ChannelException) as e:
+            LOGGER.warning(f"SSH failed for VM {vm_name}: {type(e).__name__}: {e} - retrying...")
+            return None
+
+    luks_devices: list[dict[str, Any]] | None = None
+    try:
+        for sample in TimeoutSampler(wait_timeout=timeout, sleep=retry_delay, func=_check_luks):
+            if sample is not None:
+                luks_devices = sample
+                break
+    except TimeoutExpiredError as e:
+        raise TimeoutExpiredError(f"Could not verify LUKS encryption on VM {vm_name} after {timeout}s") from e
+
+    assert luks_devices, f"No LUKS-encrypted devices found on migrated VM {vm_name}"
+    LOGGER.info(f"LUKS encryption verified on VM {vm_name}: {len(luks_devices)} encrypted device(s) found")
 
 
 def _parse_windows_network_config(ipconfig_output: str) -> dict[str, dict[str, Any]]:

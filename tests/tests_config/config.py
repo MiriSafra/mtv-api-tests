@@ -677,6 +677,27 @@ tests_params: dict = {
         "migrate_shared_disks": True,
         "target_power_state": "on",
     },
+    "test_luks_cold_migration": {
+        "virtual_machines": [
+            {
+                "name": "mtv-tests-rhel9-luks",
+                "source_vm_power": "on",
+                "guest_agent": True,
+                "luks": True,
+            },
+        ],
+        "warm_migration": False,
+    },
+    "test_luks_cold_migration_wrong_key": {
+        "virtual_machines": [
+            {
+                "name": "mtv-tests-rhel9-luks",
+                "luks_passphrase": "WRONGPASSWORD",
+            },
+        ],
+        "warm_migration": False,
+        "expected_migration_result": "fail",
+    },
     "test_upgrade_cold_migration": {
         "virtual_machines": [
             {"name": "mtv-tests-rhel8", "guest_agent": True},

@@ -11,6 +11,7 @@
     "guest_vm_linux_password": "LINUX VMS PASSWORD",  # pragma: allowlist secret
     "guest_vm_win_user": "WINDOWS VMS USERNAME",
     "guest_vm_win_password": "WINDOWS VMS PASSWORD",  # pragma: allowlist secret
+    "luks_passphrase": "LUKS DISK ENCRYPTION PASSPHRASE",  # pragma: allowlist secret
     "vddk_init_image": "<PATH TO VDDK INIT IMAGE>",
     "endpoint_type": "vcenter",
     "luks_passphrase": "<LUKS DISK ENCRYPTION PASSPHRASE>"
