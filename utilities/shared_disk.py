@@ -137,21 +137,24 @@ def _get_pvc_device_targets(
         raise ValueError(f"VM '{vm_name}' in '{target_namespace}' has no running VMI")
 
     vmi = cnv_vm.vmi
+    pvc_devices: dict[str, str] = {}
     try:
         for sample in TimeoutSampler(wait_timeout=300, sleep=5, func=lambda: vmi.instance):
-            if getattr(sample.status, "volumeStatus", None):
+            volume_status = getattr(sample.status, "volumeStatus", None)
+            if not volume_status:
+                continue
+            pvc_devices.clear()
+            for vol_status in volume_status:
+                pvc_info = getattr(vol_status, "persistentVolumeClaimInfo", None)
+                if pvc_info and vol_status.target:
+                    pvc_devices[pvc_info.claimName] = f"/dev/{vol_status.target}"
+            if pvc_devices:
                 break
     except TimeoutExpiredError:
         raise ValueError(
-            f"VM '{vm_name}' in '{target_namespace}' VMI has no volumeStatus after 300s "
+            f"VM '{vm_name}' in '{target_namespace}' VMI has no PVC device targets after 300s "
             f"(phase: {getattr(vmi.instance.status, 'phase', 'unknown')})"
         ) from None
-
-    pvc_devices: dict[str, str] = {}
-    for vol_status in vmi.instance.status.volumeStatus:
-        pvc_info = getattr(vol_status, "persistentVolumeClaimInfo", None)
-        if pvc_info and vol_status.target:
-            pvc_devices[pvc_info.claimName] = f"/dev/{vol_status.target}"
     return pvc_devices
 
 
