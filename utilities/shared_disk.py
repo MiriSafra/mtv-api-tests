@@ -104,6 +104,10 @@ def _write_marker(ssh_conn: VMSSHConnection, file_path: str, content: str, vm_la
     _run_cmd_on_vm(ssh_conn, ["sudo", "sync"], f"{vm_label} sync")
 
 
+_VMI_VOLUME_STATUS_TIMEOUT = 300
+_VMI_VOLUME_STATUS_POLL_INTERVAL = 5
+
+
 def _get_pvc_device_targets(
     ocp_admin_client: "DynamicClient",
     target_namespace: str,
@@ -125,7 +129,8 @@ def _get_pvc_device_targets(
             e.g. ``{"pvc-boot": "/dev/vda", "pvc-shared": "/dev/vdc"}``.
 
     Raises:
-        ValueError: If the VM has no running instance (VMI).
+        ValueError: If the VM has no running instance (VMI), or PVC device
+            targets are not populated within the timeout.
     """
     cnv_vm = VirtualMachine(
         client=ocp_admin_client,
@@ -133,28 +138,38 @@ def _get_pvc_device_targets(
         namespace=target_namespace,
         ensure_exists=True,
     )
-    if not cnv_vm.vmi:
+    vmi = cnv_vm.vmi
+    if not vmi:
         raise ValueError(f"VM '{vm_name}' in '{target_namespace}' has no running VMI")
 
-    vmi = cnv_vm.vmi
     pvc_devices: dict[str, str] = {}
     try:
-        for sample in TimeoutSampler(wait_timeout=300, sleep=5, func=lambda: vmi.instance):
+        for sample in TimeoutSampler(
+            wait_timeout=_VMI_VOLUME_STATUS_TIMEOUT,
+            sleep=_VMI_VOLUME_STATUS_POLL_INTERVAL,
+            func=lambda: vmi.instance,
+        ):
             volume_status = getattr(sample.status, "volumeStatus", None)
             if not volume_status:
                 continue
             pvc_devices.clear()
             for vol_status in volume_status:
                 pvc_info = getattr(vol_status, "persistentVolumeClaimInfo", None)
-                if pvc_info and vol_status.target:
-                    pvc_devices[pvc_info.claimName] = f"/dev/{vol_status.target}"
+                if not pvc_info:
+                    continue
+                if not vol_status.target:
+                    pvc_devices.clear()
+                    break
+                pvc_devices[pvc_info.claimName] = f"/dev/{vol_status.target}"
             if pvc_devices:
                 break
-    except TimeoutExpiredError:
+    except TimeoutExpiredError as exc:
         raise ValueError(
-            f"VM '{vm_name}' in '{target_namespace}' VMI has no PVC device targets after 300s "
-            f"(phase: {getattr(vmi.instance.status, 'phase', 'unknown')})"
-        ) from None
+            f"VM '{vm_name}' in '{target_namespace}' VMI has no PVC device targets "
+            f"after {_VMI_VOLUME_STATUS_TIMEOUT}s "
+            f"(phase: {getattr(sample.status, 'phase', 'unknown')})"
+        ) from exc
+    LOGGER.debug(f"PVC device targets for VM '{vm_name}': {pvc_devices}")
     return pvc_devices
 
 
