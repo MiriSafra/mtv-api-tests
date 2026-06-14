@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 from ocp_resources.virtual_machine import VirtualMachine
 from simple_logger.logger import get_logger
 
+from timeout_sampler import TimeoutExpiredError, TimeoutSampler
+
 from exceptions.exceptions import GuestCommandError
 from utilities.naming import resolve_destination_vm_name
 from utilities.post_migration import get_ssh_credentials_from_provider_config
@@ -102,15 +104,16 @@ def _write_marker(ssh_conn: VMSSHConnection, file_path: str, content: str, vm_la
     _run_cmd_on_vm(ssh_conn, ["sudo", "sync"], f"{vm_label} sync")
 
 
-def _get_pvc_volume_indexes(
+def _get_pvc_device_targets(
     ocp_admin_client: "DynamicClient",
     target_namespace: str,
     vm_name: str,
-) -> dict[str, int]:
-    """Map PVC claim names to their position in the full volume list.
+) -> dict[str, str]:
+    """Map PVC claim names to their runtime device targets from VMI status.
 
-    Iterates ALL volumes (including non-PVC ones like cloudinit) so that
-    the returned index reflects the actual device letter assignment by KubeVirt.
+    Uses ``volumeStatus[].target`` which contains the actual device name
+    assigned by KubeVirt at runtime (e.g. ``vda``), eliminating any
+    dependency on volume ordering or index arithmetic.
 
     Args:
         ocp_admin_client (DynamicClient): OpenShift admin client.
@@ -118,8 +121,8 @@ def _get_pvc_volume_indexes(
         vm_name (str): Destination VM name (already sanitized for Kubernetes).
 
     Returns:
-        dict[str, int]: Mapping of PVC claim name to its position in
-            the full volume list, e.g. {"pvc-boot": 0, "pvc-shared": 2}.
+        dict[str, str]: Mapping of PVC claim name to device path,
+            e.g. ``{"pvc-boot": "/dev/vda", "pvc-shared": "/dev/vdc"}``.
 
     Raises:
         ValueError: If the VM has no running instance (VMI).
@@ -133,68 +136,59 @@ def _get_pvc_volume_indexes(
     if not cnv_vm.vmi:
         raise ValueError(f"VM '{vm_name}' in '{target_namespace}' has no running VMI")
 
-    pvc_indexes: dict[str, int] = {}
-    for idx, vol in enumerate(cnv_vm.vmi.instance.spec.volumes):
-        pvc_ref = getattr(vol, "persistentVolumeClaim", None)
-        if pvc_ref:
-            pvc_indexes[pvc_ref.claimName] = idx
-    return pvc_indexes
+    vmi = cnv_vm.vmi
+    try:
+        for sample in TimeoutSampler(wait_timeout=300, sleep=5, func=lambda: vmi.instance):
+            if getattr(sample.status, "volumeStatus", None):
+                break
+    except TimeoutExpiredError:
+        raise ValueError(
+            f"VM '{vm_name}' in '{target_namespace}' VMI has no volumeStatus after 300s "
+            f"(phase: {getattr(vmi.instance.status, 'phase', 'unknown')})"
+        ) from None
 
-
-def _index_to_device_path(idx: int) -> str:
-    """Convert a zero-based volume index to a virtio device path.
-
-    Args:
-        idx (int): Zero-based volume index.
-
-    Returns:
-        str: Device path (e.g., 0 -> "/dev/vda", 2 -> "/dev/vdc").
-
-    Raises:
-        ValueError: If index exceeds the a-z device range.
-    """
-    if idx > 25:
-        raise ValueError(f"Volume index {idx} exceeds supported device range (a-z)")
-    return f"/dev/vd{chr(ord('a') + idx)}"
+    pvc_devices: dict[str, str] = {}
+    for vol_status in vmi.instance.status.volumeStatus:
+        pvc_info = getattr(vol_status, "persistentVolumeClaimInfo", None)
+        if pvc_info and vol_status.target:
+            pvc_devices[pvc_info.claimName] = f"/dev/{vol_status.target}"
+    return pvc_devices
 
 
 def _get_shared_disk_devices(
     ocp_admin_client: "DynamicClient",
     target_namespace: str,
-    vm1_config: dict[str, Any],
-    vm2_config: dict[str, Any],
+    vm1_dest_name: str,
+    vm2_dest_name: str,
 ) -> dict[str, str]:
     """Determine per-VM shared disk device paths from destination PVC references.
 
     Finds the PVC referenced by both destination VMs (the shared disk) and
-    returns each VM's device path based on the PVC's position in that VM's
-    full volume list (including non-PVC volumes). Handles VMs with different
-    disk layouts correctly. Assumes virtio bus (Forklift default after migration).
+    returns each VM's device path using the runtime device target from
+    ``VMI status.volumeStatus``. Handles VMs with different disk layouts
+    correctly.
 
     Args:
         ocp_admin_client (DynamicClient): OpenShift admin client.
         target_namespace (str): Namespace where migrated VMs live.
-        vm1_config (dict[str, Any]): First VM config dict from prepared_plan["virtual_machines"].
-        vm2_config (dict[str, Any]): Second VM config dict from prepared_plan["virtual_machines"].
+        vm1_dest_name (str): First destination VM name.
+        vm2_dest_name (str): Second destination VM name.
 
     Returns:
         dict[str, str]: Mapping of destination VM name to device path,
-            e.g. {"vm1-name": "/dev/vdc", "vm2-name": "/dev/vdb"}.
+            e.g. ``{"vm1-name": "/dev/vdc", "vm2-name": "/dev/vdb"}``.
 
     Raises:
         ValueError: If no shared PVC found between the two VMs.
     """
-    vm1_dest_name = resolve_destination_vm_name(vm1_config)
-    vm2_dest_name = resolve_destination_vm_name(vm2_config)
+    vm1_pvc_devices = _get_pvc_device_targets(ocp_admin_client, target_namespace, vm1_dest_name)
+    vm2_pvc_devices = _get_pvc_device_targets(ocp_admin_client, target_namespace, vm2_dest_name)
 
-    vm1_pvc_indexes = _get_pvc_volume_indexes(ocp_admin_client, target_namespace, vm1_dest_name)
-    vm2_pvc_indexes = _get_pvc_volume_indexes(ocp_admin_client, target_namespace, vm2_dest_name)
-
-    shared_pvcs = set(vm1_pvc_indexes) & set(vm2_pvc_indexes)
+    shared_pvcs = set(vm1_pvc_devices) & set(vm2_pvc_devices)
     if not shared_pvcs:
         raise ValueError(
             f"No shared PVC between '{vm1_dest_name}' and '{vm2_dest_name}'. "
-            f"VM1 PVCs: {list(vm1_pvc_indexes)}, VM2 PVCs: {list(vm2_pvc_indexes)}"
+            f"VM1 PVCs: {list(vm1_pvc_devices)}, VM2 PVCs: {list(vm2_pvc_devices)}"
         )
     if len(shared_pvcs) > 1:
         raise ValueError(
@@ -203,14 +197,9 @@ def _get_shared_disk_devices(
         )
 
     shared_pvc = shared_pvcs.pop()
-    vm1_idx = vm1_pvc_indexes[shared_pvc]
-    vm2_idx = vm2_pvc_indexes[shared_pvc]
-    vm1_device = _index_to_device_path(vm1_idx)
-    vm2_device = _index_to_device_path(vm2_idx)
-    LOGGER.info(
-        f"Shared PVC '{shared_pvc}': '{vm1_dest_name}' volume index {vm1_idx} -> {vm1_device}, "
-        f"'{vm2_dest_name}' volume index {vm2_idx} -> {vm2_device}"
-    )
+    vm1_device = vm1_pvc_devices[shared_pvc]
+    vm2_device = vm2_pvc_devices[shared_pvc]
+    LOGGER.info(f"Shared PVC '{shared_pvc}': '{vm1_dest_name}' -> {vm1_device}, '{vm2_dest_name}' -> {vm2_device}")
     return {vm1_dest_name: vm1_device, vm2_dest_name: vm2_device}
 
 
@@ -245,9 +234,9 @@ def verify_shared_disk_data(
     vm1_name = vm1_config["name"]
     vm2_name = vm2_config["name"]
     vm_namespace = prepared_plan["_vm_target_namespace"]
-    device_by_vm = _get_shared_disk_devices(ocp_admin_client, vm_namespace, vm1_config, vm2_config)
     vm1_dest_name = resolve_destination_vm_name(vm1_config)
     vm2_dest_name = resolve_destination_vm_name(vm2_config)
+    device_by_vm = _get_shared_disk_devices(ocp_admin_client, vm_namespace, vm1_dest_name, vm2_dest_name)
     vm1_device = device_by_vm[vm1_dest_name]
     vm2_device = device_by_vm[vm2_dest_name]
 
