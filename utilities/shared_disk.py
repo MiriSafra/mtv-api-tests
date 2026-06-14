@@ -138,7 +138,7 @@ def _get_pvc_names_from_vm(
 
 
 def _index_to_device_path(idx: int) -> str:
-    """Convert a zero-based volume index to a Linux device path.
+    """Convert a zero-based volume index to a virtio device path.
 
     Args:
         idx (int): Zero-based volume index.
