@@ -169,7 +169,7 @@ def _get_shared_disk_devices(
     Finds the PVC referenced by both destination VMs (the shared disk) and
     returns each VM's device path based on the PVC's position in that VM's
     full volume list (including non-PVC volumes). Handles VMs with different
-    disk layouts correctly. Works for any bus type (SCSI, IDE, virtio).
+    disk layouts correctly. Assumes virtio bus (Forklift default after migration).
 
     Args:
         ocp_admin_client (DynamicClient): OpenShift admin client.
