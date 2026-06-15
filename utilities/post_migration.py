@@ -275,9 +275,13 @@ def verify_luks_encryption(
                     LOGGER.warning(f"lsblk failed on VM {vm_name}: {err} - retrying...")
                     return None
                 try:
-                    lsblk_data: dict[str, Any] = json.loads(stdout)
+                    lsblk_data = json.loads(stdout)
                 except json.JSONDecodeError as e:
                     LOGGER.warning(f"Invalid lsblk JSON on VM {vm_name}: {e} - retrying...")
+                    return None
+
+                if not isinstance(lsblk_data, dict):
+                    LOGGER.warning(f"lsblk JSON root is not an object on VM {vm_name} - retrying...")
                     return None
 
                 blockdevices = lsblk_data.get("blockdevices")

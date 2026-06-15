@@ -147,6 +147,7 @@ class _LuksColdMigrationBase:
             source_provider_data (dict[str, Any]): Provider configuration from providers.json.
 
         Raises:
+            ValueError: If LUKS passphrase is empty.
             AssertionError: If Plan creation fails.
         """
         populate_vm_ids(prepared_plan, source_provider_inventory)
@@ -154,7 +155,12 @@ class _LuksColdMigrationBase:
         vms = [dict(vm) for vm in prepared_plan["virtual_machines"]]
         for vm in vms:
             vm.pop("luks", None)
-            luks_passphrase = vm.pop("luks_passphrase", None) or source_provider_data["luks_passphrase"]
+            luks_passphrase = vm.pop("luks_passphrase", None)
+            if luks_passphrase is None:
+                luks_passphrase = source_provider_data["luks_passphrase"]
+            if not luks_passphrase:
+                raise ValueError(f"LUKS passphrase is empty for VM '{vm['name']}'")
+
             luks_secret = create_and_store_resource(
                 client=ocp_admin_client,
                 fixture_store=fixture_store,
