@@ -138,17 +138,19 @@ def _get_pvc_device_targets(
         namespace=target_namespace,
         ensure_exists=True,
     )
-    vmi = cnv_vm.vmi
-    if not vmi:
+    if not cnv_vm.vmi:
         raise ValueError(f"VM '{vm_name}' in '{target_namespace}' has no running VMI")
 
     pvc_devices: dict[str, str] = {}
+    sample = None
     try:
         for sample in TimeoutSampler(
             wait_timeout=_VMI_VOLUME_STATUS_TIMEOUT,
             sleep=_VMI_VOLUME_STATUS_POLL_INTERVAL,
-            func=lambda: vmi.instance,
+            func=lambda: cnv_vm.vmi.instance if cnv_vm.vmi else None,
         ):
+            if not sample:
+                continue
             volume_status = getattr(sample.status, "volumeStatus", None)
             if not volume_status:
                 continue
@@ -164,10 +166,10 @@ def _get_pvc_device_targets(
             if pvc_devices:
                 break
     except TimeoutExpiredError as exc:
+        phase = getattr(sample.status, "phase", "unknown") if sample else "no-sample"
         raise ValueError(
             f"VM '{vm_name}' in '{target_namespace}' VMI has no PVC device targets "
-            f"after {_VMI_VOLUME_STATUS_TIMEOUT}s "
-            f"(phase: {getattr(sample.status, 'phase', 'unknown')})"
+            f"after {_VMI_VOLUME_STATUS_TIMEOUT}s (phase: {phase})"
         ) from exc
     LOGGER.debug(f"PVC device targets for VM '{vm_name}': {pvc_devices}")
     return pvc_devices
