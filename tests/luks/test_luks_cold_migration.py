@@ -31,6 +31,12 @@ class _LuksColdMigrationBase:
 
     Provides common storagemap, networkmap, and plan creation methods.
     Subclasses define scenario-specific migration execution and validation.
+
+    VM requirements:
+        The source VM must have a LUKS-encrypted partition (e.g. sda3 with crypto_LUKS)
+        and a key file (e.g. /etc/luks-key) configured in /etc/crypttab for unattended
+        boot. Without a key file, the VM prompts for the passphrase interactively on
+        boot, which blocks SSH access after migration.
     """
 
     storage_map: StorageMap
