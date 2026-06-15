@@ -26,21 +26,11 @@ if TYPE_CHECKING:
     from utilities.ssh_utils import SSHConnectionManager
 
 
-@pytest.mark.vsphere
-@pytest.mark.tier1
-@pytest.mark.parametrize(
-    "class_plan_config",
-    [pytest.param(py_config["tests_params"]["test_luks_cold_migration"])],
-    indirect=True,
-    ids=["luks-cold-correct-key"],
-)
-@pytest.mark.usefixtures("cleanup_migrated_vms")
-@pytest.mark.incremental
-class TestLuksColdMigration:
-    """Cold migration with correct LUKS disk decryption passphrase.
+class _LuksColdMigrationBase:
+    """Shared setup for LUKS cold migration tests.
 
-    Validates that LUKS-encrypted VMs migrate successfully when the correct
-    passphrase is provided, and that disk encryption remains active post-migration.
+    Provides common storagemap, networkmap, and plan creation methods.
+    Subclasses define scenario-specific migration execution and validation.
     """
 
     storage_map: StorageMap
@@ -181,6 +171,24 @@ class TestLuksColdMigration:
         )
         assert self.plan_resource, "Plan creation failed"
 
+
+@pytest.mark.vsphere
+@pytest.mark.tier1
+@pytest.mark.parametrize(
+    "class_plan_config",
+    [pytest.param(py_config["tests_params"]["test_luks_cold_migration"])],
+    indirect=True,
+    ids=["luks-cold-correct-key"],
+)
+@pytest.mark.usefixtures("cleanup_migrated_vms")
+@pytest.mark.incremental
+class TestLuksColdMigration(_LuksColdMigrationBase):
+    """Cold migration with correct LUKS disk decryption passphrase.
+
+    Validates that LUKS-encrypted VMs migrate successfully when the correct
+    passphrase is provided, and that disk encryption remains active post-migration.
+    """
+
     def test_migrate_vms(
         self,
         fixture_store: dict[str, Any],
@@ -280,144 +288,8 @@ class TestLuksColdMigration:
 )
 @pytest.mark.usefixtures("cleanup_migrated_vms")
 @pytest.mark.incremental
-class TestLuksColdMigrationWrongKey:
+class TestLuksColdMigrationWrongKey(_LuksColdMigrationBase):
     """Cold migration with incorrect LUKS passphrase — expects failure at ImageConversion."""
-
-    storage_map: StorageMap
-    network_map: NetworkMap
-    plan_resource: Plan
-
-    def test_create_storagemap(
-        self,
-        prepared_plan: dict[str, Any],
-        fixture_store: dict[str, Any],
-        source_provider: "BaseProvider",
-        destination_provider: "BaseProvider",
-        ocp_admin_client: "DynamicClient",
-        target_namespace: str,
-        source_provider_inventory: "ForkliftInventory",
-    ) -> None:
-        """Create StorageMap resource.
-
-        Args:
-            prepared_plan (dict[str, Any]): Test plan configuration with VM details.
-            fixture_store (dict[str, Any]): Resource tracking dictionary.
-            source_provider (BaseProvider): Source provider connection.
-            destination_provider (BaseProvider): Destination provider connection.
-            ocp_admin_client (DynamicClient): OpenShift admin client.
-            target_namespace (str): Target namespace for migration resources.
-            source_provider_inventory (ForkliftInventory): Source provider inventory.
-
-        Raises:
-            AssertionError: If StorageMap creation fails.
-        """
-        vms = [vm["name"] for vm in prepared_plan["virtual_machines"]]
-        self.__class__.storage_map = get_storage_migration_map(
-            fixture_store=fixture_store,
-            source_provider=source_provider,
-            destination_provider=destination_provider,
-            source_provider_inventory=source_provider_inventory,
-            ocp_admin_client=ocp_admin_client,
-            target_namespace=target_namespace,
-            vms=vms,
-        )
-        assert self.storage_map, "StorageMap creation failed"
-
-    def test_create_networkmap(
-        self,
-        prepared_plan: dict[str, Any],
-        fixture_store: dict[str, Any],
-        source_provider: "BaseProvider",
-        destination_provider: "BaseProvider",
-        ocp_admin_client: "DynamicClient",
-        target_namespace: str,
-        source_provider_inventory: "ForkliftInventory",
-        multus_network_name: dict[str, str],
-    ) -> None:
-        """Create NetworkMap resource.
-
-        Args:
-            prepared_plan (dict[str, Any]): Test plan configuration with VM details.
-            fixture_store (dict[str, Any]): Resource tracking dictionary.
-            source_provider (BaseProvider): Source provider connection.
-            destination_provider (BaseProvider): Destination provider connection.
-            ocp_admin_client (DynamicClient): OpenShift admin client.
-            target_namespace (str): Target namespace for migration resources.
-            source_provider_inventory (ForkliftInventory): Source provider inventory.
-            multus_network_name (dict[str, str]): Multus network name for network mapping.
-
-        Raises:
-            AssertionError: If NetworkMap creation fails.
-        """
-        vms = [vm["name"] for vm in prepared_plan["virtual_machines"]]
-        self.__class__.network_map = get_network_migration_map(
-            fixture_store=fixture_store,
-            source_provider=source_provider,
-            destination_provider=destination_provider,
-            source_provider_inventory=source_provider_inventory,
-            ocp_admin_client=ocp_admin_client,
-            multus_network_name=multus_network_name,
-            target_namespace=target_namespace,
-            vms=vms,
-        )
-        assert self.network_map, "NetworkMap creation failed"
-
-    def test_create_plan(
-        self,
-        prepared_plan: dict[str, Any],
-        fixture_store: dict[str, Any],
-        source_provider: "BaseProvider",
-        destination_provider: "OCPProvider",
-        ocp_admin_client: "DynamicClient",
-        target_namespace: str,
-        source_provider_inventory: "ForkliftInventory",
-        source_provider_data: dict[str, Any],
-    ) -> None:
-        """Create MTV Plan with incorrect LUKS decryption secret.
-
-        The wrong passphrase is specified in config.py as an override, which
-        takes precedence over the real passphrase in providers.json.
-
-        Args:
-            prepared_plan (dict[str, Any]): Test plan configuration with VM details.
-            fixture_store (dict[str, Any]): Resource tracking dictionary.
-            source_provider (BaseProvider): Source provider connection.
-            destination_provider (OCPProvider): Destination provider connection.
-            ocp_admin_client (DynamicClient): OpenShift admin client.
-            target_namespace (str): Target namespace for migration resources.
-            source_provider_inventory (ForkliftInventory): Source provider inventory.
-            source_provider_data (dict[str, Any]): Provider configuration from providers.json.
-
-        Raises:
-            AssertionError: If Plan creation fails.
-        """
-        populate_vm_ids(prepared_plan, source_provider_inventory)
-
-        vms = [dict(vm) for vm in prepared_plan["virtual_machines"]]
-        for vm in vms:
-            vm.pop("luks", None)
-            luks_passphrase = vm.pop("luks_passphrase", None) or source_provider_data["luks_passphrase"]
-            luks_secret = create_and_store_resource(
-                client=ocp_admin_client,
-                fixture_store=fixture_store,
-                resource=Secret,
-                namespace=target_namespace,
-                string_data={"key": luks_passphrase},
-            )
-            vm["luks"] = {"name": luks_secret.name}
-
-        self.__class__.plan_resource = create_plan_resource(
-            fixture_store=fixture_store,
-            source_provider=source_provider,
-            destination_provider=destination_provider,
-            storage_map=self.storage_map,
-            network_map=self.network_map,
-            ocp_admin_client=ocp_admin_client,
-            target_namespace=target_namespace,
-            virtual_machines_list=vms,
-            warm_migration=prepared_plan["warm_migration"],
-        )
-        assert self.plan_resource, "Plan creation failed"
 
     def test_migrate_vms(
         self,
@@ -435,7 +307,7 @@ class TestLuksColdMigrationWrongKey:
         Raises:
             AssertionError: If migration does not raise MigrationPlanExecError.
         """
-        with pytest.raises(MigrationPlanExecError):
+        with pytest.raises(MigrationPlanExecError, match="ImageConversion"):
             execute_migration(
                 fixture_store=fixture_store,
                 ocp_admin_client=ocp_admin_client,

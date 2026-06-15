@@ -274,8 +274,18 @@ def verify_luks_encryption(
                 if rc != 0:
                     LOGGER.warning(f"lsblk failed on VM {vm_name}: {err} - retrying...")
                     return None
-                lsblk_data: dict[str, Any] = json.loads(stdout)
-                return _find_luks_devices(lsblk_data["blockdevices"])
+                try:
+                    lsblk_data: dict[str, Any] = json.loads(stdout)
+                except json.JSONDecodeError as e:
+                    LOGGER.warning(f"Invalid lsblk JSON on VM {vm_name}: {e} - retrying...")
+                    return None
+
+                blockdevices = lsblk_data.get("blockdevices")
+                if not isinstance(blockdevices, list):
+                    LOGGER.warning(f"lsblk output missing/invalid 'blockdevices' on VM {vm_name} - retrying...")
+                    return None
+
+                return _find_luks_devices(blockdevices)
         except (SSHException, AuthenticationException, NoValidConnectionsError, ChannelException) as e:
             LOGGER.warning(f"SSH failed for VM {vm_name}: {type(e).__name__}: {e} - retrying...")
             return None
@@ -283,7 +293,7 @@ def verify_luks_encryption(
     luks_devices: list[dict[str, Any]] | None = None
     try:
         for sample in TimeoutSampler(wait_timeout=timeout, sleep=retry_delay, func=_check_luks):
-            if sample is not None:
+            if sample:
                 luks_devices = sample
                 break
     except TimeoutExpiredError as e:
