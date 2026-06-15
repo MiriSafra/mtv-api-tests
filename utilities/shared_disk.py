@@ -129,8 +129,8 @@ def _get_pvc_device_targets(
             e.g. ``{"pvc-boot": "/dev/vda", "pvc-shared": "/dev/vdc"}``.
 
     Raises:
-        ValueError: If the VM has no running instance (VMI), or PVC device
-            targets are not populated within the timeout.
+        ValueError: If PVC device targets are not populated within the
+            timeout (e.g. VMI not running or volumeStatus not yet available).
     """
     cnv_vm = VirtualMachine(
         client=ocp_admin_client,
@@ -138,9 +138,6 @@ def _get_pvc_device_targets(
         namespace=target_namespace,
         ensure_exists=True,
     )
-    if not cnv_vm.vmi:
-        raise ValueError(f"VM '{vm_name}' in '{target_namespace}' has no running VMI")
-
     pvc_devices: dict[str, str] = {}
     sample = None
     try:
