@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from utilities.ssh_utils import SSHConnectionManager
 
 
-class _LuksColdMigrationBase:
+class LuksColdMigrationBase:
     """Shared setup for LUKS cold migration tests.
 
     Provides common storagemap, networkmap, and plan creation methods.
@@ -155,7 +155,7 @@ class _LuksColdMigrationBase:
 
         vms = [copy.deepcopy(vm) for vm in prepared_plan["virtual_machines"]]
         for vm in vms:
-            vm.pop("luks", None)
+            vm.pop("luks", None)  # Remove config-only marker; all VMs in LUKS tests get secrets
             luks_passphrase = vm.pop("luks_passphrase", None)
             if luks_passphrase is None:
                 luks_passphrase = source_provider_data.get("luks_passphrase")
@@ -198,7 +198,7 @@ class _LuksColdMigrationBase:
 )
 @pytest.mark.usefixtures("cleanup_migrated_vms")
 @pytest.mark.incremental
-class TestLuksColdMigration(_LuksColdMigrationBase):
+class TestLuksColdMigration(LuksColdMigrationBase):
     """Cold migration with correct LUKS disk decryption passphrase.
 
     Validates that LUKS-encrypted VMs migrate successfully when the correct
@@ -304,7 +304,7 @@ class TestLuksColdMigration(_LuksColdMigrationBase):
 )
 @pytest.mark.usefixtures("cleanup_migrated_vms")
 @pytest.mark.incremental
-class TestLuksColdMigrationWrongKey(_LuksColdMigrationBase):
+class TestLuksColdMigrationWrongKey(LuksColdMigrationBase):
     """Cold migration with incorrect LUKS passphrase — expects failure at ImageConversion."""
 
     def test_migrate_vms(
@@ -323,6 +323,7 @@ class TestLuksColdMigrationWrongKey(_LuksColdMigrationBase):
         Raises:
             AssertionError: If migration does not raise MigrationPlanExecError.
         """
+        # ImageConversion is the pipeline step name in plan.instance.status — update if upstream renames it
         with pytest.raises(MigrationPlanExecError, match="ImageConversion"):
             execute_migration(
                 fixture_store=fixture_store,

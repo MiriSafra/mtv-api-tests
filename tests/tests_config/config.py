@@ -684,6 +684,7 @@ tests_params: dict = {
                 "source_vm_power": "on",
                 "guest_agent": True,
                 "luks": True,
+                "clone": True,
             },
         ],
         "warm_migration": False,
@@ -693,6 +694,7 @@ tests_params: dict = {
             {
                 "name": "mtv-tests-rhel9-luks",
                 "luks_passphrase": "WRONGPASSWORD",
+                "clone": True,
             },
         ],
         "warm_migration": False,
