@@ -696,7 +696,6 @@ tests_params: dict = {
             },
         ],
         "warm_migration": False,
-        "expected_migration_result": "fail",
     },
     "test_upgrade_cold_migration": {
         "virtual_machines": [

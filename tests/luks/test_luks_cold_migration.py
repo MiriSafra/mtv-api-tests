@@ -1,3 +1,4 @@
+import copy
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -152,14 +153,17 @@ class _LuksColdMigrationBase:
         """
         populate_vm_ids(prepared_plan, source_provider_inventory)
 
-        vms = [dict(vm) for vm in prepared_plan["virtual_machines"]]
+        vms = [copy.deepcopy(vm) for vm in prepared_plan["virtual_machines"]]
         for vm in vms:
             vm.pop("luks", None)
             luks_passphrase = vm.pop("luks_passphrase", None)
             if luks_passphrase is None:
-                luks_passphrase = source_provider_data["luks_passphrase"]
+                luks_passphrase = source_provider_data.get("luks_passphrase")
             if not luks_passphrase:
-                raise ValueError(f"LUKS passphrase is empty for VM '{vm['name']}'")
+                raise ValueError(
+                    f"LUKS passphrase not found for VM '{vm['name']}' — "
+                    "checked per-VM config and source_provider_data['luks_passphrase']"
+                )
 
             luks_secret = create_and_store_resource(
                 client=ocp_admin_client,
@@ -179,7 +183,7 @@ class _LuksColdMigrationBase:
             ocp_admin_client=ocp_admin_client,
             target_namespace=target_namespace,
             virtual_machines_list=vms,
-            warm_migration=prepared_plan["warm_migration"],
+            warm_migration=prepared_plan.get("warm_migration", False),
         )
         assert self.plan_resource, "Plan creation failed"
 
@@ -224,6 +228,35 @@ class TestLuksColdMigration(_LuksColdMigrationBase):
             target_namespace=target_namespace,
         )
 
+    def test_verify_luks_encryption(
+        self,
+        prepared_plan: dict[str, Any],
+        vm_ssh_connections: "SSHConnectionManager",
+        source_provider_data: dict[str, Any],
+    ) -> None:
+        """Verify LUKS encryption is active on migrated VM.
+
+        SSHs into the migrated VM and checks lsblk JSON output for crypto_LUKS
+        filesystem type, confirming encryption survived the migration.
+
+        Args:
+            prepared_plan (dict[str, Any]): Test plan configuration with VM details.
+            vm_ssh_connections (SSHConnectionManager): SSH connection manager.
+            source_provider_data (dict[str, Any]): Provider configuration with guest credentials.
+
+        Raises:
+            AssertionError: If no LUKS-encrypted devices are found.
+        """
+        for vm in prepared_plan["virtual_machines"]:
+            vm_name = vm["name"]
+            source_vm_info = prepared_plan["source_vms_data"][vm_name]
+            verify_luks_encryption(
+                vm_name=vm_name,
+                vm_ssh_connections=vm_ssh_connections,
+                source_provider_data=source_provider_data,
+                source_vm_info=source_vm_info,
+            )
+
     def test_check_vms(
         self,
         prepared_plan: dict[str, Any],
@@ -259,35 +292,6 @@ class TestLuksColdMigration(_LuksColdMigrationBase):
             source_provider_inventory=source_provider_inventory,
             vm_ssh_connections=vm_ssh_connections,
         )
-
-    def test_verify_luks_encryption(
-        self,
-        prepared_plan: dict[str, Any],
-        vm_ssh_connections: "SSHConnectionManager",
-        source_provider_data: dict[str, Any],
-    ) -> None:
-        """Verify LUKS encryption is active on migrated VM.
-
-        SSHs into the migrated VM and checks lsblk JSON output for crypto_LUKS
-        filesystem type, confirming encryption survived the migration.
-
-        Args:
-            prepared_plan (dict[str, Any]): Test plan configuration with VM details.
-            vm_ssh_connections (SSHConnectionManager): SSH connection manager.
-            source_provider_data (dict[str, Any]): Provider configuration with guest credentials.
-
-        Raises:
-            AssertionError: If no LUKS-encrypted devices are found.
-        """
-        for vm in prepared_plan["virtual_machines"]:
-            vm_name = vm["name"]
-            source_vm_info = prepared_plan["source_vms_data"][vm_name]
-            verify_luks_encryption(
-                vm_name=vm_name,
-                vm_ssh_connections=vm_ssh_connections,
-                source_provider_data=source_provider_data,
-                source_vm_info=source_vm_info,
-            )
 
 
 @pytest.mark.vsphere

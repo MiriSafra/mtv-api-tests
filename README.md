@@ -271,6 +271,7 @@ The Quick Start runs **tier0** tests (smoke tests). You can run other test categ
 | `copyoffload` | Fast migrations via shared storage | Testing storage arrays |
 | `copyoffload_sanity` | Copy-offload sanity subset (see below) | Quick copy-offload validation |
 | `warm` | Warm migrations (VMs stay running) | Specific scenario testing |
+| `tier1` | Feature-specific tests (LUKS, etc.) | Extended functionality validation |
 | `upgrade` | Migration across MTV operator upgrades | Validating upgrade compatibility |
 
 ### Copy-Offload Sanity Tests

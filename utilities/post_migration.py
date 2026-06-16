@@ -297,7 +297,7 @@ def verify_luks_encryption(
     luks_devices: list[dict[str, Any]] | None = None
     try:
         for sample in TimeoutSampler(wait_timeout=timeout, sleep=retry_delay, func=_check_luks):
-            if sample:
+            if sample is not None:
                 luks_devices = sample
                 break
     except TimeoutExpiredError as e:
