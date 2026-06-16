@@ -226,9 +226,13 @@ def _find_luks_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     found: list[dict[str, Any]] = []
     for dev in devices:
+        if not isinstance(dev, dict):
+            continue
         if dev.get("fstype") == "crypto_LUKS":
             found.append(dev)
-        found.extend(_find_luks_devices(dev.get("children", [])))
+        children = dev.get("children") or []
+        if isinstance(children, list):
+            found.extend(_find_luks_devices(children))
     return found
 
 
