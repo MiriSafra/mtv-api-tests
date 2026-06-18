@@ -279,3 +279,242 @@ def verify_shared_disk_data(
         _umount_shared_partition(ssh_vm1, mount_point, "VM1 final")
 
     LOGGER.info("Shared disk verification successful - bidirectional access confirmed")
+
+
+_SHARED_VOLUME_LABEL = "SHARED"
+
+
+def _win_run_powershell(
+    ssh_conn: VMSSHConnection,
+    script: str,
+    description: str,
+) -> str:
+    """Execute a PowerShell command on a Windows VM via SSH.
+
+    SSH on Windows lands in CMD by default. This wraps the script
+    in ``powershell -Command "..."`` so it is interpreted by PowerShell.
+
+    Args:
+        ssh_conn (VMSSHConnection): Active SSH connection to the Windows VM.
+        script (str): PowerShell script to execute (single command or semicolon-separated).
+        description (str): Human-readable description for logging.
+
+    Returns:
+        str: Command stdout.
+
+    Raises:
+        GuestCommandError: If the command fails (non-zero return code).
+    """
+    return _run_cmd_on_vm(ssh_conn, ["powershell", "-Command", script], description)
+
+
+def _win_ensure_shared_volume_online(ssh_conn: VMSSHConnection, vm_label: str) -> str:
+    """Bring offline disks online and return the SHARED volume drive letter.
+
+    After migration, Windows SAN policy may leave non-boot disks offline.
+    This brings all offline disks online, clears read-only flags, then
+    locates the SHARED volume by its filesystem label.
+
+    Args:
+        ssh_conn (VMSSHConnection): Active SSH connection to the Windows VM.
+        vm_label (str): Label for log messages (e.g., "VM1").
+
+    Returns:
+        str: Single-character drive letter (e.g., "E").
+
+    Raises:
+        GuestCommandError: If PowerShell commands fail or SHARED volume not found.
+    """
+    _win_run_powershell(
+        ssh_conn,
+        "Get-Disk | Where-Object {$_.OperationalStatus -eq 'Offline'} | Set-Disk -IsOffline $false | Out-Null",
+        f"{vm_label} bring offline disks online",
+    )
+    _win_run_powershell(
+        ssh_conn,
+        "Get-Disk | Where-Object {$_.IsReadOnly -eq $true -and $_.Number -ne 0} | Set-Disk -IsReadOnly $false | Out-Null",
+        f"{vm_label} clear read-only flags",
+    )
+    return _win_get_shared_drive_letter(ssh_conn, vm_label)
+
+
+_WIN_VOLUME_DISCOVERY_TIMEOUT = 60
+_WIN_VOLUME_DISCOVERY_POLL_INTERVAL = 5
+
+
+def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str) -> str:
+    """Find the drive letter of the SHARED volume by its filesystem label.
+
+    Polls with a timeout because Windows may take a moment to mount the
+    filesystem after the disk is brought online.
+
+    Args:
+        ssh_conn (VMSSHConnection): Active SSH connection to the Windows VM.
+        vm_label (str): Label for log messages.
+
+    Returns:
+        str: Single-character drive letter (e.g., "E").
+
+    Raises:
+        GuestCommandError: If the SHARED volume is not found within the timeout.
+    """
+
+    def _try_get_drive_letter() -> str | None:
+        try:
+            return _win_run_powershell(
+                ssh_conn,
+                f"(Get-Volume -FileSystemLabel '{_SHARED_VOLUME_LABEL}').DriveLetter",
+                f"{vm_label} get SHARED drive letter",
+            ).strip()
+        except GuestCommandError:
+            return None
+
+    try:
+        for sample in TimeoutSampler(
+            wait_timeout=_WIN_VOLUME_DISCOVERY_TIMEOUT,
+            sleep=_WIN_VOLUME_DISCOVERY_POLL_INTERVAL,
+            func=_try_get_drive_letter,
+        ):
+            if sample and len(sample) == 1:
+                LOGGER.info(f"{vm_label}: SHARED volume is drive {sample}:")
+                return sample
+    except TimeoutExpiredError as exc:
+        raise GuestCommandError(
+            f"{vm_label}: Volume with label '{_SHARED_VOLUME_LABEL}' not found after "
+            f"{_WIN_VOLUME_DISCOVERY_TIMEOUT}s. Ensure the shared disk on the source VM "
+            f"has an NTFS volume labeled '{_SHARED_VOLUME_LABEL}'."
+        ) from exc
+    raise GuestCommandError(f"{vm_label}: SHARED volume not found")
+
+
+def _win_refresh_shared_disk(ssh_conn: VMSSHConnection, vm_label: str) -> None:
+    """Flush NTFS metadata cache via disk offline/online cycle.
+
+    NTFS does not see files written by another VM until the disk is taken
+    offline and brought back online. This is the Windows equivalent of
+    ``blockdev --flushbufs`` used in the Linux verification.
+
+    Args:
+        ssh_conn (VMSSHConnection): Active SSH connection to the Windows VM.
+        vm_label (str): Label for log messages.
+
+    Raises:
+        GuestCommandError: If disk offline/online commands fail.
+    """
+    disk_num = _win_run_powershell(
+        ssh_conn,
+        f"(Get-Volume -FileSystemLabel '{_SHARED_VOLUME_LABEL}' | Get-Partition).DiskNumber",
+        f"{vm_label} get SHARED disk number",
+    ).strip()
+    if not disk_num.isdigit():
+        raise GuestCommandError(f"{vm_label}: Cannot determine disk number for SHARED volume (got: '{disk_num}')")
+    _win_run_powershell(
+        ssh_conn, f"Set-Disk -Number {disk_num} -IsOffline $true | Out-Null", f"{vm_label} disk offline"
+    )
+    _win_run_powershell(
+        ssh_conn, f"Set-Disk -Number {disk_num} -IsOffline $false | Out-Null", f"{vm_label} disk online"
+    )
+    LOGGER.info(f"{vm_label}: Refreshed SHARED disk (disk {disk_num})")
+
+
+def _win_write_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: str, content: str, vm_label: str) -> None:
+    """Write a marker file on the SHARED volume.
+
+    Args:
+        ssh_conn (VMSSHConnection): Active SSH connection to the Windows VM.
+        drive_letter (str): Drive letter (e.g., "E").
+        filename (str): File name to write (e.g., "test-vm1.txt").
+        content (str): Text content to write.
+        vm_label (str): Label for log messages.
+
+    Raises:
+        GuestCommandError: If write command fails.
+    """
+    path = f"{drive_letter}:\\{filename}"
+    _win_run_powershell(
+        ssh_conn,
+        f"Set-Content -Path '{path}' -Value '{content}'",
+        f"{vm_label} write {filename}",
+    )
+
+
+def verify_shared_disk_data_windows(
+    prepared_plan: dict[str, Any],
+    vm_ssh_connections: SSHConnectionManager,
+    source_provider_data: dict[str, Any],
+    ocp_admin_client: "DynamicClient",
+) -> None:
+    """Verify shared disk is accessible from both Windows VMs after migration.
+
+    Uses NTFS volume label to locate the shared disk (no Linux device paths).
+    The shared disk must be formatted with NTFS and labeled ``SHARED``.
+
+    Flow:
+    1. Confirm shared PVC exists via KubeVirt volumeStatus
+    2. VM1: bring shared disk online, write test data
+    3. VM2: bring shared disk online (fresh mount, no stale cache), read VM1's data, write own data
+    4. VM1: refresh disk (offline/online to flush NTFS cache), read VM2's data
+
+    Args:
+        prepared_plan (dict[str, Any]): Plan config with virtual_machines, source_vms_data, and _vm_target_namespace.
+        vm_ssh_connections (SSHConnectionManager): SSH connection manager.
+        source_provider_data (dict[str, Any]): Provider configuration from .providers.json.
+        ocp_admin_client (DynamicClient): OpenShift admin client for destination VM lookup.
+
+    Raises:
+        AssertionError: If shared disk data verification fails.
+        GuestCommandError: If SSH or PowerShell commands fail.
+    """
+    vm1_config = prepared_plan["virtual_machines"][0]
+    vm2_config = prepared_plan["virtual_machines"][1]
+    vm1_name = vm1_config["name"]
+    vm2_name = vm2_config["name"]
+    vm_namespace = prepared_plan["_vm_target_namespace"]
+    vm1_dest_name = resolve_destination_vm_name(vm1_config)
+    vm2_dest_name = resolve_destination_vm_name(vm2_config)
+
+    _get_shared_disk_devices(ocp_admin_client, vm_namespace, vm1_dest_name, vm2_dest_name)
+
+    LOGGER.info(f"Verifying Windows shared disk between {vm1_name} and {vm2_name}")
+
+    vm1_info = prepared_plan["source_vms_data"][vm1_name]
+    vm2_info = prepared_plan["source_vms_data"][vm2_name]
+
+    vm1_user, vm1_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm1_info)
+    vm2_user, vm2_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm2_info)
+
+    ssh_vm1 = vm_ssh_connections.create(vm_name=vm1_name, username=vm1_user, password=vm1_pass)
+    ssh_vm2 = vm_ssh_connections.create(vm_name=vm2_name, username=vm2_user, password=vm2_pass)
+
+    test_file_vm1 = "test-vm1.txt"
+    test_file_vm2 = "test-vm2.txt"
+
+    with ssh_vm1:
+        drive1 = _win_ensure_shared_volume_online(ssh_vm1, "VM1")
+        _win_write_marker(ssh_vm1, drive1, test_file_vm1, "Data from VM1", "VM1")
+
+        with ssh_vm2:
+            drive2 = _win_ensure_shared_volume_online(ssh_vm2, "VM2")
+
+            vm2_read = _win_run_powershell(
+                ssh_vm2,
+                f"Get-Content -Path '{drive2}:\\{test_file_vm1}'",
+                "VM2 read VM1 data",
+            )
+            assert "Data from VM1" in vm2_read.strip(), f"VM2 cannot read VM1's data: {vm2_read}"
+            LOGGER.info(f"VM2 ({vm2_name}): Successfully read VM1's data")
+
+            _win_write_marker(ssh_vm2, drive2, test_file_vm2, "Data from VM2", "VM2")
+
+        _win_refresh_shared_disk(ssh_vm1, "VM1")
+        drive1 = _win_get_shared_drive_letter(ssh_vm1, "VM1")
+
+        vm1_read = _win_run_powershell(
+            ssh_vm1,
+            f"Get-Content -Path '{drive1}:\\{test_file_vm2}'",
+            "VM1 read VM2 data",
+        )
+        assert "Data from VM2" in vm1_read.strip(), f"VM1 cannot read VM2's data: {vm1_read}"
+        LOGGER.info(f"VM1 ({vm1_name}): Successfully read VM2's data")
+
+    LOGGER.info("Windows shared disk verification successful - bidirectional access confirmed")

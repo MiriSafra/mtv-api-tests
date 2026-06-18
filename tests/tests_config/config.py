@@ -702,6 +702,25 @@ tests_params: dict = {
         ],
         "warm_migration": False,
     },
+    "test_shared_disk_windows_migration": {
+        "virtual_machines": [
+            {
+                "name": "mtv-tests-shared-win1",
+                "source_vm_power": "off",
+                "guest_agent": True,
+                "migrate_shared_disks": True,
+            },
+            {
+                "name": "mtv-tests-shared-win2",
+                "source_vm_power": "off",
+                "guest_agent": True,
+                "migrate_shared_disks": False,
+            },
+        ],
+        "warm_migration": False,
+        "migrate_shared_disks": True,
+        "target_power_state": "on",
+    },
     "test_upgrade_cold_migration": {
         "virtual_machines": [
             {"name": "mtv-tests-rhel8", "guest_agent": True},
