@@ -369,6 +369,7 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str) -> st
         except GuestCommandError:
             return None
 
+    drive_letter = ""
     try:
         for sample in TimeoutSampler(
             wait_timeout=_WIN_VOLUME_DISCOVERY_TIMEOUT,
@@ -377,14 +378,15 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str) -> st
         ):
             if sample and len(sample) == 1:
                 LOGGER.info(f"{vm_label}: SHARED volume is drive {sample}:")
-                return sample
+                drive_letter = sample
+                break
     except TimeoutExpiredError as exc:
         raise GuestCommandError(
             f"{vm_label}: Volume with label '{_SHARED_VOLUME_LABEL}' not found after "
             f"{_WIN_VOLUME_DISCOVERY_TIMEOUT}s. Ensure the shared disk on the source VM "
             f"has an NTFS volume labeled '{_SHARED_VOLUME_LABEL}'."
         ) from exc
-    raise GuestCommandError(f"{vm_label}: SHARED volume not found")
+    return drive_letter
 
 
 def _win_refresh_shared_disk(ssh_conn: VMSSHConnection, vm_label: str) -> None:
