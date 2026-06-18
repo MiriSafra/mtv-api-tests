@@ -480,11 +480,6 @@ def _win_write_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: st
         f"Set-Content -Path '{ps_path}' -Value '{ps_content}'",
         f"{vm_label} write {filename}",
     )
-    _win_run_powershell(
-        ssh_conn,
-        f"fsutil volume flush {drive_letter}:",
-        f"{vm_label} flush {drive_letter}:",
-    )
 
 
 def verify_shared_disk_data_windows(
