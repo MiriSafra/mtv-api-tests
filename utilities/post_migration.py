@@ -298,6 +298,7 @@ def verify_luks_encryption(
             LOGGER.warning(f"SSH failed for VM {vm_name}: {type(e).__name__}: {e} - retrying...")
             return None
 
+    # None = transient failure (retry); empty list = no LUKS devices (definitive → assert)
     luks_devices: list[dict[str, Any]] | None = None
     try:
         for sample in TimeoutSampler(wait_timeout=timeout, sleep=retry_delay, func=_check_luks):

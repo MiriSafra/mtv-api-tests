@@ -1,10 +1,8 @@
-import copy
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from ocp_resources.network_map import NetworkMap
 from ocp_resources.plan import Plan
-from ocp_resources.secret import Secret
 from ocp_resources.storage_map import StorageMap
 from pytest_testconfig import config as py_config
 
@@ -16,7 +14,6 @@ from utilities.mtv_migration import (
     get_storage_migration_map,
 )
 from utilities.post_migration import check_vms, verify_luks_encryption
-from utilities.resources import create_and_store_resource
 from utilities.utils import populate_vm_ids
 
 if TYPE_CHECKING:
@@ -128,14 +125,12 @@ class LuksColdMigrationBase:
         ocp_admin_client: "DynamicClient",
         target_namespace: str,
         source_provider_inventory: "ForkliftInventory",
-        source_provider_data: dict[str, Any],
+        luks_vm_specs: list[dict[str, Any]],
     ) -> None:
-        """Create MTV Plan with LUKS decryption secret.
+        """Create MTV Plan with LUKS decryption secrets.
 
-        Creates a Kubernetes Secret containing the LUKS passphrase and references
-        it in the VM spec so forklift mounts it for virt-v2v during conversion.
-        The passphrase is resolved from per-VM config override first, then from
-        the provider configuration (providers.json).
+        Uses the luks_vm_specs fixture which resolves passphrases and creates
+        K8s Secrets per-VM. This method only handles plan creation.
 
         Args:
             prepared_plan (dict[str, Any]): Test plan configuration with VM details.
@@ -145,34 +140,12 @@ class LuksColdMigrationBase:
             ocp_admin_client (DynamicClient): OpenShift admin client.
             target_namespace (str): Target namespace for migration resources.
             source_provider_inventory (ForkliftInventory): Source provider inventory.
-            source_provider_data (dict[str, Any]): Provider configuration from providers.json.
+            luks_vm_specs (list[dict[str, Any]]): VM specs with LUKS secrets injected.
 
         Raises:
-            ValueError: If LUKS passphrase is empty.
             AssertionError: If Plan creation fails.
         """
         populate_vm_ids(prepared_plan, source_provider_inventory)
-
-        vms = [copy.deepcopy(vm) for vm in prepared_plan["virtual_machines"]]
-        for vm in vms:
-            vm.pop("luks", None)  # Remove config-only marker; all VMs in LUKS tests get secrets
-            luks_passphrase = vm.pop("luks_passphrase", None)
-            if luks_passphrase is None:
-                luks_passphrase = source_provider_data.get("luks_passphrase")
-            if not luks_passphrase:
-                raise ValueError(
-                    f"LUKS passphrase not found for VM '{vm['name']}' — "
-                    "checked per-VM config and source_provider_data['luks_passphrase']"
-                )
-
-            luks_secret = create_and_store_resource(
-                client=ocp_admin_client,
-                fixture_store=fixture_store,
-                resource=Secret,
-                namespace=target_namespace,
-                string_data={"key": luks_passphrase},
-            )
-            vm["luks"] = {"name": luks_secret.name}
 
         self.__class__.plan_resource = create_plan_resource(
             fixture_store=fixture_store,
@@ -182,7 +155,7 @@ class LuksColdMigrationBase:
             network_map=self.network_map,
             ocp_admin_client=ocp_admin_client,
             target_namespace=target_namespace,
-            virtual_machines_list=vms,
+            virtual_machines_list=luks_vm_specs,
             warm_migration=prepared_plan.get("warm_migration", False),
         )
         assert self.plan_resource, "Plan creation failed"
