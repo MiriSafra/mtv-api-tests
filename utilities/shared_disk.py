@@ -7,6 +7,7 @@ after migration.
 from __future__ import annotations
 
 import shlex
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ocp_resources.virtual_machine import VirtualMachine
@@ -191,6 +192,67 @@ def _get_shared_disk_devices(
     return {vm1_dest_name: vm1_device, vm2_dest_name: vm2_device}
 
 
+@dataclass
+class _SharedDiskContext:
+    """Common context extracted by _prepare_shared_disk_verification."""
+
+    vm1_name: str
+    vm2_name: str
+    vm1_dest_name: str
+    vm2_dest_name: str
+    ssh_vm1: VMSSHConnection
+    ssh_vm2: VMSSHConnection
+    shared_devices: dict[str, str]
+
+
+def _prepare_shared_disk_verification(
+    prepared_plan: dict[str, Any],
+    vm_ssh_connections: SSHConnectionManager,
+    source_provider_data: dict[str, Any],
+    ocp_admin_client: "DynamicClient",
+) -> _SharedDiskContext:
+    """Extract common setup for shared disk verification (Linux and Windows).
+
+    Both verify functions share the same preamble: extract VM configs,
+    resolve destination names, validate shared PVC exists, get SSH
+    credentials, and create SSH connections.
+
+    Args:
+        prepared_plan (dict[str, Any]): Plan config with virtual_machines, source_vms_data, and _vm_target_namespace.
+        vm_ssh_connections (SSHConnectionManager): SSH connection manager.
+        source_provider_data (dict[str, Any]): Provider configuration from .providers.json.
+        ocp_admin_client (DynamicClient): OpenShift admin client for destination VM lookup.
+
+    Returns:
+        _SharedDiskContext: Common context for shared disk verification.
+    """
+    vm1_config = prepared_plan["virtual_machines"][0]
+    vm2_config = prepared_plan["virtual_machines"][1]
+    vm1_name = vm1_config["name"]
+    vm2_name = vm2_config["name"]
+    vm_namespace = prepared_plan["_vm_target_namespace"]
+    vm1_dest_name = resolve_destination_vm_name(vm1_config)
+    vm2_dest_name = resolve_destination_vm_name(vm2_config)
+    shared_devices = _get_shared_disk_devices(ocp_admin_client, vm_namespace, vm1_dest_name, vm2_dest_name)
+
+    vm1_info = prepared_plan["source_vms_data"][vm1_name]
+    vm2_info = prepared_plan["source_vms_data"][vm2_name]
+    vm1_user, vm1_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm1_info)
+    vm2_user, vm2_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm2_info)
+    ssh_vm1 = vm_ssh_connections.create(vm_name=vm1_name, username=vm1_user, password=vm1_pass)
+    ssh_vm2 = vm_ssh_connections.create(vm_name=vm2_name, username=vm2_user, password=vm2_pass)
+
+    return _SharedDiskContext(
+        vm1_name=vm1_name,
+        vm2_name=vm2_name,
+        vm1_dest_name=vm1_dest_name,
+        vm2_dest_name=vm2_dest_name,
+        ssh_vm1=ssh_vm1,
+        ssh_vm2=ssh_vm2,
+        shared_devices=shared_devices,
+    )
+
+
 def verify_shared_disk_data(
     prepared_plan: dict[str, Any],
     vm_ssh_connections: SSHConnectionManager,
@@ -217,27 +279,11 @@ def verify_shared_disk_data(
         AssertionError: If shared disk data verification fails.
         GuestCommandError: If SSH commands fail.
     """
-    vm1_config = prepared_plan["virtual_machines"][0]
-    vm2_config = prepared_plan["virtual_machines"][1]
-    vm1_name = vm1_config["name"]
-    vm2_name = vm2_config["name"]
-    vm_namespace = prepared_plan["_vm_target_namespace"]
-    vm1_dest_name = resolve_destination_vm_name(vm1_config)
-    vm2_dest_name = resolve_destination_vm_name(vm2_config)
-    device_by_vm = _get_shared_disk_devices(ocp_admin_client, vm_namespace, vm1_dest_name, vm2_dest_name)
-    vm1_device = device_by_vm[vm1_dest_name]
-    vm2_device = device_by_vm[vm2_dest_name]
+    ctx = _prepare_shared_disk_verification(prepared_plan, vm_ssh_connections, source_provider_data, ocp_admin_client)
+    vm1_device = ctx.shared_devices[ctx.vm1_dest_name]
+    vm2_device = ctx.shared_devices[ctx.vm2_dest_name]
 
-    LOGGER.info(f"Verifying shared disk between {vm1_name} and {vm2_name}")
-
-    vm1_info = prepared_plan["source_vms_data"][vm1_name]
-    vm2_info = prepared_plan["source_vms_data"][vm2_name]
-
-    vm1_user, vm1_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm1_info)
-    vm2_user, vm2_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm2_info)
-
-    ssh_vm1 = vm_ssh_connections.create(vm_name=vm1_name, username=vm1_user, password=vm1_pass)
-    ssh_vm2 = vm_ssh_connections.create(vm_name=vm2_name, username=vm2_user, password=vm2_pass)
+    LOGGER.info(f"Verifying shared disk between {ctx.vm1_name} and {ctx.vm2_name}")
 
     mount_point = "/mnt/shared_disk"
     vm1_partition = f"{vm1_device}1"
@@ -245,38 +291,35 @@ def verify_shared_disk_data(
     test_file_vm1 = f"{mount_point}/test-vm1.txt"
     test_file_vm2 = f"{mount_point}/test-vm2.txt"
 
-    # VM1: Mount shared disk, write test data, unmount (keep connection open for verify phase)
-    LOGGER.info(f"VM1 ({vm1_name}): Mounting shared disk {vm1_partition}")
-    with ssh_vm1:
-        _mount_shared_partition(ssh_vm1, vm1_partition, mount_point, "VM1")
-        _write_marker(ssh_vm1, test_file_vm1, "Data from VM1", "VM1")
-        _umount_shared_partition(ssh_vm1, mount_point, "VM1")
+    LOGGER.info(f"VM1 ({ctx.vm1_name}): Mounting shared disk {vm1_partition}")
+    with ctx.ssh_vm1:
+        _mount_shared_partition(ctx.ssh_vm1, vm1_partition, mount_point, "VM1")
+        _write_marker(ctx.ssh_vm1, test_file_vm1, "Data from VM1", "VM1")
+        _umount_shared_partition(ctx.ssh_vm1, mount_point, "VM1")
 
-        # VM2: Mount shared disk, verify VM1's data, write own data, unmount
-        LOGGER.info(f"VM2 ({vm2_name}): Mounting shared disk {vm2_partition}")
-        with ssh_vm2:
-            _mount_shared_partition(ssh_vm2, vm2_partition, mount_point, "VM2")
+        LOGGER.info(f"VM2 ({ctx.vm2_name}): Mounting shared disk {vm2_partition}")
+        with ctx.ssh_vm2:
+            _mount_shared_partition(ctx.ssh_vm2, vm2_partition, mount_point, "VM2")
 
-            vm2_read_data = run_cmd_in_vm(ssh_vm2, ["sudo", "cat", test_file_vm1], "VM2 read VM1 data")
+            vm2_read_data = run_cmd_in_vm(ctx.ssh_vm2, ["sudo", "cat", test_file_vm1], "VM2 read VM1 data")
             assert "Data from VM1" in vm2_read_data.strip(), f"VM2 cannot read VM1's data: {vm2_read_data}"
-            LOGGER.info(f"VM2 ({vm2_name}): Successfully read VM1's data")
+            LOGGER.info(f"VM2 ({ctx.vm2_name}): Successfully read VM1's data")
 
-            _write_marker(ssh_vm2, test_file_vm2, "Data from VM2", "VM2")
-            _umount_shared_partition(ssh_vm2, mount_point, "VM2")
+            _write_marker(ctx.ssh_vm2, test_file_vm2, "Data from VM2", "VM2")
+            _umount_shared_partition(ctx.ssh_vm2, mount_point, "VM2")
 
-        # Verify bidirectional access (remount with cache flush)
-        LOGGER.info(f"VM1 ({vm1_name}): Verifying bidirectional access")
+        LOGGER.info(f"VM1 ({ctx.vm1_name}): Verifying bidirectional access")
         # Flush block device buffers to clear stale kernel cache.
         # XFS (non-cluster filesystem) retains metadata in kernel buffer cache.
         # Without this, VM1 won't see VM2's newly written files even after remount.
-        run_cmd_in_vm(ssh_vm1, ["sudo", "blockdev", "--flushbufs", vm1_device], "VM1 flush buffers")
-        run_cmd_in_vm(ssh_vm1, ["sudo", "mount", vm1_partition, mount_point], "VM1 remount")
+        run_cmd_in_vm(ctx.ssh_vm1, ["sudo", "blockdev", "--flushbufs", vm1_device], "VM1 flush buffers")
+        run_cmd_in_vm(ctx.ssh_vm1, ["sudo", "mount", vm1_partition, mount_point], "VM1 remount")
 
-        vm1_read_data = run_cmd_in_vm(ssh_vm1, ["sudo", "cat", test_file_vm2], "VM1 read VM2 data")
+        vm1_read_data = run_cmd_in_vm(ctx.ssh_vm1, ["sudo", "cat", test_file_vm2], "VM1 read VM2 data")
         assert "Data from VM2" in vm1_read_data.strip(), f"VM1 cannot read VM2's data: {vm1_read_data}"
-        LOGGER.info(f"VM1 ({vm1_name}): Successfully read VM2's data")
+        LOGGER.info(f"VM1 ({ctx.vm1_name}): Successfully read VM2's data")
 
-        _umount_shared_partition(ssh_vm1, mount_point, "VM1 final")
+        _umount_shared_partition(ctx.ssh_vm1, mount_point, "VM1 final")
 
     LOGGER.info("Shared disk verification successful - bidirectional access confirmed")
 
@@ -369,7 +412,6 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str) -> st
         except GuestCommandError:
             return None
 
-    drive_letter = ""
     try:
         for sample in TimeoutSampler(
             wait_timeout=_WIN_VOLUME_DISCOVERY_TIMEOUT,
@@ -378,15 +420,14 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str) -> st
         ):
             if sample and len(sample) == 1:
                 LOGGER.info(f"{vm_label}: SHARED volume is drive {sample}:")
-                drive_letter = sample
-                break
+                return sample
     except TimeoutExpiredError as exc:
         raise GuestCommandError(
             f"{vm_label}: Volume with label '{_SHARED_VOLUME_LABEL}' not found after "
             f"{_WIN_VOLUME_DISCOVERY_TIMEOUT}s. Ensure the shared disk on the source VM "
             f"has an NTFS volume labeled '{_SHARED_VOLUME_LABEL}'."
         ) from exc
-    return drive_letter
+    raise GuestCommandError(f"{vm_label}: SHARED volume discovery ended without result")
 
 
 def _win_refresh_shared_disk(ssh_conn: VMSSHConnection, vm_label: str) -> None:
@@ -420,7 +461,7 @@ def _win_refresh_shared_disk(ssh_conn: VMSSHConnection, vm_label: str) -> None:
 
 
 def _win_write_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: str, content: str, vm_label: str) -> None:
-    """Write a marker file on the SHARED volume.
+    """Write a marker file on the SHARED volume and flush to disk.
 
     Args:
         ssh_conn (VMSSHConnection): Active SSH connection to the Windows VM.
@@ -430,13 +471,19 @@ def _win_write_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: st
         vm_label (str): Label for log messages.
 
     Raises:
-        GuestCommandError: If write command fails.
+        GuestCommandError: If write or flush command fails.
     """
-    path = f"{drive_letter}:\\{filename}"
+    ps_path = f"{drive_letter}:\\{filename}".replace("'", "''")
+    ps_content = content.replace("'", "''")
     _win_run_powershell(
         ssh_conn,
-        f"Set-Content -Path '{path}' -Value '{content}'",
+        f"Set-Content -Path '{ps_path}' -Value '{ps_content}'",
         f"{vm_label} write {filename}",
+    )
+    _win_run_powershell(
+        ssh_conn,
+        f"fsutil volume flush {drive_letter}:",
+        f"{vm_label} flush {drive_letter}:",
     )
 
 
@@ -467,56 +514,40 @@ def verify_shared_disk_data_windows(
         AssertionError: If shared disk data verification fails.
         GuestCommandError: If SSH or PowerShell commands fail.
     """
-    vm1_config = prepared_plan["virtual_machines"][0]
-    vm2_config = prepared_plan["virtual_machines"][1]
-    vm1_name = vm1_config["name"]
-    vm2_name = vm2_config["name"]
-    vm_namespace = prepared_plan["_vm_target_namespace"]
-    vm1_dest_name = resolve_destination_vm_name(vm1_config)
-    vm2_dest_name = resolve_destination_vm_name(vm2_config)
+    # Shared PVC validated by helper (device paths unused — Windows uses volume labels)
+    ctx = _prepare_shared_disk_verification(prepared_plan, vm_ssh_connections, source_provider_data, ocp_admin_client)
 
-    _get_shared_disk_devices(ocp_admin_client, vm_namespace, vm1_dest_name, vm2_dest_name)
-
-    LOGGER.info(f"Verifying Windows shared disk between {vm1_name} and {vm2_name}")
-
-    vm1_info = prepared_plan["source_vms_data"][vm1_name]
-    vm2_info = prepared_plan["source_vms_data"][vm2_name]
-
-    vm1_user, vm1_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm1_info)
-    vm2_user, vm2_pass = get_ssh_credentials_from_provider_config(source_provider_data, vm2_info)
-
-    ssh_vm1 = vm_ssh_connections.create(vm_name=vm1_name, username=vm1_user, password=vm1_pass)
-    ssh_vm2 = vm_ssh_connections.create(vm_name=vm2_name, username=vm2_user, password=vm2_pass)
+    LOGGER.info(f"Verifying Windows shared disk between {ctx.vm1_name} and {ctx.vm2_name}")
 
     test_file_vm1 = "test-vm1.txt"
     test_file_vm2 = "test-vm2.txt"
 
-    with ssh_vm1:
-        drive1 = _win_ensure_shared_volume_online(ssh_vm1, "VM1")
-        _win_write_marker(ssh_vm1, drive1, test_file_vm1, "Data from VM1", "VM1")
+    with ctx.ssh_vm1:
+        drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1")
+        _win_write_marker(ctx.ssh_vm1, drive1, test_file_vm1, "Data from VM1", "VM1")
 
-        with ssh_vm2:
-            drive2 = _win_ensure_shared_volume_online(ssh_vm2, "VM2")
+        with ctx.ssh_vm2:
+            drive2 = _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2")
 
             vm2_read = _win_run_powershell(
-                ssh_vm2,
+                ctx.ssh_vm2,
                 f"Get-Content -Path '{drive2}:\\{test_file_vm1}'",
                 "VM2 read VM1 data",
             )
             assert "Data from VM1" in vm2_read.strip(), f"VM2 cannot read VM1's data: {vm2_read}"
-            LOGGER.info(f"VM2 ({vm2_name}): Successfully read VM1's data")
+            LOGGER.info(f"VM2 ({ctx.vm2_name}): Successfully read VM1's data")
 
-            _win_write_marker(ssh_vm2, drive2, test_file_vm2, "Data from VM2", "VM2")
+            _win_write_marker(ctx.ssh_vm2, drive2, test_file_vm2, "Data from VM2", "VM2")
 
-        _win_refresh_shared_disk(ssh_vm1, "VM1")
-        drive1 = _win_get_shared_drive_letter(ssh_vm1, "VM1")
+        _win_refresh_shared_disk(ctx.ssh_vm1, "VM1")
+        drive1 = _win_get_shared_drive_letter(ctx.ssh_vm1, "VM1")
 
         vm1_read = _win_run_powershell(
-            ssh_vm1,
+            ctx.ssh_vm1,
             f"Get-Content -Path '{drive1}:\\{test_file_vm2}'",
             "VM1 read VM2 data",
         )
         assert "Data from VM2" in vm1_read.strip(), f"VM1 cannot read VM2's data: {vm1_read}"
-        LOGGER.info(f"VM1 ({vm1_name}): Successfully read VM2's data")
+        LOGGER.info(f"VM1 ({ctx.vm1_name}): Successfully read VM2's data")
 
     LOGGER.info("Windows shared disk verification successful - bidirectional access confirmed")

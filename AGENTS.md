@@ -788,7 +788,7 @@ class TestNameHere:
 - **6-step shared-disk pattern**: storagemap -> networkmap -> plan -> migrate -> verify_shared_disk_data -> check_vms
   Shared disk tests insert `test_verify_shared_disk_data` before `test_check_vms`. This step mounts,
   writes, and reads a shared disk from both VMs to verify bidirectional access after migration.
-  Uses `verify_shared_disk_data()` from `utilities/shared_disk.py`.
+  Uses `verify_shared_disk_data()` (Linux) or `verify_shared_disk_data_windows()` (Windows) from `utilities/shared_disk.py`.
 - **6-step copy-offload pattern**: storagemap -> networkmap -> plan -> migrate -> check_xcopy_used -> check_vms
   `test_check_xcopy_used` calls `verify_xcopy_used()` from `utilities/copyoffload_migration.py`. This step
   validates the transfer mechanism (infrastructure), not the migrated VM (application), and provides
@@ -966,6 +966,7 @@ Class-scoped teardown fixture that cleans up migrated VMs after each test class 
 | `copyoffload_sanity`    | Copy-offload sanity subset             |
 | `copyoffload_snapshots` | Copy-offload snapshot tests (vSphere)  |
 | `vsphere`               | VMware vSphere provider-specific tests |
+| `shared_disk`           | Shared disk migration tests            |
 
 **Marker requirements for collection-time skipping (MUST):**
 
