@@ -693,6 +693,7 @@ tests_params: dict = {
         "virtual_machines": [
             {
                 "name": "mtv-tests-rhel9-luks",
+                "luks": True,
                 "luks_passphrase": "WRONGPASSWORD",
                 "clone": True,
             },

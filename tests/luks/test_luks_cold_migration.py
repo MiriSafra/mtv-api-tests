@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -14,7 +16,6 @@ from utilities.mtv_migration import (
     get_storage_migration_map,
 )
 from utilities.post_migration import check_vms, verify_luks_encryption
-from utilities.utils import populate_vm_ids
 
 if TYPE_CHECKING:
     from kubernetes.dynamic import DynamicClient
@@ -124,13 +125,12 @@ class LuksColdMigrationBase:
         destination_provider: "OCPProvider",
         ocp_admin_client: "DynamicClient",
         target_namespace: str,
-        source_provider_inventory: "ForkliftInventory",
         luks_vm_specs: list[dict[str, Any]],
     ) -> None:
         """Create MTV Plan with LUKS decryption secrets.
 
-        Uses the luks_vm_specs fixture which resolves passphrases and creates
-        K8s Secrets per-VM. This method only handles plan creation.
+        Uses the luks_vm_specs fixture which resolves passphrases, populates VM IDs,
+        and creates K8s Secrets per-VM. This method only handles plan creation.
 
         Args:
             prepared_plan (dict[str, Any]): Test plan configuration with VM details.
@@ -139,14 +139,11 @@ class LuksColdMigrationBase:
             destination_provider (OCPProvider): Destination provider connection.
             ocp_admin_client (DynamicClient): OpenShift admin client.
             target_namespace (str): Target namespace for migration resources.
-            source_provider_inventory (ForkliftInventory): Source provider inventory.
-            luks_vm_specs (list[dict[str, Any]]): VM specs with LUKS secrets injected.
+            luks_vm_specs (list[dict[str, Any]]): VM specs with LUKS secrets and IDs injected.
 
         Raises:
             AssertionError: If Plan creation fails.
         """
-        populate_vm_ids(prepared_plan, source_provider_inventory)
-
         self.__class__.plan_resource = create_plan_resource(
             fixture_store=fixture_store,
             source_provider=source_provider,

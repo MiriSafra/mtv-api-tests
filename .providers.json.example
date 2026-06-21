@@ -14,7 +14,6 @@
     "luks_passphrase": "LUKS DISK ENCRYPTION PASSPHRASE",  # pragma: allowlist secret
     "vddk_init_image": "<PATH TO VDDK INIT IMAGE>",
     "endpoint_type": "vcenter",
-    "luks_passphrase": "<LUKS DISK ENCRYPTION PASSPHRASE>"
   },
 
   "vsphere-copy-offload": {
