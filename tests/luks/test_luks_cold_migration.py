@@ -189,7 +189,7 @@ class TestLuksColdMigration(LuksColdMigrationBase):
             target_namespace (str): Target namespace for migration resources.
 
         Raises:
-            MigrationTimeoutError: If migration fails to complete within timeout.
+            MigrationPlanExecError: If migration execution fails.
         """
         execute_migration(
             fixture_store=fixture_store,
@@ -290,8 +290,6 @@ class TestLuksColdMigrationWrongKey(LuksColdMigrationBase):
             ocp_admin_client (DynamicClient): OpenShift admin client.
             target_namespace (str): Target namespace for migration resources.
 
-        Raises:
-            AssertionError: If migration does not raise MigrationPlanExecError.
         """
         # ImageConversion is the pipeline step name in plan.instance.status — update if upstream renames it
         with pytest.raises(MigrationPlanExecError, match="ImageConversion"):
