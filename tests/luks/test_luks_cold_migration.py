@@ -289,7 +289,6 @@ class TestLuksColdMigrationWrongKey(LuksColdMigrationBase):
             fixture_store (dict[str, Any]): Resource tracking dictionary.
             ocp_admin_client (DynamicClient): OpenShift admin client.
             target_namespace (str): Target namespace for migration resources.
-
         """
         # ImageConversion is the pipeline step name in plan.instance.status — update if upstream renames it
         with pytest.raises(MigrationPlanExecError, match="ImageConversion"):

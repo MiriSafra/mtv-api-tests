@@ -35,6 +35,8 @@ LOGGER = get_logger(name=__name__)
 KUBERNETES_MAX_NAME_LENGTH: int = 63
 KUBERNETES_MAX_GENERATE_NAME_PREFIX_LENGTH: int = 58
 
+_LUKS_FSTYPE = "crypto_LUKS"  # lsblk filesystem-type identifier for LUKS partitions
+
 
 def get_ssh_credentials_from_provider_config(
     source_provider_data: dict[str, Any], source_vm_info: dict[str, Any]
@@ -228,7 +230,7 @@ def _find_luks_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for dev in devices:
         if not isinstance(dev, dict):
             continue
-        if dev.get("fstype") == "crypto_LUKS":
+        if dev.get("fstype") == _LUKS_FSTYPE:
             found.append(dev)
         children = dev.get("children") or []
         if isinstance(children, list):
