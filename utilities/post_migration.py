@@ -228,13 +228,9 @@ def _find_luks_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     found: list[dict[str, Any]] = []
     for dev in devices:
-        if not isinstance(dev, dict):
-            continue
         if dev.get("fstype") == _LUKS_FSTYPE:
             found.append(dev)
-        children = dev.get("children") or []
-        if isinstance(children, list):
-            found.extend(_find_luks_devices(children))
+        found.extend(_find_luks_devices(dev.get("children") or []))
     return found
 
 
@@ -286,16 +282,7 @@ def verify_luks_encryption(
                     LOGGER.warning(f"Invalid lsblk JSON on VM {vm_name}: {e} - retrying...")
                     return None
 
-                if not isinstance(lsblk_data, dict):
-                    LOGGER.warning(f"lsblk JSON root is not an object on VM {vm_name} - retrying...")
-                    return None
-
-                blockdevices = lsblk_data.get("blockdevices")
-                if not isinstance(blockdevices, list):
-                    LOGGER.warning(f"lsblk output missing/invalid 'blockdevices' on VM {vm_name} - retrying...")
-                    return None
-
-                return _find_luks_devices(blockdevices)
+                return _find_luks_devices(lsblk_data["blockdevices"])
         except (SSHException, AuthenticationException, NoValidConnectionsError, ChannelException) as e:
             LOGGER.warning(f"SSH failed for VM {vm_name}: {type(e).__name__}: {e} - retrying...")
             return None
