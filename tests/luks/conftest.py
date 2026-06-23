@@ -50,16 +50,15 @@ def luks_vm_specs(
     vms = [copy.deepcopy(vm) for vm in prepared_plan["virtual_machines"]]
     for vm in vms:
         vm.pop("luks", None)
+        source = "per-VM config"
         luks_passphrase = vm.pop("luks_passphrase", None)
         if luks_passphrase is None:
             luks_passphrase = source_provider_data.get("luks_passphrase")
+            source = "source_provider_data"
             if luks_passphrase:
                 LOGGER.debug(f"Using provider-level LUKS passphrase for VM '{vm['name']}'")
         if not luks_passphrase:
-            raise ValueError(
-                f"LUKS passphrase not found for VM '{vm['name']}' — "
-                "checked per-VM config and source_provider_data['luks_passphrase']"
-            )
+            raise ValueError(f"LUKS passphrase empty/missing for VM '{vm['name']}' (resolved from {source})")
 
         luks_secret = create_and_store_resource(
             client=ocp_admin_client,

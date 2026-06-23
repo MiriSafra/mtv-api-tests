@@ -589,6 +589,40 @@ For technical implementation details, see the
 
 ---
 
+## LUKS Disk Encryption Migration (tier1)
+
+The test suite includes migration tests for VMs with LUKS-encrypted disks. These tests verify that
+LUKS encryption is preserved after cold migration by checking `lsblk` output on the migrated VM.
+
+### Configuration
+
+Add the `luks_passphrase` field to your `.providers.json` provider configuration:
+
+```json
+{
+  "vsphere-8.0.1": {
+    "type": "vsphere",
+    "luks_passphrase": "your-luks-passphrase"
+  }
+}
+```
+
+The passphrase can be configured at two levels:
+
+- **Provider-level** (in `.providers.json`): Used as the default for all LUKS VMs
+- **Per-VM override** (in test config): Set `luks_passphrase` on individual VM entries to override the provider default
+
+### Running LUKS Tests
+
+```bash
+# Run LUKS encryption migration tests
+podman run ... uv run pytest -m tier1 -k luks -v --tc=source_provider:vsphere-8.0.1 ...
+```
+
+See `.providers.json.example` for the complete provider template including the `luks_passphrase` field.
+
+---
+
 ## Target Scheduling Features (MTV 2.10.0+)
 
 Control where and how migrated VMs are scheduled in the target OpenShift cluster.

@@ -730,7 +730,7 @@ from utilities.post_migration import check_vms
 )
 @pytest.mark.usefixtures("cleanup_migrated_vms")
 @pytest.mark.incremental
-@pytest.mark.tier0  # optional: tier0/warm/remote/copyoffload
+@pytest.mark.tier0  # optional: tier0, tier1, warm, remote, copyoffload
 class TestNameHere:
     """Test description."""
 
@@ -826,10 +826,9 @@ tests_params: dict = {
 
 1. Create the test file in the feature subdirectory described in **Test File Location (MUST)** (for example, `tests/<feature>/test_<feature>_migration.py`)
 2. Create a test class with `@pytest.mark.parametrize` using `class_plan_config` and `indirect=True`
-3. Add pytest markers at class level (tier0, warm, remote, copyoffload)
-4. Implement the 5 test methods following the pattern above (6 for copy-offload tests — use the 6-step copy-offload pattern;
-   7 for copy-offload populator throttling tests — use the 7-step copy-offload throttling pattern;
-   6 for LUKS tests — use the 6-step LUKS pattern)
+3. Add pytest markers at class level (tier0, tier1, warm, remote, copyoffload)
+4. Implement the 5 base test methods. Some features need extra validation steps: see **Key Patterns** for the
+   6-step shared-disk, copy-offload, and LUKS patterns, or the 7-step copy-offload throttling pattern
 
 **VM Configuration Options:**
 
@@ -956,6 +955,7 @@ Test classes for marker-gated features must include the feature name in the clas
 - Warm migration → class name must contain `Warm` (e.g., `TestSanityWarmMtvMigration`)
 - Copy-offload snapshots → class name must contain both `Copyoffload` and `Snapshot` (e.g., `TestCopyoffloadThinSnapshotsMigration`)
 - Copy-offload → class name must contain `Copyoffload` (e.g., `TestCopyoffloadThinMigration`)
+- Tier1 features → class name must include the feature name (e.g., `TestLuksColdMigration`)
 
 This ensures discoverability and consistency with the markers applied to the class.
 
