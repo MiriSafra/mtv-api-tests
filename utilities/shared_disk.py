@@ -542,9 +542,11 @@ def verify_shared_disk_data_windows(
     4. VM1: refresh disk (invalidate cache), read VM2's data
 
     Args:
-        prepared_plan (dict[str, Any]): Plan config with virtual_machines, source_vms_data, and _vm_target_namespace.
+        prepared_plan (dict[str, Any]): Heterogeneous pytest fixture dict — schema varies by
+            test scenario (uses virtual_machines, source_vms_data, _vm_target_namespace).
         vm_ssh_connections (SSHConnectionManager): SSH connection manager.
-        source_provider_data (dict[str, Any]): Provider configuration from .providers.json.
+        source_provider_data (dict[str, Any]): Heterogeneous provider config from .providers.json —
+            schema varies by provider type (uses guest credentials keys).
         ocp_admin_client (DynamicClient): OpenShift admin client for destination VM lookup.
 
     Raises:
@@ -584,6 +586,9 @@ def verify_shared_disk_data_windows(
             AuthenticationException,
             NoValidConnectionsError,
             ChannelException,
+            RuntimeError,
+            OSError,
+            ConnectionError,
             GuestCommandError,
             AssertionError,
         ) as e:
