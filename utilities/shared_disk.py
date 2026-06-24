@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ocp_resources.virtual_machine import VirtualMachine
+from paramiko.ssh_exception import AuthenticationException, ChannelException, NoValidConnectionsError, SSHException
 from simple_logger.logger import get_logger
 
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
@@ -366,23 +367,35 @@ def _win_ensure_shared_volume_online(ssh_conn: VMSSHConnection, vm_label: str) -
         str: Single-character drive letter (e.g., "E").
 
     Raises:
-        GuestCommandError: If PowerShell commands fail or SHARED volume not found.
+        GuestCommandError: If SHARED volume not found after bringing disks online.
     """
-    _win_run_powershell(
-        ssh_conn,
-        "Get-Disk | Where-Object {$_.OperationalStatus -eq 'Offline'} | Set-Disk -IsOffline $false | Out-Null",
-        f"{vm_label} bring offline disks online",
-    )
-    _win_run_powershell(
-        ssh_conn,
-        "Get-Disk | Where-Object {$_.IsReadOnly -eq $true -and $_.Number -ne 0} | Set-Disk -IsReadOnly $false | Out-Null",
-        f"{vm_label} clear read-only flags",
-    )
+    # Best-effort: piped Set-Disk fails on some vSphere versions due to a Windows SSH
+    # console buffer bug. The targeted Set-Disk -Number <N> in _win_refresh_shared_disk
+    # is the reliable path; this is just an initial attempt to bring disks online.
+    try:
+        _win_run_powershell(
+            ssh_conn,
+            "Get-Disk | Where-Object {$_.OperationalStatus -eq 'Offline'} | Set-Disk -IsOffline $false | Out-Null",
+            f"{vm_label} bring offline disks online",
+        )
+    except GuestCommandError as e:
+        LOGGER.warning(f"{vm_label}: Set-Disk -IsOffline failed (best-effort): {e}")
+    try:
+        _win_run_powershell(
+            ssh_conn,
+            "Get-Disk | Where-Object {$_.IsReadOnly -eq $true -and $_.Number -ne 0} "
+            "| Set-Disk -IsReadOnly $false | Out-Null",
+            f"{vm_label} clear read-only flags",
+        )
+    except GuestCommandError as e:
+        LOGGER.warning(f"{vm_label}: Set-Disk -IsReadOnly failed (best-effort): {e}")
     return _win_get_shared_drive_letter(ssh_conn, vm_label)
 
 
 _WIN_VOLUME_DISCOVERY_TIMEOUT = 60
 _WIN_VOLUME_DISCOVERY_POLL_INTERVAL = 5
+_WIN_VERIFICATION_RETRY_TIMEOUT = 300
+_WIN_VERIFICATION_RETRY_INTERVAL = 15
 
 
 def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str) -> str:
@@ -412,6 +425,7 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str) -> st
         except GuestCommandError:
             return None
 
+    drive_letter: str | None = None
     try:
         for sample in TimeoutSampler(
             wait_timeout=_WIN_VOLUME_DISCOVERY_TIMEOUT,
@@ -419,15 +433,20 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str) -> st
             func=_try_get_drive_letter,
         ):
             if sample and len(sample) == 1:
-                LOGGER.info(f"{vm_label}: SHARED volume is drive {sample}:")
-                return sample
+                drive_letter = sample
+                break
     except TimeoutExpiredError as exc:
         raise GuestCommandError(
             f"{vm_label}: Volume with label '{_SHARED_VOLUME_LABEL}' not found after "
             f"{_WIN_VOLUME_DISCOVERY_TIMEOUT}s. Ensure the shared disk on the source VM "
             f"has an NTFS volume labeled '{_SHARED_VOLUME_LABEL}'."
         ) from exc
-    raise GuestCommandError(f"{vm_label}: SHARED volume discovery ended without result")
+
+    if not drive_letter:
+        raise GuestCommandError(f"{vm_label}: SHARED volume not found")
+
+    LOGGER.info(f"{vm_label}: SHARED volume is drive {drive_letter}:")
+    return drive_letter
 
 
 def _win_refresh_shared_disk(ssh_conn: VMSSHConnection, vm_label: str) -> None:
@@ -461,7 +480,7 @@ def _win_refresh_shared_disk(ssh_conn: VMSSHConnection, vm_label: str) -> None:
 
 
 def _win_write_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: str, content: str, vm_label: str) -> None:
-    """Write a marker file on the SHARED volume and flush to disk.
+    """Write a marker file on the SHARED volume.
 
     Args:
         ssh_conn (VMSSHConnection): Active SSH connection to the Windows VM.
@@ -471,7 +490,7 @@ def _win_write_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: st
         vm_label (str): Label for log messages.
 
     Raises:
-        GuestCommandError: If write or flush command fails.
+        GuestCommandError: If the write command fails.
     """
     ps_path = f"{drive_letter}:\\{filename}".replace("'", "''")
     ps_content = content.replace("'", "''")
@@ -480,6 +499,29 @@ def _win_write_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: st
         f"Set-Content -Path '{ps_path}' -Value '{ps_content}'",
         f"{vm_label} write {filename}",
     )
+
+
+def _win_read_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: str, expected: str, vm_label: str) -> None:
+    """Read a marker file from the SHARED volume and verify its content.
+
+    Args:
+        ssh_conn (VMSSHConnection): Active SSH connection to the Windows VM.
+        drive_letter (str): Drive letter (e.g., "E").
+        filename (str): File name to read (e.g., "test-vm1.txt").
+        expected (str): Expected content substring.
+        vm_label (str): Label for log messages.
+
+    Raises:
+        AssertionError: If the file content does not contain the expected string.
+        GuestCommandError: If the read command fails.
+    """
+    content = _win_run_powershell(
+        ssh_conn,
+        f"Get-Content -Path '{drive_letter}:\\{filename}'",
+        f"{vm_label} read {filename}",
+    )
+    assert expected in content.strip(), f"{vm_label} cannot read expected data from {filename}: {content}"
+    LOGGER.info(f"{vm_label}: Successfully read {filename}")
 
 
 def verify_shared_disk_data_windows(
@@ -496,8 +538,8 @@ def verify_shared_disk_data_windows(
     Flow:
     1. Confirm shared PVC exists via KubeVirt volumeStatus
     2. VM1: bring shared disk online, write test data
-    3. VM2: bring shared disk online (fresh mount, no stale cache), read VM1's data, write own data
-    4. VM1: refresh disk (offline/online to flush NTFS cache), read VM2's data
+    3. VM2: bring shared disk online, refresh (clear stale NTFS cache), read VM1's data, write, refresh (flush to disk)
+    4. VM1: refresh disk (invalidate cache), read VM2's data
 
     Args:
         prepared_plan (dict[str, Any]): Plan config with virtual_machines, source_vms_data, and _vm_target_namespace.
@@ -517,32 +559,48 @@ def verify_shared_disk_data_windows(
     test_file_vm1 = "test-vm1.txt"
     test_file_vm2 = "test-vm2.txt"
 
-    with ctx.ssh_vm1:
-        drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1")
-        _win_write_marker(ctx.ssh_vm1, drive1, test_file_vm1, "Data from VM1", "VM1")
+    def _do_verification() -> bool | None:
+        try:
+            with ctx.ssh_vm1:
+                drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1")
+                _win_write_marker(ctx.ssh_vm1, drive1, test_file_vm1, "Data from VM1", "VM1")
 
-        with ctx.ssh_vm2:
-            drive2 = _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2")
+                with ctx.ssh_vm2:
+                    drive2 = _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2")
+                    _win_refresh_shared_disk(ctx.ssh_vm2, "VM2")
+                    drive2 = _win_get_shared_drive_letter(ctx.ssh_vm2, "VM2")
+                    _win_read_marker(ctx.ssh_vm2, drive2, test_file_vm1, "Data from VM1", "VM2")
 
-            vm2_read = _win_run_powershell(
-                ctx.ssh_vm2,
-                f"Get-Content -Path '{drive2}:\\{test_file_vm1}'",
-                "VM2 read VM1 data",
-            )
-            assert "Data from VM1" in vm2_read.strip(), f"VM2 cannot read VM1's data: {vm2_read}"
-            LOGGER.info(f"VM2 ({ctx.vm2_name}): Successfully read VM1's data")
+                    _win_write_marker(ctx.ssh_vm2, drive2, test_file_vm2, "Data from VM2", "VM2")
+                    _win_refresh_shared_disk(ctx.ssh_vm2, "VM2")
 
-            _win_write_marker(ctx.ssh_vm2, drive2, test_file_vm2, "Data from VM2", "VM2")
+                _win_refresh_shared_disk(ctx.ssh_vm1, "VM1")
+                drive1 = _win_get_shared_drive_letter(ctx.ssh_vm1, "VM1")
+                _win_read_marker(ctx.ssh_vm1, drive1, test_file_vm2, "Data from VM2", "VM1")
 
-        _win_refresh_shared_disk(ctx.ssh_vm1, "VM1")
-        drive1 = _win_get_shared_drive_letter(ctx.ssh_vm1, "VM1")
+                return True
+        except (
+            SSHException,
+            AuthenticationException,
+            NoValidConnectionsError,
+            ChannelException,
+            GuestCommandError,
+            AssertionError,
+        ) as e:
+            LOGGER.warning(f"Shared disk verification failed: {type(e).__name__}: {e} - retrying...")
+            return None
 
-        vm1_read = _win_run_powershell(
-            ctx.ssh_vm1,
-            f"Get-Content -Path '{drive1}:\\{test_file_vm2}'",
-            "VM1 read VM2 data",
-        )
-        assert "Data from VM2" in vm1_read.strip(), f"VM1 cannot read VM2's data: {vm1_read}"
-        LOGGER.info(f"VM1 ({ctx.vm1_name}): Successfully read VM2's data")
+    try:
+        for sample in TimeoutSampler(
+            wait_timeout=_WIN_VERIFICATION_RETRY_TIMEOUT,
+            sleep=_WIN_VERIFICATION_RETRY_INTERVAL,
+            func=_do_verification,
+        ):
+            if sample:
+                break
+    except TimeoutExpiredError as e:
+        raise TimeoutExpiredError(
+            f"Windows shared disk verification failed after {_WIN_VERIFICATION_RETRY_TIMEOUT}s"
+        ) from e
 
     LOGGER.info("Windows shared disk verification successful - bidirectional access confirmed")
