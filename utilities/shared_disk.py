@@ -31,6 +31,33 @@ if TYPE_CHECKING:
 
 LOGGER = get_logger(name=__name__)
 
+_VMI_VOLUME_STATUS_TIMEOUT = 300
+_VMI_VOLUME_STATUS_POLL_INTERVAL = 5
+
+_SHARED_LABEL_PREFIX = "SHARED"
+
+_WIN_LABEL_PS_TEMPLATE = """\
+$ErrorActionPreference = 'Stop'
+$wmiDisk = Get-CimInstance Win32_DiskDrive | Where-Object {{ $_.SerialNumber -eq '{serial}' }}
+if (-not $wmiDisk) {{ throw 'No disk with serial {serial}' }}
+$n = $wmiDisk.Index
+Set-Disk -Number $n -IsOffline $false -ErrorAction SilentlyContinue
+Set-Disk -Number $n -IsReadOnly $false -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+$vol = Get-Partition -DiskNumber $n | Get-Volume | Where-Object {{ $_.FileSystemType -eq 'NTFS' -and $_.DriveLetter }}
+if (-not $vol) {{ throw ('No NTFS volume with drive letter on disk ' + $n) }}
+$vol | ForEach-Object {{ Set-Volume -DriveLetter $_.DriveLetter -NewFileSystemLabel '{label}' }}
+$check = Get-Volume -FileSystemLabel '{label}' -ErrorAction SilentlyContinue
+if (-not $check) {{ throw 'Label verification failed' }}
+Write-Output ('Labeled disk ' + $n + ' drive ' + $check.DriveLetter + ': as {label}')
+"""
+
+_WIN_LABEL_GUEST_OPS_TIMEOUT = 60
+_WIN_VOLUME_DISCOVERY_TIMEOUT = 60
+_WIN_VOLUME_DISCOVERY_POLL_INTERVAL = 5
+_WIN_VERIFICATION_RETRY_TIMEOUT = 300
+_WIN_VERIFICATION_RETRY_INTERVAL = 15
+
 
 def _mount_shared_partition(ssh_conn: VMSSHConnection, partition: str, mount_point: str, vm_label: str) -> None:
     """Mount a shared disk partition on a VM.
@@ -80,10 +107,6 @@ def _write_marker(ssh_conn: VMSSHConnection, file_path: str, content: str, vm_la
         f"{vm_label} write test data",
     )
     run_cmd_in_vm(ssh_conn, ["sudo", "sync"], f"{vm_label} sync")
-
-
-_VMI_VOLUME_STATUS_TIMEOUT = 300
-_VMI_VOLUME_STATUS_POLL_INTERVAL = 5
 
 
 def _get_pvc_device_targets(
@@ -330,27 +353,6 @@ def verify_shared_disk_data(
     LOGGER.info("Shared disk verification successful - bidirectional access confirmed")
 
 
-_SHARED_LABEL_PREFIX = "SHARED"
-
-_WIN_LABEL_PS_TEMPLATE = """\
-$ErrorActionPreference = 'Stop'
-$wmiDisk = Get-CimInstance Win32_DiskDrive | Where-Object {{ $_.SerialNumber -eq '{serial}' }}
-if (-not $wmiDisk) {{ throw 'No disk with serial {serial}' }}
-$n = $wmiDisk.Index
-Set-Disk -Number $n -IsOffline $false -ErrorAction SilentlyContinue
-Set-Disk -Number $n -IsReadOnly $false -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-$vol = Get-Partition -DiskNumber $n | Get-Volume | Where-Object {{ $_.FileSystemType -eq 'NTFS' -and $_.DriveLetter }}
-if (-not $vol) {{ throw ('No NTFS volume with drive letter on disk ' + $n) }}
-$vol | ForEach-Object {{ Set-Volume -DriveLetter $_.DriveLetter -NewFileSystemLabel '{label}' }}
-$check = Get-Volume -FileSystemLabel '{label}' -ErrorAction SilentlyContinue
-if (-not $check) {{ throw 'Label verification failed' }}
-Write-Output ('Labeled disk ' + $n + ' drive ' + $check.DriveLetter + ': as {label}')
-"""
-
-_WIN_LABEL_GUEST_OPS_TIMEOUT = 60
-
-
 def label_shared_disk_on_source_windows(
     source_provider: "VMWareProvider",
     prepared_plan: dict[str, Any],
@@ -537,12 +539,6 @@ def _win_ensure_shared_volume_online(ssh_conn: VMSSHConnection, vm_label: str, v
     return _win_get_shared_drive_letter(ssh_conn, vm_label, volume_label)
 
 
-_WIN_VOLUME_DISCOVERY_TIMEOUT = 60
-_WIN_VOLUME_DISCOVERY_POLL_INTERVAL = 5
-_WIN_VERIFICATION_RETRY_TIMEOUT = 300
-_WIN_VERIFICATION_RETRY_INTERVAL = 15
-
-
 def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str, volume_label: str) -> str:
     """Find the drive letter of the shared volume by its filesystem label.
 
@@ -562,6 +558,7 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str, volum
     """
 
     def _try_get_drive_letter() -> str | None:
+        """Poll for the shared volume's drive letter by filesystem label."""
         try:
             return _win_run_powershell(
                 ssh_conn,
@@ -718,6 +715,7 @@ def verify_shared_disk_data_windows(
     test_file_vm2 = "test-vm2.txt"
 
     def _do_verification() -> bool | None:
+        """Run bidirectional read/write verification between both Windows VMs."""
         try:
             with ctx.ssh_vm1:
                 drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1", volume_label)

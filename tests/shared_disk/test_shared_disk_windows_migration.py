@@ -58,14 +58,14 @@ class TestSharedDiskWindowsMigration:
 
     def test_label_shared_disk(
         self,
-        prepared_plan: dict[str, Any],
+        prepared_plan: dict[str, Any],  # Heterogeneous: VM specs, flags, runtime data
         source_provider: "BaseProvider",
-        source_provider_data: dict[str, Any],
-        fixture_store: dict[str, Any],
+        source_provider_data: dict[str, Any],  # Provider config: credentials, endpoints, settings
+        fixture_store: dict[str, Any],  # Session state: UUIDs, teardown tracking
     ) -> None:
         """Label the shared disk on source VM via SCSI position before migration."""
         label_shared_disk_on_source_windows(
-            source_provider=source_provider,  # type: ignore[arg-type]
+            source_provider=source_provider,  # type: ignore[arg-type]  # vsphere marker guarantees VMWareProvider
             prepared_plan=prepared_plan,
             source_provider_data=source_provider_data,
             session_uuid=fixture_store["session_uuid"],
@@ -141,7 +141,7 @@ class TestSharedDiskWindowsMigration:
             network_map=self.network_map,
             virtual_machines_list=prepared_plan["virtual_machines"],
             target_namespace=target_namespace,
-            warm_migration=prepared_plan["warm_migration"],
+            warm_migration=prepared_plan.get("warm_migration", False),
             migrate_shared_disks=prepared_plan["migrate_shared_disks"],
             target_power_state=prepared_plan["target_power_state"],
         )
