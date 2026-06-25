@@ -382,7 +382,8 @@ def _find_shared_disk_serial(
         raise ValueError(f"No shared VMDKs found between VMs: {vm_names}")
     if len(shared_vmdks) > 1:
         raise ValueError(
-            f"Multiple shared VMDKs found between VMs: {list(shared_vmdks)}. Only single shared disk is supported."
+            f"Multiple shared VMDKs found between VMs {vm_names}: {list(shared_vmdks)}. "
+            "Only single shared disk is supported."
         )
 
     shared_vmdk_path = next(iter(shared_vmdks))
