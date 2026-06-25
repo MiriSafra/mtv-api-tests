@@ -353,6 +353,50 @@ def verify_shared_disk_data(
     LOGGER.info("Shared disk verification successful - bidirectional access confirmed")
 
 
+def _find_shared_disk_serial(
+    source_provider: "VMWareProvider",
+    owner_vm: vim.VirtualMachine,
+    owner_name: str,
+    vm_names: list[str],
+) -> str:
+    """Find the disk serial of the shared VMDK on the owner VM.
+
+    Detects shared VMDKs by comparing backing files across VMs, then
+    extracts the VMware backing UUID (which forklift maps to the Windows
+    disk serial via ``Win32_DiskDrive.SerialNumber``).
+
+    Args:
+        source_provider: VMWare provider instance.
+        owner_vm: Owner VM pyvmomi object.
+        owner_name: Owner VM name (for error messages).
+        vm_names: All VM names in the plan.
+
+    Returns:
+        Disk serial string (backing UUID without dashes, lowercase).
+
+    Raises:
+        ValueError: If no shared VMDK found or backing UUID unavailable.
+    """
+    shared_vmdks = source_provider.find_shared_vmdk_paths(vm_names)
+    if not shared_vmdks:
+        raise ValueError(f"No shared VMDKs found between VMs: {vm_names}")
+
+    shared_vmdk_path = next(iter(shared_vmdks))
+    backing_uuid = None
+    for device in owner_vm.config.hardware.device:
+        if not isinstance(device, vim.vm.device.VirtualDisk):
+            continue
+        if hasattr(device.backing, "fileName") and device.backing.fileName == shared_vmdk_path:
+            backing_uuid = getattr(device.backing, "uuid", None)
+            break
+    if not backing_uuid:
+        raise ValueError(f"Cannot find backing UUID for shared VMDK '{shared_vmdk_path}' on VM '{owner_name}'")
+
+    serial = backing_uuid.replace("-", "").lower()
+    LOGGER.info(f"Shared disk on '{owner_name}': backing.uuid={backing_uuid}, serial={serial}")
+    return serial
+
+
 def label_shared_disk_on_source_windows(
     source_provider: "VMWareProvider",
     prepared_plan: dict[str, Any],
@@ -361,17 +405,10 @@ def label_shared_disk_on_source_windows(
 ) -> None:
     """Label the shared disk on the source Windows VM before migration.
 
-    Dynamically detects the shared VMDK by comparing disk backing files
-    across VMs, retrieves the VMware backing UUID (which forklift maps to
-    the disk serial number), and matches it to the Windows disk via WMI
-    ``Win32_DiskDrive.SerialNumber``. Sets a unique NTFS volume label
-    via VMware Guest Operations (no SSH needed).
-
-    The generated label (``SHARED-<session_uuid>``) is stored in
-    ``prepared_plan["_shared_disk_label"]`` so post-migration verification
-    can find the volume by the same label.
-
-    Must be called after cloning + relinking and before migration.
+    Sets a unique NTFS volume label via VMware Guest Operations by matching
+    the shared VMDK's backing UUID to the Windows disk serial number.
+    The generated label is stored in ``prepared_plan["_shared_disk_label"]``
+    for post-migration verification.
 
     Args:
         source_provider: VMWare provider instance.
@@ -399,26 +436,7 @@ def label_shared_disk_on_source_windows(
     owner_name = vm_names[owner_idx]
     owner_vm = prepared_plan["source_vms_data"][owner_name]["provider_vm_api"]
 
-    vmdk_positions = source_provider._build_vmdk_position_map(vm_names)
-    shared_vmdks = source_provider._find_shared_vmdks(vmdk_positions)
-
-    if not shared_vmdks:
-        raise ValueError(f"No shared VMDKs found between VMs: {vm_names}")
-
-    shared_vmdk_path = next(iter(shared_vmdks))
-
-    backing_uuid = None
-    for device in owner_vm.config.hardware.device:
-        if not isinstance(device, vim.vm.device.VirtualDisk):
-            continue
-        if hasattr(device.backing, "fileName") and device.backing.fileName == shared_vmdk_path:
-            backing_uuid = getattr(device.backing, "uuid", None)
-            break
-    if not backing_uuid:
-        raise ValueError(f"Cannot find backing UUID for shared VMDK '{shared_vmdk_path}' on VM '{owner_name}'")
-
-    disk_serial = backing_uuid.replace("-", "").lower()
-    LOGGER.info(f"Shared disk on '{owner_name}': backing.uuid={backing_uuid}, serial={disk_serial}")
+    disk_serial = _find_shared_disk_serial(source_provider, owner_vm, owner_name, vm_names)
 
     LOGGER.info(f"Powering on '{owner_name}' for shared disk labeling")
     source_provider.start_vm(owner_vm)
@@ -755,7 +773,6 @@ def verify_shared_disk_data_windows(
             OSError,
             ConnectionError,
             GuestCommandError,
-            AssertionError,
         ) as e:
             nonlocal last_exc
             last_exc = e
