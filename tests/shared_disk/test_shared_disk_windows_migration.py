@@ -63,7 +63,7 @@ class TestSharedDiskWindowsMigration:
         source_provider_data: dict[str, Any],  # Provider config: credentials, endpoints, settings
         fixture_store: dict[str, Any],  # Session state: UUIDs, teardown tracking
     ) -> None:
-        """Label the shared disk on source VM via SCSI position before migration."""
+        """Label the shared disk on source VM via VMware Guest Operations before migration."""
         label_shared_disk_on_source_windows(
             source_provider=source_provider,  # type: ignore[arg-type]  # vsphere marker guarantees VMWareProvider
             prepared_plan=prepared_plan,
