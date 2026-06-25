@@ -22,7 +22,7 @@ from utilities.mtv_migration import (
     get_storage_migration_map,
 )
 from utilities.post_migration import check_vms
-from utilities.shared_disk import verify_shared_disk_data_windows
+from utilities.shared_disk import label_shared_disk_on_source_windows, verify_shared_disk_data_windows
 from utilities.utils import populate_vm_ids
 
 if TYPE_CHECKING:
@@ -55,6 +55,21 @@ class TestSharedDiskWindowsMigration:
     storage_map: StorageMap
     network_map: NetworkMap
     plan_resource: Plan
+
+    def test_label_shared_disk(
+        self,
+        prepared_plan: dict[str, Any],
+        source_provider: "BaseProvider",
+        source_provider_data: dict[str, Any],
+        fixture_store: dict[str, Any],
+    ) -> None:
+        """Label the shared disk on source VM via SCSI position before migration."""
+        label_shared_disk_on_source_windows(
+            source_provider=source_provider,  # type: ignore[arg-type]
+            prepared_plan=prepared_plan,
+            source_provider_data=source_provider_data,
+            session_uuid=fixture_store["session_uuid"],
+        )
 
     def test_create_storagemap(
         self,

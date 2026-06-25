@@ -6,12 +6,14 @@ after migration.
 
 from __future__ import annotations
 
+import base64
 import shlex
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ocp_resources.virtual_machine import VirtualMachine
 from paramiko.ssh_exception import AuthenticationException, ChannelException, NoValidConnectionsError, SSHException
+from pyVmomi import vim
 from simple_logger.logger import get_logger
 
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
@@ -20,9 +22,12 @@ from exceptions.exceptions import GuestCommandError
 from utilities.naming import resolve_destination_vm_name
 from utilities.post_migration import get_ssh_credentials_from_provider_config
 from utilities.ssh_utils import SSHConnectionManager, VMSSHConnection, run_cmd_in_vm
+from utilities.vmware_guest_operations import run_command_in_vmware_guest
 
 if TYPE_CHECKING:
     from kubernetes.dynamic import DynamicClient
+
+    from libs.providers.vmware import VMWareProvider
 
 LOGGER = get_logger(name=__name__)
 
@@ -325,7 +330,146 @@ def verify_shared_disk_data(
     LOGGER.info("Shared disk verification successful - bidirectional access confirmed")
 
 
-_SHARED_VOLUME_LABEL = "SHARED"
+_SHARED_LABEL_PREFIX = "SHARED"
+
+_WIN_LABEL_PS_TEMPLATE = """\
+$ErrorActionPreference = 'Stop'
+$wmiDisk = Get-CimInstance Win32_DiskDrive | Where-Object {{ $_.SerialNumber -eq '{serial}' }}
+if (-not $wmiDisk) {{ throw 'No disk with serial {serial}' }}
+$n = $wmiDisk.Index
+Set-Disk -Number $n -IsOffline $false -ErrorAction SilentlyContinue
+Set-Disk -Number $n -IsReadOnly $false -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+$vol = Get-Partition -DiskNumber $n | Get-Volume | Where-Object {{ $_.FileSystemType -eq 'NTFS' -and $_.DriveLetter }}
+if (-not $vol) {{ throw ('No NTFS volume with drive letter on disk ' + $n) }}
+$vol | ForEach-Object {{ Set-Volume -DriveLetter $_.DriveLetter -NewFileSystemLabel '{label}' }}
+$check = Get-Volume -FileSystemLabel '{label}' -ErrorAction SilentlyContinue
+if (-not $check) {{ throw 'Label verification failed' }}
+Write-Output ('Labeled disk ' + $n + ' drive ' + $check.DriveLetter + ': as {label}')
+"""
+
+_WIN_LABEL_GUEST_OPS_TIMEOUT = 60
+
+
+def label_shared_disk_on_source_windows(
+    source_provider: "VMWareProvider",
+    prepared_plan: dict[str, Any],
+    source_provider_data: dict[str, Any],
+    session_uuid: str,
+) -> None:
+    """Label the shared disk on the source Windows VM before migration.
+
+    Dynamically detects the shared VMDK by comparing disk backing files
+    across VMs, retrieves the VMware backing UUID (which forklift maps to
+    the disk serial number), and matches it to the Windows disk via WMI
+    ``Win32_DiskDrive.SerialNumber``. Sets a unique NTFS volume label
+    via VMware Guest Operations (no SSH needed).
+
+    The generated label (``SHARED-<session_uuid>``) is stored in
+    ``prepared_plan["_shared_disk_label"]`` so post-migration verification
+    can find the volume by the same label.
+
+    Must be called after cloning + relinking and before migration.
+
+    Args:
+        source_provider: VMWare provider instance.
+        prepared_plan: Plan config dict (from prepared_plan fixture).
+        source_provider_data: Provider config from .providers.json.
+        session_uuid: Session-unique identifier (from fixture_store).
+
+    Raises:
+        ValueError: If no shared disk found or Windows credentials missing.
+        GuestCommandError: If PowerShell commands fail inside the guest.
+    """
+    volume_label = f"{_SHARED_LABEL_PREFIX}-{session_uuid}"
+    prepared_plan["_shared_disk_label"] = volume_label
+    LOGGER.info(f"Generated shared disk volume label: '{volume_label}'")
+    vm_configs = prepared_plan["virtual_machines"]
+    vm_names = [vm["name"] for vm in vm_configs]
+
+    owner_idx = next(
+        (idx for idx, vm in enumerate(vm_configs) if vm.get("migrate_shared_disks") is True),
+        None,
+    )
+    if owner_idx is None:
+        raise ValueError("No VM with migrate_shared_disks=True found in plan")
+
+    owner_name = vm_names[owner_idx]
+    owner_vm = prepared_plan["source_vms_data"][owner_name]["provider_vm_api"]
+
+    vmdk_positions = source_provider._build_vmdk_position_map(vm_names)
+    shared_vmdks = source_provider._find_shared_vmdks(vmdk_positions)
+
+    if not shared_vmdks:
+        raise ValueError(f"No shared VMDKs found between VMs: {vm_names}")
+
+    shared_vmdk_path = next(iter(shared_vmdks))
+
+    backing_uuid = None
+    for device in owner_vm.config.hardware.device:
+        if not isinstance(device, vim.vm.device.VirtualDisk):
+            continue
+        if hasattr(device.backing, "fileName") and device.backing.fileName == shared_vmdk_path:
+            backing_uuid = getattr(device.backing, "uuid", None)
+            break
+    if not backing_uuid:
+        raise ValueError(f"Cannot find backing UUID for shared VMDK '{shared_vmdk_path}' on VM '{owner_name}'")
+
+    disk_serial = backing_uuid.replace("-", "").lower()
+    LOGGER.info(f"Shared disk on '{owner_name}': backing.uuid={backing_uuid}, serial={disk_serial}")
+
+    LOGGER.info(f"Powering on '{owner_name}' for shared disk labeling")
+    source_provider.start_vm(owner_vm)
+    try:
+        if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=300):
+            raise ValueError(f"VMware Tools not available on '{owner_name}' after power-on, cannot label shared disk")
+
+        try:
+            win_user = source_provider_data["guest_vm_win_user"]
+            win_pass = source_provider_data["guest_vm_win_password"]
+        except KeyError as e:
+            raise ValueError(
+                f"Windows VM credentials not found in provider config: {e}. "
+                "Required: guest_vm_win_user, guest_vm_win_password"
+            ) from e
+
+        auth = vim.vm.guest.NamePasswordAuthentication(username=win_user, password=win_pass, interactiveSession=False)
+
+        ps_script = _WIN_LABEL_PS_TEMPLATE.format(serial=disk_serial, label=volume_label)
+        encoded_cmd = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+
+        vcenter_host = source_provider.host
+        if vcenter_host is None:
+            raise ValueError(f"vCenter host not available for provider used by VM '{owner_name}'")
+
+        output = run_command_in_vmware_guest(
+            content=source_provider.content,
+            vm=owner_vm,
+            auth=auth,
+            command=f"powershell -EncodedCommand {encoded_cmd}",
+            vcenter_host=vcenter_host,
+            timeout=_WIN_LABEL_GUEST_OPS_TIMEOUT,
+        )
+        LOGGER.info(f"Shared disk labeling on '{owner_name}': {output.strip()}")
+
+        # Disable Fast Startup before graceful shutdown to prevent hiberfile.sys creation.
+        # Windows hybrid shutdown writes a hibernation file that causes virt-customize to fail
+        # during migration (ConversionHasWarnings / CustomizationFailed).
+        try:
+            run_command_in_vmware_guest(
+                content=source_provider.content,
+                vm=owner_vm,
+                auth=auth,
+                command="powershell -Command powercfg /h off",
+                vcenter_host=vcenter_host,
+                timeout=_WIN_LABEL_GUEST_OPS_TIMEOUT,
+            )
+            LOGGER.info(f"Disabled Fast Startup on '{owner_name}' to ensure clean shutdown")
+        except GuestCommandError:
+            LOGGER.warning(f"Failed to disable Fast Startup on '{owner_name}' (best-effort)")
+    finally:
+        LOGGER.info(f"Gracefully shutting down '{owner_name}' after shared disk labeling")
+        source_provider.shutdown_vm_guest(owner_vm)
 
 
 def _win_run_powershell(
@@ -352,22 +496,23 @@ def _win_run_powershell(
     return _run_cmd_on_vm(ssh_conn, ["powershell", "-Command", script], description)
 
 
-def _win_ensure_shared_volume_online(ssh_conn: VMSSHConnection, vm_label: str) -> str:
-    """Bring offline disks online and return the SHARED volume drive letter.
+def _win_ensure_shared_volume_online(ssh_conn: VMSSHConnection, vm_label: str, volume_label: str) -> str:
+    """Bring offline disks online and return the shared volume drive letter.
 
     After migration, Windows SAN policy may leave non-boot disks offline.
     This brings all offline disks online, clears read-only flags, then
-    locates the SHARED volume by its filesystem label.
+    locates the shared volume by its filesystem label.
 
     Args:
         ssh_conn (VMSSHConnection): Active SSH connection to the Windows VM.
         vm_label (str): Label for log messages (e.g., "VM1").
+        volume_label (str): NTFS volume label to search for.
 
     Returns:
         str: Single-character drive letter (e.g., "E").
 
     Raises:
-        GuestCommandError: If SHARED volume not found after bringing disks online.
+        GuestCommandError: If shared volume not found after bringing disks online.
     """
     # Best-effort: piped Set-Disk fails on some vSphere versions due to a Windows SSH
     # console buffer bug. The targeted Set-Disk -Number <N> in _win_refresh_shared_disk
@@ -389,7 +534,7 @@ def _win_ensure_shared_volume_online(ssh_conn: VMSSHConnection, vm_label: str) -
         )
     except GuestCommandError as e:
         LOGGER.warning(f"{vm_label}: Set-Disk -IsReadOnly failed (best-effort): {e}")
-    return _win_get_shared_drive_letter(ssh_conn, vm_label)
+    return _win_get_shared_drive_letter(ssh_conn, vm_label, volume_label)
 
 
 _WIN_VOLUME_DISCOVERY_TIMEOUT = 60
@@ -398,8 +543,8 @@ _WIN_VERIFICATION_RETRY_TIMEOUT = 300
 _WIN_VERIFICATION_RETRY_INTERVAL = 15
 
 
-def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str) -> str:
-    """Find the drive letter of the SHARED volume by its filesystem label.
+def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str, volume_label: str) -> str:
+    """Find the drive letter of the shared volume by its filesystem label.
 
     Polls with a timeout because Windows may take a moment to mount the
     filesystem after the disk is brought online.
@@ -407,20 +552,21 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str) -> st
     Args:
         ssh_conn (VMSSHConnection): Active SSH connection to the Windows VM.
         vm_label (str): Label for log messages.
+        volume_label (str): NTFS volume label to search for.
 
     Returns:
         str: Single-character drive letter (e.g., "E").
 
     Raises:
-        GuestCommandError: If the SHARED volume is not found within the timeout.
+        GuestCommandError: If the volume is not found within the timeout.
     """
 
     def _try_get_drive_letter() -> str | None:
         try:
             return _win_run_powershell(
                 ssh_conn,
-                f"(Get-Volume -FileSystemLabel '{_SHARED_VOLUME_LABEL}').DriveLetter",
-                f"{vm_label} get SHARED drive letter",
+                f"(Get-Volume -FileSystemLabel '{volume_label}').DriveLetter",
+                f"{vm_label} get shared drive letter",
             ).strip()
         except GuestCommandError:
             return None
@@ -437,19 +583,19 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str) -> st
                 break
     except TimeoutExpiredError as exc:
         raise GuestCommandError(
-            f"{vm_label}: Volume with label '{_SHARED_VOLUME_LABEL}' not found after "
-            f"{_WIN_VOLUME_DISCOVERY_TIMEOUT}s. Ensure the shared disk on the source VM "
-            f"has an NTFS volume labeled '{_SHARED_VOLUME_LABEL}'."
+            f"{vm_label}: Volume with label '{volume_label}' not found after "
+            f"{_WIN_VOLUME_DISCOVERY_TIMEOUT}s. Ensure the shared disk was labeled "
+            f"by test_label_shared_disk before migration."
         ) from exc
 
     if not drive_letter:
-        raise GuestCommandError(f"{vm_label}: SHARED volume not found")
+        raise GuestCommandError(f"{vm_label}: Shared volume '{volume_label}' not found")
 
-    LOGGER.info(f"{vm_label}: SHARED volume is drive {drive_letter}:")
+    LOGGER.info(f"{vm_label}: Shared volume '{volume_label}' is drive {drive_letter}:")
     return drive_letter
 
 
-def _win_refresh_shared_disk(ssh_conn: VMSSHConnection, vm_label: str) -> None:
+def _win_refresh_shared_disk(ssh_conn: VMSSHConnection, vm_label: str, volume_label: str) -> None:
     """Flush NTFS metadata cache via disk offline/online cycle.
 
     NTFS does not see files written by another VM until the disk is taken
@@ -459,24 +605,27 @@ def _win_refresh_shared_disk(ssh_conn: VMSSHConnection, vm_label: str) -> None:
     Args:
         ssh_conn (VMSSHConnection): Active SSH connection to the Windows VM.
         vm_label (str): Label for log messages.
+        volume_label (str): NTFS volume label to locate the disk.
 
     Raises:
         GuestCommandError: If disk offline/online commands fail.
     """
     disk_num = _win_run_powershell(
         ssh_conn,
-        f"(Get-Volume -FileSystemLabel '{_SHARED_VOLUME_LABEL}' | Get-Partition).DiskNumber",
-        f"{vm_label} get SHARED disk number",
+        f"(Get-Volume -FileSystemLabel '{volume_label}' | Get-Partition).DiskNumber",
+        f"{vm_label} get shared disk number",
     ).strip()
     if not disk_num.isdigit():
-        raise GuestCommandError(f"{vm_label}: Cannot determine disk number for SHARED volume (got: '{disk_num}')")
+        raise GuestCommandError(
+            f"{vm_label}: Cannot determine disk number for volume '{volume_label}' (got: '{disk_num}')"
+        )
     _win_run_powershell(
         ssh_conn, f"Set-Disk -Number {disk_num} -IsOffline $true | Out-Null", f"{vm_label} disk offline"
     )
     _win_run_powershell(
         ssh_conn, f"Set-Disk -Number {disk_num} -IsOffline $false | Out-Null", f"{vm_label} disk online"
     )
-    LOGGER.info(f"{vm_label}: Refreshed SHARED disk (disk {disk_num})")
+    LOGGER.info(f"{vm_label}: Refreshed shared disk '{volume_label}' (disk {disk_num})")
 
 
 def _win_write_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: str, content: str, vm_label: str) -> None:
@@ -533,7 +682,8 @@ def verify_shared_disk_data_windows(
     """Verify shared disk is accessible from both Windows VMs after migration.
 
     Uses NTFS volume label to locate the shared disk (no Linux device paths).
-    The shared disk must be formatted with NTFS and labeled ``SHARED``.
+    The label is set dynamically by ``label_shared_disk_on_source_windows``
+    before migration and read from ``prepared_plan["_shared_disk_label"]``.
 
     Flow:
     1. Confirm shared PVC exists via KubeVirt volumeStatus
@@ -553,10 +703,16 @@ def verify_shared_disk_data_windows(
         AssertionError: If shared disk data verification fails.
         GuestCommandError: If SSH or PowerShell commands fail.
     """
+    volume_label = prepared_plan.get("_shared_disk_label")
+    if not volume_label:
+        raise ValueError(
+            "No shared disk label found in prepared_plan. Ensure test_label_shared_disk ran before migration."
+        )
+
     # Shared PVC validated by helper (device paths unused — Windows uses volume labels)
     ctx = _prepare_shared_disk_verification(prepared_plan, vm_ssh_connections, source_provider_data, ocp_admin_client)
 
-    LOGGER.info(f"Verifying Windows shared disk between {ctx.vm1_name} and {ctx.vm2_name}")
+    LOGGER.info(f"Verifying Windows shared disk (label='{volume_label}') between {ctx.vm1_name} and {ctx.vm2_name}")
 
     test_file_vm1 = "test-vm1.txt"
     test_file_vm2 = "test-vm2.txt"
@@ -564,20 +720,20 @@ def verify_shared_disk_data_windows(
     def _do_verification() -> bool | None:
         try:
             with ctx.ssh_vm1:
-                drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1")
+                drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1", volume_label)
                 _win_write_marker(ctx.ssh_vm1, drive1, test_file_vm1, "Data from VM1", "VM1")
 
                 with ctx.ssh_vm2:
-                    drive2 = _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2")
-                    _win_refresh_shared_disk(ctx.ssh_vm2, "VM2")
-                    drive2 = _win_get_shared_drive_letter(ctx.ssh_vm2, "VM2")
+                    drive2 = _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2", volume_label)
+                    _win_refresh_shared_disk(ctx.ssh_vm2, "VM2", volume_label)
+                    drive2 = _win_get_shared_drive_letter(ctx.ssh_vm2, "VM2", volume_label)
                     _win_read_marker(ctx.ssh_vm2, drive2, test_file_vm1, "Data from VM1", "VM2")
 
                     _win_write_marker(ctx.ssh_vm2, drive2, test_file_vm2, "Data from VM2", "VM2")
-                    _win_refresh_shared_disk(ctx.ssh_vm2, "VM2")
+                    _win_refresh_shared_disk(ctx.ssh_vm2, "VM2", volume_label)
 
-                _win_refresh_shared_disk(ctx.ssh_vm1, "VM1")
-                drive1 = _win_get_shared_drive_letter(ctx.ssh_vm1, "VM1")
+                _win_refresh_shared_disk(ctx.ssh_vm1, "VM1", volume_label)
+                drive1 = _win_get_shared_drive_letter(ctx.ssh_vm1, "VM1", volume_label)
                 _win_read_marker(ctx.ssh_vm1, drive1, test_file_vm2, "Data from VM2", "VM1")
 
                 return True
