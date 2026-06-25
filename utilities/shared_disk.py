@@ -558,15 +558,20 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str, volum
     """
 
     def _try_get_drive_letter() -> str | None:
-        """Poll for the shared volume's drive letter by filesystem label."""
-        try:
-            return _win_run_powershell(
-                ssh_conn,
-                f"(Get-Volume -FileSystemLabel '{volume_label}').DriveLetter",
-                f"{vm_label} get shared drive letter",
-            ).strip()
-        except GuestCommandError:
-            return None
+        """Poll for the shared volume's drive letter by filesystem label.
+
+        Returns:
+            Single-character drive letter, or None if the volume is not yet available.
+
+        Raises:
+            GuestCommandError: On real SSH/PowerShell failures (not volume-not-found).
+        """
+        result = _win_run_powershell(
+            ssh_conn,
+            f"(Get-Volume -FileSystemLabel '{volume_label}' -ErrorAction SilentlyContinue).DriveLetter",
+            f"{vm_label} get shared drive letter",
+        ).strip()
+        return result if result and len(result) == 1 else None
 
     drive_letter: str | None = None
     try:
@@ -714,8 +719,14 @@ def verify_shared_disk_data_windows(
     test_file_vm1 = "test-vm1.txt"
     test_file_vm2 = "test-vm2.txt"
 
+    last_exc: Exception | None = None
+
     def _do_verification() -> bool | None:
-        """Run bidirectional read/write verification between both Windows VMs."""
+        """Run bidirectional read/write verification between both Windows VMs.
+
+        Returns:
+            True if both VMs can read each other's marker files, None on transient failure (triggers retry).
+        """
         try:
             with ctx.ssh_vm1:
                 drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1", volume_label)
@@ -746,6 +757,8 @@ def verify_shared_disk_data_windows(
             GuestCommandError,
             AssertionError,
         ) as e:
+            nonlocal last_exc
+            last_exc = e
             LOGGER.warning(f"Shared disk verification failed: {type(e).__name__}: {e} - retrying...")
             return None
 
@@ -757,9 +770,10 @@ def verify_shared_disk_data_windows(
         ):
             if sample:
                 break
-    except TimeoutExpiredError as e:
+    except TimeoutExpiredError:
+        last_err = f" Last error: {type(last_exc).__name__}: {last_exc}" if last_exc else ""
         raise TimeoutExpiredError(
-            f"Windows shared disk verification failed after {_WIN_VERIFICATION_RETRY_TIMEOUT}s"
-        ) from e
+            f"Windows shared disk verification failed after {_WIN_VERIFICATION_RETRY_TIMEOUT}s.{last_err}"
+        ) from last_exc
 
     LOGGER.info("Windows shared disk verification successful - bidirectional access confirmed")
