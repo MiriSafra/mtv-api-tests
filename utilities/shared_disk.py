@@ -60,8 +60,8 @@ _WIN_VERIFICATION_RETRY_TIMEOUT = 300
 _WIN_VERIFICATION_RETRY_INTERVAL = 15
 _GUEST_TOOLS_READY_TIMEOUT = 300
 
-_HEX_SERIAL_RE = re.compile(r"^[a-fA-F0-9]+$")
-_SAFE_LABEL_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+_HEX_SERIAL_RE = re.compile(r"[a-fA-F0-9]+")
+_SAFE_LABEL_RE = re.compile(r"[a-zA-Z0-9_-]+")
 
 
 def _mount_shared_partition(ssh_conn: VMSSHConnection, partition: str, mount_point: str, vm_label: str) -> None:
@@ -359,7 +359,7 @@ def verify_shared_disk_data(
 
 
 def _find_shared_disk_serial(
-    source_provider: "VMWareProvider",
+    source_provider: VMWareProvider,
     owner_vm: vim.VirtualMachine,
     owner_name: str,
     vm_names: list[str],
@@ -411,7 +411,7 @@ def _find_shared_disk_serial(
 
 
 def _disable_fast_startup(
-    source_provider: "VMWareProvider",
+    source_provider: VMWareProvider,
     owner_vm: vim.VirtualMachine,
     owner_name: str,
     auth: vim.vm.guest.NamePasswordAuthentication,
@@ -439,14 +439,17 @@ def _disable_fast_startup(
             timeout=_WIN_LABEL_GUEST_OPS_TIMEOUT,
         )
         LOGGER.info(f"Disabled Fast Startup on '{owner_name}' to ensure clean shutdown")
-    except GuestCommandError as e:
+    except Exception as e:
         # Intentional best-effort (no-fallbacks exception): Fast Startup disable is
         # non-critical — migration can succeed without it, but may produce warnings.
+        # Broad catch because run_command_in_vmware_guest can raise GuestCommandError,
+        # vim.fault.* (GuestOperationsFault, InvalidGuestLogin), timeouts, and
+        # connection errors — none should abort the critical labeling flow.
         LOGGER.warning(f"Failed to disable Fast Startup on '{owner_name}' (best-effort): {e}")
 
 
 def _execute_guest_label_command(
-    source_provider: "VMWareProvider",
+    source_provider: VMWareProvider,
     owner_vm: vim.VirtualMachine,
     owner_name: str,
     disk_serial: str,
@@ -467,9 +470,11 @@ def _execute_guest_label_command(
         ValueError: If credentials, vCenter host unavailable, or inputs invalid.
         GuestCommandError: If the labeling PowerShell command fails.
     """
-    if not _HEX_SERIAL_RE.match(disk_serial):
+    disk_serial = disk_serial.strip()
+    volume_label = volume_label.strip()
+    if not _HEX_SERIAL_RE.fullmatch(disk_serial):
         raise ValueError(f"Invalid disk serial (hex expected): {disk_serial}")
-    if not _SAFE_LABEL_RE.match(volume_label):
+    if not _SAFE_LABEL_RE.fullmatch(volume_label):
         raise ValueError(f"Invalid volume label (alphanumeric expected): {volume_label}")
 
     if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=_GUEST_TOOLS_READY_TIMEOUT):
@@ -513,7 +518,7 @@ def _execute_guest_label_command(
 
 
 def label_shared_disk_on_source_windows(
-    source_provider: "VMWareProvider",
+    source_provider: VMWareProvider,
     prepared_plan: dict[str, Any],
     source_provider_data: dict[str, Any],
     session_uuid: str,
