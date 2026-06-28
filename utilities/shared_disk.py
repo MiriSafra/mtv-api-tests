@@ -404,7 +404,7 @@ def _find_shared_disk_serial(
 
 def _execute_guest_label_command(
     source_provider: "VMWareProvider",
-    owner_vm: Any,
+    owner_vm: vim.VirtualMachine,
     owner_name: str,
     disk_serial: str,
     volume_label: str,
