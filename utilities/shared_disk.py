@@ -7,6 +7,7 @@ after migration.
 from __future__ import annotations
 
 import base64
+import re
 import shlex
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -57,6 +58,10 @@ _WIN_VOLUME_DISCOVERY_TIMEOUT = 60
 _WIN_VOLUME_DISCOVERY_POLL_INTERVAL = 5
 _WIN_VERIFICATION_RETRY_TIMEOUT = 300
 _WIN_VERIFICATION_RETRY_INTERVAL = 15
+_GUEST_TOOLS_READY_TIMEOUT = 300
+
+_HEX_SERIAL_RE = re.compile(r"^[a-fA-F0-9]+$")
+_SAFE_LABEL_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
 def _mount_shared_partition(ssh_conn: VMSSHConnection, partition: str, mount_point: str, vm_label: str) -> None:
@@ -391,8 +396,11 @@ def _find_shared_disk_serial(
     for device in owner_vm.config.hardware.device:
         if not isinstance(device, vim.vm.device.VirtualDisk):
             continue
-        if hasattr(device.backing, "fileName") and device.backing.fileName == shared_vmdk_path:
-            backing_uuid = getattr(device.backing, "uuid", None)
+        if (
+            isinstance(device.backing, vim.vm.device.VirtualDisk.FlatVer2BackingInfo)
+            and device.backing.fileName == shared_vmdk_path
+        ):
+            backing_uuid = device.backing.uuid
             break
     if not backing_uuid:
         raise ValueError(f"Cannot find backing UUID for shared VMDK '{shared_vmdk_path}' on VM '{owner_name}'")
@@ -400,6 +408,41 @@ def _find_shared_disk_serial(
     serial = backing_uuid.replace("-", "").lower()
     LOGGER.info(f"Shared disk on '{owner_name}': backing.uuid={backing_uuid}, serial={serial}")
     return serial
+
+
+def _disable_fast_startup(
+    source_provider: "VMWareProvider",
+    owner_vm: vim.VirtualMachine,
+    owner_name: str,
+    auth: vim.vm.guest.NamePasswordAuthentication,
+    vcenter_host: str,
+) -> None:
+    """Disable Windows Fast Startup via Guest Ops to prevent hiberfile.sys creation.
+
+    Windows hybrid shutdown writes a hibernation file that causes virt-customize to fail
+    during migration (ConversionHasWarnings / CustomizationFailed).
+
+    Args:
+        source_provider: VMWare provider instance.
+        owner_vm: PyVmomi VM object for the owner VM.
+        owner_name: Display name of the owner VM.
+        auth: Guest authentication credentials.
+        vcenter_host: vCenter hostname for Guest Ops API.
+    """
+    try:
+        run_command_in_vmware_guest(
+            content=source_provider.content,
+            vm=owner_vm,
+            auth=auth,
+            command="powershell -Command powercfg /h off",
+            vcenter_host=vcenter_host,
+            timeout=_WIN_LABEL_GUEST_OPS_TIMEOUT,
+        )
+        LOGGER.info(f"Disabled Fast Startup on '{owner_name}' to ensure clean shutdown")
+    except GuestCommandError as e:
+        # Intentional best-effort (no-fallbacks exception): Fast Startup disable is
+        # non-critical — migration can succeed without it, but may produce warnings.
+        LOGGER.warning(f"Failed to disable Fast Startup on '{owner_name}' (best-effort): {e}")
 
 
 def _execute_guest_label_command(
@@ -410,21 +453,26 @@ def _execute_guest_label_command(
     volume_label: str,
     source_provider_data: dict[str, Any],
 ) -> None:
-    """Authenticate via Guest Ops, label the shared disk, and disable Fast Startup.
+    """Authenticate via Guest Ops and label the shared disk on the source Windows VM.
 
     Args:
         source_provider: VMWare provider instance.
         owner_vm: PyVmomi VM object for the owner VM.
         owner_name: Display name of the owner VM.
-        disk_serial: Disk serial number to match inside the guest.
-        volume_label: NTFS volume label to set.
+        disk_serial: Hex disk serial number to match inside the guest.
+        volume_label: Alphanumeric NTFS volume label to set.
         source_provider_data: Provider config (uses guest_vm_win_user/password).
 
     Raises:
-        ValueError: If credentials or vCenter host unavailable.
+        ValueError: If credentials, vCenter host unavailable, or inputs invalid.
         GuestCommandError: If the labeling PowerShell command fails.
     """
-    if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=300):
+    if not _HEX_SERIAL_RE.match(disk_serial):
+        raise ValueError(f"Invalid disk serial (hex expected): {disk_serial}")
+    if not _SAFE_LABEL_RE.match(volume_label):
+        raise ValueError(f"Invalid volume label (alphanumeric expected): {volume_label}")
+
+    if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=_GUEST_TOOLS_READY_TIMEOUT):
         raise ValueError(f"VMware Tools not available on '{owner_name}' after power-on, cannot label shared disk")
 
     try:
@@ -455,21 +503,13 @@ def _execute_guest_label_command(
     )
     LOGGER.info(f"Shared disk labeling on '{owner_name}': {output.strip()}")
 
-    # Disable Fast Startup before graceful shutdown to prevent hiberfile.sys creation.
-    # Windows hybrid shutdown writes a hibernation file that causes virt-customize to fail
-    # during migration (ConversionHasWarnings / CustomizationFailed).
-    try:
-        run_command_in_vmware_guest(
-            content=source_provider.content,
-            vm=owner_vm,
-            auth=auth,
-            command="powershell -Command powercfg /h off",
-            vcenter_host=vcenter_host,
-            timeout=_WIN_LABEL_GUEST_OPS_TIMEOUT,
-        )
-        LOGGER.info(f"Disabled Fast Startup on '{owner_name}' to ensure clean shutdown")
-    except GuestCommandError as e:
-        LOGGER.warning(f"Failed to disable Fast Startup on '{owner_name}' (best-effort): {e}")
+    _disable_fast_startup(
+        source_provider=source_provider,
+        owner_vm=owner_vm,
+        owner_name=owner_name,
+        auth=auth,
+        vcenter_host=vcenter_host,
+    )
 
 
 def label_shared_disk_on_source_windows(
