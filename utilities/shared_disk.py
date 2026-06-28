@@ -439,12 +439,9 @@ def _disable_fast_startup(
             timeout=_WIN_LABEL_GUEST_OPS_TIMEOUT,
         )
         LOGGER.info(f"Disabled Fast Startup on '{owner_name}' to ensure clean shutdown")
-    except Exception as e:
-        # Intentional best-effort (no-fallbacks exception): Fast Startup disable is
-        # non-critical — migration can succeed without it, but may produce warnings.
-        # Broad catch because run_command_in_vmware_guest can raise GuestCommandError,
-        # vim.fault.* (GuestOperationsFault, InvalidGuestLogin), timeouts, and
-        # connection errors — none should abort the critical labeling flow.
+    except (GuestCommandError, vim.fault.VimFault, TimeoutExpiredError, ConnectionError, OSError) as e:
+        # Best-effort: Fast Startup disable is non-critical — migration can succeed
+        # without it, but may produce ConversionHasWarnings.
         LOGGER.warning(f"Failed to disable Fast Startup on '{owner_name}' (best-effort): {e}")
 
 
@@ -780,7 +777,7 @@ def _win_do_bidirectional_verification(
     volume_label: str,
     test_file_vm1: str,
     test_file_vm2: str,
-) -> bool:
+) -> None:
     """Run bidirectional read/write verification between both Windows VMs.
 
     Args:
@@ -789,8 +786,9 @@ def _win_do_bidirectional_verification(
         test_file_vm1: Marker filename written by VM1.
         test_file_vm2: Marker filename written by VM2.
 
-    Returns:
-        True if both VMs can read each other's marker files.
+    Raises:
+        GuestCommandError: If any PowerShell command fails.
+        AssertionError: If marker file content doesn't match expected data.
     """
     with ctx.ssh_vm1:
         drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1", volume_label)
@@ -808,8 +806,6 @@ def _win_do_bidirectional_verification(
         _win_refresh_shared_disk(ctx.ssh_vm1, "VM1", volume_label)
         drive1 = _win_get_shared_drive_letter(ctx.ssh_vm1, "VM1", volume_label)
         _win_read_marker(ctx.ssh_vm1, drive1, test_file_vm2, "Data from VM2", "VM1")
-
-    return True
 
 
 def verify_shared_disk_data_windows(
@@ -861,7 +857,8 @@ def verify_shared_disk_data_windows(
     def _attempt() -> bool | None:
         nonlocal last_exc
         try:
-            return _win_do_bidirectional_verification(ctx, volume_label, test_file_vm1, test_file_vm2)
+            _win_do_bidirectional_verification(ctx, volume_label, test_file_vm1, test_file_vm2)
+            return True
         except (
             SSHException,
             AuthenticationException,
