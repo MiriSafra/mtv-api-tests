@@ -21,6 +21,7 @@ from simple_logger.logger import get_logger
 from timeout_sampler import TimeoutSampler, TimeoutExpiredError
 from exceptions.exceptions import GuestCommandError
 
+from exceptions.exceptions import SSHConnectionSetupError
 from libs.base_provider import BaseProvider
 
 LOGGER = get_logger(__name__)
@@ -129,7 +130,7 @@ class VMSSHConnection:
         # Get virtctl binary path
         virtctl_path = shutil.which("virtctl")
         if not virtctl_path:
-            raise RuntimeError(
+            raise SSHConnectionSetupError(
                 "virtctl command not found in PATH. "
                 "Please install virtctl before running the test suite. "
                 "See README.md for installation instructions."

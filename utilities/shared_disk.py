@@ -18,7 +18,7 @@ from simple_logger.logger import get_logger
 
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from exceptions.exceptions import GuestCommandError
+from exceptions.exceptions import GuestCommandError, SSHConnectionSetupError
 from utilities.naming import resolve_destination_vm_name
 from utilities.post_migration import get_ssh_credentials_from_provider_config
 from utilities.ssh_utils import SSHConnectionManager, VMSSHConnection, run_cmd_in_vm
@@ -402,6 +402,76 @@ def _find_shared_disk_serial(
     return serial
 
 
+def _execute_guest_label_command(
+    source_provider: "VMWareProvider",
+    owner_vm: Any,
+    owner_name: str,
+    disk_serial: str,
+    volume_label: str,
+    source_provider_data: dict[str, Any],
+) -> None:
+    """Authenticate via Guest Ops, label the shared disk, and disable Fast Startup.
+
+    Args:
+        source_provider: VMWare provider instance.
+        owner_vm: PyVmomi VM object for the owner VM.
+        owner_name: Display name of the owner VM.
+        disk_serial: Disk serial number to match inside the guest.
+        volume_label: NTFS volume label to set.
+        source_provider_data: Provider config (uses guest_vm_win_user/password).
+
+    Raises:
+        ValueError: If credentials or vCenter host unavailable.
+        GuestCommandError: If the labeling PowerShell command fails.
+    """
+    if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=300):
+        raise ValueError(f"VMware Tools not available on '{owner_name}' after power-on, cannot label shared disk")
+
+    try:
+        win_user = source_provider_data["guest_vm_win_user"]
+        win_pass = source_provider_data["guest_vm_win_password"]
+    except KeyError as e:
+        raise ValueError(
+            f"Windows VM credentials not found in provider config: {e}. "
+            "Required: guest_vm_win_user, guest_vm_win_password"
+        ) from e
+
+    auth = vim.vm.guest.NamePasswordAuthentication(username=win_user, password=win_pass, interactiveSession=False)
+
+    ps_script = _WIN_LABEL_PS_TEMPLATE.format(serial=disk_serial, label=volume_label)
+    encoded_cmd = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+
+    vcenter_host = source_provider.host
+    if vcenter_host is None:
+        raise ValueError(f"vCenter host not available for provider used by VM '{owner_name}'")
+
+    output = run_command_in_vmware_guest(
+        content=source_provider.content,
+        vm=owner_vm,
+        auth=auth,
+        command=f"powershell -EncodedCommand {encoded_cmd}",
+        vcenter_host=vcenter_host,
+        timeout=_WIN_LABEL_GUEST_OPS_TIMEOUT,
+    )
+    LOGGER.info(f"Shared disk labeling on '{owner_name}': {output.strip()}")
+
+    # Disable Fast Startup before graceful shutdown to prevent hiberfile.sys creation.
+    # Windows hybrid shutdown writes a hibernation file that causes virt-customize to fail
+    # during migration (ConversionHasWarnings / CustomizationFailed).
+    try:
+        run_command_in_vmware_guest(
+            content=source_provider.content,
+            vm=owner_vm,
+            auth=auth,
+            command="powershell -Command powercfg /h off",
+            vcenter_host=vcenter_host,
+            timeout=_WIN_LABEL_GUEST_OPS_TIMEOUT,
+        )
+        LOGGER.info(f"Disabled Fast Startup on '{owner_name}' to ensure clean shutdown")
+    except GuestCommandError as e:
+        LOGGER.warning(f"Failed to disable Fast Startup on '{owner_name}' (best-effort): {e}")
+
+
 def label_shared_disk_on_source_windows(
     source_provider: "VMWareProvider",
     prepared_plan: dict[str, Any],
@@ -446,52 +516,14 @@ def label_shared_disk_on_source_windows(
     LOGGER.info(f"Powering on '{owner_name}' for shared disk labeling")
     source_provider.start_vm(owner_vm)
     try:
-        if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=300):
-            raise ValueError(f"VMware Tools not available on '{owner_name}' after power-on, cannot label shared disk")
-
-        try:
-            win_user = source_provider_data["guest_vm_win_user"]
-            win_pass = source_provider_data["guest_vm_win_password"]
-        except KeyError as e:
-            raise ValueError(
-                f"Windows VM credentials not found in provider config: {e}. "
-                "Required: guest_vm_win_user, guest_vm_win_password"
-            ) from e
-
-        auth = vim.vm.guest.NamePasswordAuthentication(username=win_user, password=win_pass, interactiveSession=False)
-
-        ps_script = _WIN_LABEL_PS_TEMPLATE.format(serial=disk_serial, label=volume_label)
-        encoded_cmd = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
-
-        vcenter_host = source_provider.host
-        if vcenter_host is None:
-            raise ValueError(f"vCenter host not available for provider used by VM '{owner_name}'")
-
-        output = run_command_in_vmware_guest(
-            content=source_provider.content,
-            vm=owner_vm,
-            auth=auth,
-            command=f"powershell -EncodedCommand {encoded_cmd}",
-            vcenter_host=vcenter_host,
-            timeout=_WIN_LABEL_GUEST_OPS_TIMEOUT,
+        _execute_guest_label_command(
+            source_provider=source_provider,
+            owner_vm=owner_vm,
+            owner_name=owner_name,
+            disk_serial=disk_serial,
+            volume_label=volume_label,
+            source_provider_data=source_provider_data,
         )
-        LOGGER.info(f"Shared disk labeling on '{owner_name}': {output.strip()}")
-
-        # Disable Fast Startup before graceful shutdown to prevent hiberfile.sys creation.
-        # Windows hybrid shutdown writes a hibernation file that causes virt-customize to fail
-        # during migration (ConversionHasWarnings / CustomizationFailed).
-        try:
-            run_command_in_vmware_guest(
-                content=source_provider.content,
-                vm=owner_vm,
-                auth=auth,
-                command="powershell -Command powercfg /h off",
-                vcenter_host=vcenter_host,
-                timeout=_WIN_LABEL_GUEST_OPS_TIMEOUT,
-            )
-            LOGGER.info(f"Disabled Fast Startup on '{owner_name}' to ensure clean shutdown")
-        except GuestCommandError:
-            LOGGER.warning(f"Failed to disable Fast Startup on '{owner_name}' (best-effort)")
     finally:
         LOGGER.info(f"Gracefully shutting down '{owner_name}' after shared disk labeling")
         source_provider.shutdown_vm_guest(owner_vm)
@@ -539,9 +571,9 @@ def _win_ensure_shared_volume_online(ssh_conn: VMSSHConnection, vm_label: str, v
     Raises:
         GuestCommandError: If shared volume not found after bringing disks online.
     """
-    # Best-effort: piped Set-Disk fails on some vSphere versions due to a Windows SSH
-    # console buffer bug. The targeted Set-Disk -Number <N> in _win_refresh_shared_disk
-    # is the reliable path; this is just an initial attempt to bring disks online.
+    # Intentional best-effort (no-fallbacks exception): piped Set-Disk fails on some vSphere
+    # versions due to a Windows SSH console buffer bug. _win_refresh_shared_disk uses targeted
+    # Set-Disk -Number <N> as the reliable path; these are just optimistic first attempts.
     try:
         _win_run_powershell(
             ssh_conn,
@@ -698,6 +730,43 @@ def _win_read_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: str
     LOGGER.info(f"{vm_label}: Successfully read {filename}")
 
 
+def _win_do_bidirectional_verification(
+    ctx: _SharedDiskContext,
+    volume_label: str,
+    test_file_vm1: str,
+    test_file_vm2: str,
+) -> bool:
+    """Run bidirectional read/write verification between both Windows VMs.
+
+    Args:
+        ctx: Shared disk verification context (SSH connections, VM names).
+        volume_label: NTFS volume label to locate the shared disk.
+        test_file_vm1: Marker filename written by VM1.
+        test_file_vm2: Marker filename written by VM2.
+
+    Returns:
+        True if both VMs can read each other's marker files.
+    """
+    with ctx.ssh_vm1:
+        drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1", volume_label)
+        _win_write_marker(ctx.ssh_vm1, drive1, test_file_vm1, "Data from VM1", "VM1")
+
+        with ctx.ssh_vm2:
+            drive2 = _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2", volume_label)
+            _win_refresh_shared_disk(ctx.ssh_vm2, "VM2", volume_label)
+            drive2 = _win_get_shared_drive_letter(ctx.ssh_vm2, "VM2", volume_label)
+            _win_read_marker(ctx.ssh_vm2, drive2, test_file_vm1, "Data from VM1", "VM2")
+
+            _win_write_marker(ctx.ssh_vm2, drive2, test_file_vm2, "Data from VM2", "VM2")
+            _win_refresh_shared_disk(ctx.ssh_vm2, "VM2", volume_label)
+
+        _win_refresh_shared_disk(ctx.ssh_vm1, "VM1", volume_label)
+        drive1 = _win_get_shared_drive_letter(ctx.ssh_vm1, "VM1", volume_label)
+        _win_read_marker(ctx.ssh_vm1, drive1, test_file_vm2, "Data from VM2", "VM1")
+
+    return True
+
+
 def verify_shared_disk_data_windows(
     prepared_plan: dict[str, Any],
     vm_ssh_connections: SSHConnectionManager,
@@ -744,42 +813,20 @@ def verify_shared_disk_data_windows(
 
     last_exc: Exception | None = None
 
-    def _do_verification() -> bool | None:
-        """Run bidirectional read/write verification between both Windows VMs.
-
-        Returns:
-            True if both VMs can read each other's marker files, None on transient failure (triggers retry).
-        """
+    def _attempt() -> bool | None:
+        nonlocal last_exc
         try:
-            with ctx.ssh_vm1:
-                drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1", volume_label)
-                _win_write_marker(ctx.ssh_vm1, drive1, test_file_vm1, "Data from VM1", "VM1")
-
-                with ctx.ssh_vm2:
-                    drive2 = _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2", volume_label)
-                    _win_refresh_shared_disk(ctx.ssh_vm2, "VM2", volume_label)
-                    drive2 = _win_get_shared_drive_letter(ctx.ssh_vm2, "VM2", volume_label)
-                    _win_read_marker(ctx.ssh_vm2, drive2, test_file_vm1, "Data from VM1", "VM2")
-
-                    _win_write_marker(ctx.ssh_vm2, drive2, test_file_vm2, "Data from VM2", "VM2")
-                    _win_refresh_shared_disk(ctx.ssh_vm2, "VM2", volume_label)
-
-                _win_refresh_shared_disk(ctx.ssh_vm1, "VM1", volume_label)
-                drive1 = _win_get_shared_drive_letter(ctx.ssh_vm1, "VM1", volume_label)
-                _win_read_marker(ctx.ssh_vm1, drive1, test_file_vm2, "Data from VM2", "VM1")
-
-                return True
+            return _win_do_bidirectional_verification(ctx, volume_label, test_file_vm1, test_file_vm2)
         except (
             SSHException,
             AuthenticationException,
             NoValidConnectionsError,
             ChannelException,
-            RuntimeError,
+            SSHConnectionSetupError,
             OSError,
             ConnectionError,
             GuestCommandError,
         ) as e:
-            nonlocal last_exc
             last_exc = e
             LOGGER.warning(f"Shared disk verification failed: {type(e).__name__}: {e} - retrying...")
             return None
@@ -788,7 +835,7 @@ def verify_shared_disk_data_windows(
         for sample in TimeoutSampler(
             wait_timeout=_WIN_VERIFICATION_RETRY_TIMEOUT,
             sleep=_WIN_VERIFICATION_RETRY_INTERVAL,
-            func=_do_verification,
+            func=_attempt,
         ):
             if sample:
                 break
