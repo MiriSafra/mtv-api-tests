@@ -868,6 +868,7 @@ def verify_shared_disk_data_windows(
             OSError,
             ConnectionError,
             GuestCommandError,
+            AssertionError,
         ) as e:
             last_exc = e
             LOGGER.warning(f"Shared disk verification failed: {type(e).__name__}: {e} - retrying...")
