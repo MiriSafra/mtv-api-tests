@@ -445,15 +445,50 @@ def _disable_fast_startup(
         LOGGER.warning(f"Failed to disable Fast Startup on '{owner_name}' (best-effort): {e}")
 
 
+def _get_guest_auth(
+    source_provider: VMWareProvider,
+    owner_vm: vim.VirtualMachine,
+    owner_name: str,
+    source_provider_data: dict[str, Any],
+) -> tuple["vim.vm.guest.NamePasswordAuthentication", str]:
+    """Wait for VMware Tools and return guest auth + vCenter host.
+
+    Args:
+        source_provider: VMWare provider instance.
+        owner_vm: PyVmomi VM object for the owner VM.
+        owner_name: Display name of the owner VM.
+        source_provider_data: Provider config (uses guest_vm_win_user/password).
+
+    Returns:
+        Tuple of (NamePasswordAuthentication, vcenter_host).
+
+    Raises:
+        ValueError: If Tools not ready or vCenter host unavailable.
+    """
+    if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=_GUEST_TOOLS_READY_TIMEOUT):
+        raise ValueError(f"VMware Tools not available on '{owner_name}' after power-on, cannot label shared disk")
+
+    win_user = source_provider_data["guest_vm_win_user"]
+    win_pass = source_provider_data["guest_vm_win_password"]
+    auth = vim.vm.guest.NamePasswordAuthentication(username=win_user, password=win_pass, interactiveSession=False)
+
+    vcenter_host = source_provider.host
+    if vcenter_host is None:
+        raise ValueError(f"vCenter host not available for provider used by VM '{owner_name}'")
+
+    return auth, vcenter_host
+
+
 def _execute_guest_label_command(
     source_provider: VMWareProvider,
     owner_vm: vim.VirtualMachine,
     owner_name: str,
     disk_serial: str,
     volume_label: str,
-    source_provider_data: dict[str, Any],
+    auth: "vim.vm.guest.NamePasswordAuthentication",
+    vcenter_host: str,
 ) -> None:
-    """Authenticate via Guest Ops and label the shared disk on the source Windows VM.
+    """Label the shared disk on the source Windows VM via Guest Ops.
 
     Args:
         source_provider: VMWare provider instance.
@@ -461,10 +496,11 @@ def _execute_guest_label_command(
         owner_name: Display name of the owner VM.
         disk_serial: Hex disk serial number to match inside the guest.
         volume_label: Alphanumeric NTFS volume label to set.
-        source_provider_data: Provider config (uses guest_vm_win_user/password).
+        auth: Guest authentication credentials.
+        vcenter_host: vCenter hostname.
 
     Raises:
-        ValueError: If credentials, vCenter host unavailable, or inputs invalid.
+        ValueError: If disk_serial or volume_label format is invalid.
         GuestCommandError: If the labeling PowerShell command fails.
     """
     disk_serial = disk_serial.strip()
@@ -474,26 +510,8 @@ def _execute_guest_label_command(
     if not _SAFE_LABEL_RE.fullmatch(volume_label):
         raise ValueError(f"Invalid volume label (alphanumeric expected): {volume_label}")
 
-    if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=_GUEST_TOOLS_READY_TIMEOUT):
-        raise ValueError(f"VMware Tools not available on '{owner_name}' after power-on, cannot label shared disk")
-
-    try:
-        win_user = source_provider_data["guest_vm_win_user"]
-        win_pass = source_provider_data["guest_vm_win_password"]
-    except KeyError as e:
-        raise ValueError(
-            f"Windows VM credentials not found in provider config: {e}. "
-            "Required: guest_vm_win_user, guest_vm_win_password"
-        ) from e
-
-    auth = vim.vm.guest.NamePasswordAuthentication(username=win_user, password=win_pass, interactiveSession=False)
-
     ps_script = _WIN_LABEL_PS_TEMPLATE.format(serial=disk_serial, label=volume_label)
     encoded_cmd = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
-
-    vcenter_host = source_provider.host
-    if vcenter_host is None:
-        raise ValueError(f"vCenter host not available for provider used by VM '{owner_name}'")
 
     output = run_command_in_vmware_guest(
         content=source_provider.content,
@@ -504,14 +522,6 @@ def _execute_guest_label_command(
         timeout=_WIN_LABEL_GUEST_OPS_TIMEOUT,
     )
     LOGGER.info(f"Shared disk labeling on '{owner_name}': {output.strip()}")
-
-    _disable_fast_startup(
-        source_provider=source_provider,
-        owner_vm=owner_vm,
-        owner_name=owner_name,
-        auth=auth,
-        vcenter_host=vcenter_host,
-    )
 
 
 def label_shared_disk_on_source_windows(
@@ -558,13 +568,27 @@ def label_shared_disk_on_source_windows(
     LOGGER.info(f"Powering on '{owner_name}' for shared disk labeling")
     source_provider.start_vm(owner_vm)
     try:
+        auth, vcenter_host = _get_guest_auth(
+            source_provider=source_provider,
+            owner_vm=owner_vm,
+            owner_name=owner_name,
+            source_provider_data=source_provider_data,
+        )
         _execute_guest_label_command(
             source_provider=source_provider,
             owner_vm=owner_vm,
             owner_name=owner_name,
             disk_serial=disk_serial,
             volume_label=volume_label,
-            source_provider_data=source_provider_data,
+            auth=auth,
+            vcenter_host=vcenter_host,
+        )
+        _disable_fast_startup(
+            source_provider=source_provider,
+            owner_vm=owner_vm,
+            owner_name=owner_name,
+            auth=auth,
+            vcenter_host=vcenter_host,
         )
     finally:
         LOGGER.info(f"Gracefully shutting down '{owner_name}' after shared disk labeling")
@@ -838,11 +862,7 @@ def verify_shared_disk_data_windows(
         AssertionError: If shared disk data verification fails.
         GuestCommandError: If SSH or PowerShell commands fail.
     """
-    volume_label = prepared_plan.get("_shared_disk_label")
-    if not volume_label:
-        raise ValueError(
-            "No shared disk label found in prepared_plan. Ensure test_label_shared_disk ran before migration."
-        )
+    volume_label = prepared_plan["_shared_disk_label"]
 
     # Shared PVC validated by helper (device paths unused — Windows uses volume labels)
     ctx = _prepare_shared_disk_verification(prepared_plan, vm_ssh_connections, source_provider_data, ocp_admin_client)
@@ -868,7 +888,6 @@ def verify_shared_disk_data_windows(
             OSError,
             ConnectionError,
             GuestCommandError,
-            AssertionError,
         ) as e:
             last_exc = e
             LOGGER.warning(f"Shared disk verification failed: {type(e).__name__}: {e} - retrying...")
