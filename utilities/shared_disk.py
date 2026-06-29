@@ -463,7 +463,7 @@ def _get_guest_auth(
         Tuple of (NamePasswordAuthentication, vcenter_host).
 
     Raises:
-        ValueError: If Tools not ready or vCenter host unavailable.
+        ValueError: If Tools not ready, credentials missing, or vCenter host unavailable.
     """
     if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=_GUEST_TOOLS_READY_TIMEOUT):
         raise ValueError(f"VMware Tools not available on '{owner_name}' after power-on, cannot label shared disk")
