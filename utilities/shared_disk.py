@@ -468,8 +468,13 @@ def _get_guest_auth(
     if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=_GUEST_TOOLS_READY_TIMEOUT):
         raise ValueError(f"VMware Tools not available on '{owner_name}' after power-on, cannot label shared disk")
 
-    win_user = source_provider_data["guest_vm_win_user"]
-    win_pass = source_provider_data["guest_vm_win_password"]
+    win_user = source_provider_data.get("guest_vm_win_user")
+    win_pass = source_provider_data.get("guest_vm_win_password")
+    if not win_user or not win_pass:
+        raise ValueError(
+            f"Windows Guest Operations requires 'guest_vm_win_user' and "
+            f"'guest_vm_win_password' in provider config for '{owner_name}'"
+        )
     auth = vim.vm.guest.NamePasswordAuthentication(username=win_user, password=win_pass, interactiveSession=False)
 
     vcenter_host = source_provider.host
@@ -819,7 +824,7 @@ def _win_do_bidirectional_verification(
         _win_write_marker(ctx.ssh_vm1, drive1, test_file_vm1, "Data from VM1", "VM1")
 
         with ctx.ssh_vm2:
-            drive2 = _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2", volume_label)
+            _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2", volume_label)
             _win_refresh_shared_disk(ctx.ssh_vm2, "VM2", volume_label)
             drive2 = _win_get_shared_drive_letter(ctx.ssh_vm2, "VM2", volume_label)
             _win_read_marker(ctx.ssh_vm2, drive2, test_file_vm1, "Data from VM1", "VM2")
