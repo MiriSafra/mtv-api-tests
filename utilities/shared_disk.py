@@ -706,7 +706,7 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str, volum
             sleep=_WIN_VOLUME_DISCOVERY_POLL_INTERVAL,
             func=_try_get_drive_letter,
         ):
-            if sample and len(sample) == 1:
+            if sample:
                 drive_letter = sample
                 break
     except TimeoutExpiredError as exc:
@@ -868,6 +868,8 @@ def verify_shared_disk_data_windows(
         GuestCommandError: If SSH or PowerShell commands fail.
     """
     volume_label = prepared_plan["_shared_disk_label"]
+    if not _SAFE_LABEL_RE.fullmatch(volume_label):
+        raise ValueError(f"Invalid volume label: {volume_label}")
 
     # Shared PVC validated by helper (device paths unused — Windows uses volume labels)
     ctx = _prepare_shared_disk_verification(prepared_plan, vm_ssh_connections, source_provider_data, ocp_admin_client)
