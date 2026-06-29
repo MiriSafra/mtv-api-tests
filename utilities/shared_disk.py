@@ -465,9 +465,6 @@ def _get_guest_auth(
     Raises:
         ValueError: If Tools not ready, credentials missing, or vCenter host unavailable.
     """
-    if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=_GUEST_TOOLS_READY_TIMEOUT):
-        raise ValueError(f"VMware Tools not available on '{owner_name}' after power-on, cannot label shared disk")
-
     win_user = source_provider_data.get("guest_vm_win_user")
     win_pass = source_provider_data.get("guest_vm_win_password")
     if not win_user or not win_pass:
@@ -475,11 +472,15 @@ def _get_guest_auth(
             f"Windows Guest Operations requires 'guest_vm_win_user' and "
             f"'guest_vm_win_password' in provider config for '{owner_name}'"
         )
-    auth = vim.vm.guest.NamePasswordAuthentication(username=win_user, password=win_pass, interactiveSession=False)
 
     vcenter_host = source_provider.host
     if vcenter_host is None:
         raise ValueError(f"vCenter host not available for provider used by VM '{owner_name}'")
+
+    if not source_provider.wait_for_vmware_guest_info(owner_vm, timeout=_GUEST_TOOLS_READY_TIMEOUT):
+        raise ValueError(f"VMware Tools not available on '{owner_name}' after power-on, cannot label shared disk")
+
+    auth = vim.vm.guest.NamePasswordAuthentication(username=win_user, password=win_pass, interactiveSession=False)
 
     return auth, vcenter_host
 

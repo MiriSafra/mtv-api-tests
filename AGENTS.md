@@ -818,7 +818,7 @@ class TestNameHere:
 **Test method naming:** Base tests: `test_create_storagemap`, `test_create_networkmap`, `test_create_plan`,
 `test_migrate_vms`, `test_check_vms`. Shared-disk Linux tests: same through `test_migrate_vms`, then
 `test_verify_shared_disk_data`, `test_check_vms`. Shared-disk Windows tests: `test_label_shared_disk`,
-then the base five, then `test_verify_shared_disk_data`, `test_check_vms`. Copy-offload tests: same through `test_migrate_vms`, then
+then the base five through `test_migrate_vms`, then `test_verify_shared_disk_data`, `test_check_vms`. Copy-offload tests: same through `test_migrate_vms`, then
 `test_check_xcopy_used`, `test_check_vms`. Copy-offload throttling tests: same through `test_migrate_vms`, then
 `test_verify_populator_throttling`, `test_check_xcopy_used`, `test_check_vms`. LUKS tests: same through `test_migrate_vms`, then
 `test_verify_luks_encryption`, `test_check_vms`. XFS tests: same through `test_migrate_vms`, then
