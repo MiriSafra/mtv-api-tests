@@ -450,7 +450,7 @@ def _get_guest_auth(
     owner_vm: vim.VirtualMachine,
     owner_name: str,
     source_provider_data: dict[str, Any],
-) -> tuple["vim.vm.guest.NamePasswordAuthentication", str]:
+) -> tuple[vim.vm.guest.NamePasswordAuthentication, str]:
     """Wait for VMware Tools and return guest auth + vCenter host.
 
     Args:
@@ -485,7 +485,7 @@ def _execute_guest_label_command(
     owner_name: str,
     disk_serial: str,
     volume_label: str,
-    auth: "vim.vm.guest.NamePasswordAuthentication",
+    auth: vim.vm.guest.NamePasswordAuthentication,
     vcenter_host: str,
 ) -> None:
     """Label the shared disk on the source Windows VM via Guest Ops.
