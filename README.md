@@ -591,10 +591,9 @@ For technical implementation details, see the
 
 ## LUKS Disk Encryption Migration (tier1)
 
-This test suite verifies MTV's ability to handle the migration of LUKS-encrypted VMs. It ensures
-that MTV correctly processes decryption secrets during the ImageConversion phase, validating both
-successful migration when correct credentials are provided and expected failure when invalid
-credentials are used.
+This test suite verifies MTV's ability to migrate LUKS-encrypted VMs. It validates both
+successful cold migration when the correct decryption passphrase is provided, and expected
+failure at the ImageConversion phase when invalid credentials are used.
 
 ### Configuration
 
