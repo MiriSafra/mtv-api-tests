@@ -593,7 +593,7 @@ For technical implementation details, see the
 
 This test suite verifies MTV's ability to migrate LUKS-encrypted VMs. It validates both
 successful cold migration when the correct decryption passphrase is provided, and expected
-failure at the ImageConversion phase when invalid credentials are used.
+failure at the ImageConversion phase when an incorrect LUKS decryption passphrase is used.
 
 ### Configuration
 
