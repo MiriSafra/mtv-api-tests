@@ -310,7 +310,8 @@ def verify_shared_disk_data(
         ocp_admin_client (DynamicClient): OpenShift admin client for destination VM lookup.
 
     Raises:
-        GuestCommandError: If SSH commands or data verification fails.
+        GuestCommandError: If SSH commands fail.
+        AssertionError: If shared-disk marker content does not match.
     """
     ctx = _prepare_shared_disk_verification(prepared_plan, vm_ssh_connections, source_provider_data, ocp_admin_client)
     vm1_device = ctx.shared_devices[ctx.vm1_dest_name]
@@ -794,9 +795,10 @@ def _win_read_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: str
     Raises:
         GuestCommandError: If the read command fails or content does not match.
     """
+    ps_path = f"{drive_letter}:\\{filename}".replace("'", "''")
     content = _win_run_powershell(
         ssh_conn,
-        f"Get-Content -Path '{drive_letter}:\\{filename}'",
+        f"Get-Content -Path '{ps_path}'",
         f"{vm_label} read {filename}",
     )
     if expected not in content.strip():
@@ -866,7 +868,9 @@ def verify_shared_disk_data_windows(
         ocp_admin_client (DynamicClient): OpenShift admin client for destination VM lookup.
 
     Raises:
-        GuestCommandError: If SSH, PowerShell commands, or data verification fails.
+        KeyError: If ``prepared_plan`` does not contain ``"_shared_disk_label"``.
+        ValueError: If the stored volume label is not safe for PowerShell usage.
+        TimeoutExpiredError: If SSH, PowerShell, or data verification keeps failing until retry timeout.
     """
     volume_label = prepared_plan["_shared_disk_label"]
     if not _SAFE_LABEL_RE.fullmatch(volume_label):
