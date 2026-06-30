@@ -310,8 +310,7 @@ def verify_shared_disk_data(
         ocp_admin_client (DynamicClient): OpenShift admin client for destination VM lookup.
 
     Raises:
-        AssertionError: If shared disk data verification fails.
-        GuestCommandError: If SSH commands fail.
+        GuestCommandError: If SSH commands or data verification fails.
     """
     ctx = _prepare_shared_disk_verification(prepared_plan, vm_ssh_connections, source_provider_data, ocp_admin_client)
     vm1_device = ctx.shared_devices[ctx.vm1_dest_name]
@@ -793,15 +792,15 @@ def _win_read_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: str
         vm_label (str): Label for log messages.
 
     Raises:
-        AssertionError: If the file content does not contain the expected string.
-        GuestCommandError: If the read command fails.
+        GuestCommandError: If the read command fails or content does not match.
     """
     content = _win_run_powershell(
         ssh_conn,
         f"Get-Content -Path '{drive_letter}:\\{filename}'",
         f"{vm_label} read {filename}",
     )
-    assert expected in content.strip(), f"{vm_label} cannot read expected data from {filename}: {content}"
+    if expected not in content.strip():
+        raise GuestCommandError(f"{vm_label} cannot read expected data from {filename}: {content}")
     LOGGER.info(f"{vm_label}: Successfully read {filename}")
 
 
@@ -820,15 +819,14 @@ def _win_do_bidirectional_verification(
         test_file_vm2: Marker filename written by VM2.
 
     Raises:
-        GuestCommandError: If any PowerShell command fails.
-        AssertionError: If marker file content doesn't match expected data.
+        GuestCommandError: If any PowerShell command fails or marker content doesn't match.
     """
     with ctx.ssh_vm1:
         drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1", volume_label)
         _win_write_marker(ctx.ssh_vm1, drive1, test_file_vm1, "Data from VM1", "VM1")
 
         with ctx.ssh_vm2:
-            _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2", volume_label)
+            _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2", volume_label)  # drive letter re-queried after refresh
             _win_refresh_shared_disk(ctx.ssh_vm2, "VM2", volume_label)
             drive2 = _win_get_shared_drive_letter(ctx.ssh_vm2, "VM2", volume_label)
             _win_read_marker(ctx.ssh_vm2, drive2, test_file_vm1, "Data from VM1", "VM2")
@@ -868,8 +866,7 @@ def verify_shared_disk_data_windows(
         ocp_admin_client (DynamicClient): OpenShift admin client for destination VM lookup.
 
     Raises:
-        AssertionError: If shared disk data verification fails.
-        GuestCommandError: If SSH or PowerShell commands fail.
+        GuestCommandError: If SSH, PowerShell commands, or data verification fails.
     """
     volume_label = prepared_plan["_shared_disk_label"]
     if not _SAFE_LABEL_RE.fullmatch(volume_label):
