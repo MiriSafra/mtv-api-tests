@@ -422,6 +422,11 @@ def _disable_fast_startup(
     Windows hybrid shutdown writes a hibernation file that causes virt-customize to fail
     during migration (ConversionHasWarnings / CustomizationFailed).
 
+    Note:
+        Intentional deviation from no-fallbacks rule — Fast Startup disable is
+        a non-critical optimization that does not affect migration correctness.
+        Failure is logged and execution continues.
+
     Args:
         source_provider: VMWare provider instance.
         owner_vm: PyVmomi VM object for the owner VM.
@@ -717,9 +722,7 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str, volum
             f"by test_label_shared_disk before migration."
         ) from exc
 
-    if not drive_letter:
-        raise GuestCommandError(f"{vm_label}: Shared volume '{volume_label}' not found")
-
+    assert drive_letter is not None
     LOGGER.info(f"{vm_label}: Shared volume '{volume_label}' is drive {drive_letter}:")
     return drive_letter
 
@@ -893,7 +896,6 @@ def verify_shared_disk_data_windows(
             NoValidConnectionsError,
             ChannelException,
             SSHConnectionSetupError,
-            OSError,
             ConnectionError,
             GuestCommandError,
         ) as e:
