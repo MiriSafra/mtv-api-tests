@@ -63,6 +63,11 @@ _GUEST_TOOLS_READY_TIMEOUT = 300
 _HEX_SERIAL_RE = re.compile(r"[a-fA-F0-9]+")
 _SAFE_LABEL_RE = re.compile(r"[a-zA-Z0-9_-]+")
 
+_MARKER_VM1_FILENAME = "test-vm1.txt"
+_MARKER_VM2_FILENAME = "test-vm2.txt"
+_MARKER_VM1_CONTENT = "Data from VM1"
+_MARKER_VM2_CONTENT = "Data from VM2"
+
 
 def _mount_shared_partition(ssh_conn: VMSSHConnection, partition: str, mount_point: str, vm_label: str) -> None:
     """Mount a shared disk partition on a VM.
@@ -371,13 +376,13 @@ def _find_shared_disk_serial(
     disk serial via ``Win32_DiskDrive.SerialNumber``).
 
     Args:
-        source_provider: VMWare provider instance.
-        owner_vm: Owner VM pyvmomi object.
-        owner_name: Owner VM name (for error messages).
-        vm_names: All VM names in the plan.
+        source_provider (VMWareProvider): VMWare provider instance.
+        owner_vm (vim.VirtualMachine): Owner VM pyvmomi object.
+        owner_name (str): Owner VM name (for error messages).
+        vm_names (list[str]): All VM names in the plan.
 
     Returns:
-        Disk serial string (backing UUID without dashes, lowercase).
+        str: Disk serial string (backing UUID without dashes, lowercase).
 
     Raises:
         ValueError: If no shared VMDK found or backing UUID unavailable.
@@ -428,11 +433,11 @@ def _disable_fast_startup(
         Failure is logged and execution continues.
 
     Args:
-        source_provider: VMWare provider instance.
-        owner_vm: PyVmomi VM object for the owner VM.
-        owner_name: Display name of the owner VM.
-        auth: Guest authentication credentials.
-        vcenter_host: vCenter hostname for Guest Ops API.
+        source_provider (VMWareProvider): VMWare provider instance.
+        owner_vm (vim.VirtualMachine): PyVmomi VM object for the owner VM.
+        owner_name (str): Display name of the owner VM.
+        auth (vim.vm.guest.NamePasswordAuthentication): Guest authentication credentials.
+        vcenter_host (str): vCenter hostname for Guest Ops API.
     """
     try:
         run_command_in_vmware_guest(
@@ -459,13 +464,13 @@ def _get_guest_auth(
     """Wait for VMware Tools and return guest auth + vCenter host.
 
     Args:
-        source_provider: VMWare provider instance.
-        owner_vm: PyVmomi VM object for the owner VM.
-        owner_name: Display name of the owner VM.
-        source_provider_data: Provider config (uses guest_vm_win_user/password).
+        source_provider (VMWareProvider): VMWare provider instance.
+        owner_vm (vim.VirtualMachine): PyVmomi VM object for the owner VM.
+        owner_name (str): Display name of the owner VM.
+        source_provider_data (dict[str, Any]): Provider config (uses guest_vm_win_user/password).
 
     Returns:
-        Tuple of (NamePasswordAuthentication, vcenter_host).
+        tuple: (NamePasswordAuthentication, vcenter_host).
 
     Raises:
         ValueError: If Tools not ready, credentials missing, or vCenter host unavailable.
@@ -502,13 +507,13 @@ def _execute_guest_label_command(
     """Label the shared disk on the source Windows VM via Guest Ops.
 
     Args:
-        source_provider: VMWare provider instance.
-        owner_vm: PyVmomi VM object for the owner VM.
-        owner_name: Display name of the owner VM.
-        disk_serial: Hex disk serial number to match inside the guest.
-        volume_label: Alphanumeric NTFS volume label to set.
-        auth: Guest authentication credentials.
-        vcenter_host: vCenter hostname.
+        source_provider (VMWareProvider): VMWare provider instance.
+        owner_vm (vim.VirtualMachine): PyVmomi VM object for the owner VM.
+        owner_name (str): Display name of the owner VM.
+        disk_serial (str): Hex disk serial number to match inside the guest.
+        volume_label (str): Alphanumeric NTFS volume label to set.
+        auth (vim.vm.guest.NamePasswordAuthentication): Guest authentication credentials.
+        vcenter_host (str): vCenter hostname.
 
     Raises:
         ValueError: If disk_serial or volume_label format is invalid.
@@ -549,10 +554,10 @@ def label_shared_disk_on_source_windows(
     for post-migration verification.
 
     Args:
-        source_provider: VMWare provider instance.
-        prepared_plan: Plan config dict (from prepared_plan fixture).
-        source_provider_data: Provider config from .providers.json.
-        session_uuid: Session-unique identifier (from fixture_store).
+        source_provider (VMWareProvider): VMWare provider instance.
+        prepared_plan (dict[str, Any]): Plan config dict (from prepared_plan fixture).
+        source_provider_data (dict[str, Any]): Provider config from .providers.json.
+        session_uuid (str): Session-unique identifier (from fixture_store).
 
     Raises:
         ValueError: If no shared disk found or Windows credentials missing.
@@ -603,7 +608,10 @@ def label_shared_disk_on_source_windows(
         )
     finally:
         LOGGER.info(f"Gracefully shutting down '{owner_name}' after shared disk labeling")
-        source_provider.shutdown_vm_guest(owner_vm)
+        try:
+            source_provider.shutdown_vm_guest(owner_vm)
+        except Exception:
+            LOGGER.warning(f"Failed to shut down '{owner_name}' after labeling", exc_info=True)
 
 
 def _win_run_powershell(
@@ -722,6 +730,7 @@ def _win_get_shared_drive_letter(ssh_conn: VMSSHConnection, vm_label: str, volum
             f"by test_label_shared_disk before migration."
         ) from exc
 
+    # Type narrowing: TimeoutSampler guarantees either break (drive_letter set) or TimeoutExpiredError
     assert drive_letter is not None
     LOGGER.info(f"{vm_label}: Shared volume '{volume_label}' is drive {drive_letter}:")
     return drive_letter
@@ -793,7 +802,8 @@ def _win_read_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: str
         vm_label (str): Label for log messages.
 
     Raises:
-        GuestCommandError: If the read command fails or content does not match.
+        GuestCommandError: If the read command fails.
+        AssertionError: If content does not match expected data.
     """
     ps_path = f"{drive_letter}:\\{filename}".replace("'", "''")
     content = _win_run_powershell(
@@ -802,7 +812,7 @@ def _win_read_marker(ssh_conn: VMSSHConnection, drive_letter: str, filename: str
         f"{vm_label} read {filename}",
     )
     if expected not in content.strip():
-        raise GuestCommandError(f"{vm_label} cannot read expected data from {filename}: {content}")
+        raise AssertionError(f"{vm_label} cannot read expected data from {filename}: {content}")
     LOGGER.info(f"{vm_label}: Successfully read {filename}")
 
 
@@ -815,30 +825,31 @@ def _win_do_bidirectional_verification(
     """Run bidirectional read/write verification between both Windows VMs.
 
     Args:
-        ctx: Shared disk verification context (SSH connections, VM names).
-        volume_label: NTFS volume label to locate the shared disk.
-        test_file_vm1: Marker filename written by VM1.
-        test_file_vm2: Marker filename written by VM2.
+        ctx (_SharedDiskContext): Shared disk verification context (SSH connections, VM names).
+        volume_label (str): NTFS volume label to locate the shared disk.
+        test_file_vm1 (str): Marker filename written by VM1.
+        test_file_vm2 (str): Marker filename written by VM2.
 
     Raises:
-        GuestCommandError: If any PowerShell command fails or marker content doesn't match.
+        GuestCommandError: If any PowerShell command fails.
+        AssertionError: If marker content does not match expected data.
     """
     with ctx.ssh_vm1:
         drive1 = _win_ensure_shared_volume_online(ctx.ssh_vm1, "VM1", volume_label)
-        _win_write_marker(ctx.ssh_vm1, drive1, test_file_vm1, "Data from VM1", "VM1")
+        _win_write_marker(ctx.ssh_vm1, drive1, test_file_vm1, _MARKER_VM1_CONTENT, "VM1")
 
         with ctx.ssh_vm2:
             _win_ensure_shared_volume_online(ctx.ssh_vm2, "VM2", volume_label)  # drive letter re-queried after refresh
             _win_refresh_shared_disk(ctx.ssh_vm2, "VM2", volume_label)
             drive2 = _win_get_shared_drive_letter(ctx.ssh_vm2, "VM2", volume_label)
-            _win_read_marker(ctx.ssh_vm2, drive2, test_file_vm1, "Data from VM1", "VM2")
+            _win_read_marker(ctx.ssh_vm2, drive2, test_file_vm1, _MARKER_VM1_CONTENT, "VM2")
 
-            _win_write_marker(ctx.ssh_vm2, drive2, test_file_vm2, "Data from VM2", "VM2")
+            _win_write_marker(ctx.ssh_vm2, drive2, test_file_vm2, _MARKER_VM2_CONTENT, "VM2")
             _win_refresh_shared_disk(ctx.ssh_vm2, "VM2", volume_label)
 
         _win_refresh_shared_disk(ctx.ssh_vm1, "VM1", volume_label)
         drive1 = _win_get_shared_drive_letter(ctx.ssh_vm1, "VM1", volume_label)
-        _win_read_marker(ctx.ssh_vm1, drive1, test_file_vm2, "Data from VM2", "VM1")
+        _win_read_marker(ctx.ssh_vm1, drive1, test_file_vm2, _MARKER_VM2_CONTENT, "VM1")
 
 
 def verify_shared_disk_data_windows(
@@ -881,15 +892,12 @@ def verify_shared_disk_data_windows(
 
     LOGGER.info(f"Verifying Windows shared disk (label='{volume_label}') between {ctx.vm1_name} and {ctx.vm2_name}")
 
-    test_file_vm1 = "test-vm1.txt"
-    test_file_vm2 = "test-vm2.txt"
-
     last_exc: Exception | None = None
 
     def _attempt() -> bool | None:
         nonlocal last_exc
         try:
-            _win_do_bidirectional_verification(ctx, volume_label, test_file_vm1, test_file_vm2)
+            _win_do_bidirectional_verification(ctx, volume_label, _MARKER_VM1_FILENAME, _MARKER_VM2_FILENAME)
             return True
         except (
             SSHException,
