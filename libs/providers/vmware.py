@@ -1606,7 +1606,10 @@ class VMWareProvider(BaseProvider):
             vm_names (list[str]): Source VM names to scan.
 
         Returns:
-            dict mapping shared VMDK paths to their SCSI positions per VM.
+            dict[str, list[tuple[int, int, int]]]: Mapping of shared VMDK backing-file
+                paths to their SCSI positions. Each tuple is ``(vm_index, bus_number,
+                unit_number)`` where ``vm_index`` is the index into the caller-supplied
+                ``vm_names`` list.
         """
         return self._find_shared_vmdks(self._build_vmdk_position_map(vm_names))
 

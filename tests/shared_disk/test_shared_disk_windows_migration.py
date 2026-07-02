@@ -59,7 +59,7 @@ class TestSharedDiskWindowsMigration:
     def test_label_shared_disk(
         self,
         prepared_plan: dict[str, Any],  # Heterogeneous: VM specs, flags, runtime data
-        source_provider: "BaseProvider",
+        source_provider: BaseProvider,
         source_provider_data: dict[str, Any],  # Provider config: credentials, endpoints, settings
         fixture_store: dict[str, Any],  # Session state: UUIDs, teardown tracking
     ) -> None:
@@ -75,10 +75,10 @@ class TestSharedDiskWindowsMigration:
         self,
         prepared_plan: dict[str, Any],
         fixture_store: dict[str, Any],
-        ocp_admin_client: "DynamicClient",
-        source_provider: "BaseProvider",
-        destination_provider: "OCPProvider",
-        source_provider_inventory: "ForkliftInventory",
+        ocp_admin_client: DynamicClient,
+        source_provider: BaseProvider,
+        destination_provider: OCPProvider,
+        source_provider_inventory: ForkliftInventory,
         target_namespace: str,
     ) -> None:
         """Create StorageMap resource for both VMs."""
@@ -98,10 +98,10 @@ class TestSharedDiskWindowsMigration:
         self,
         prepared_plan: dict[str, Any],
         fixture_store: dict[str, Any],
-        ocp_admin_client: "DynamicClient",
-        source_provider: "BaseProvider",
-        destination_provider: "OCPProvider",
-        source_provider_inventory: "ForkliftInventory",
+        ocp_admin_client: DynamicClient,
+        source_provider: BaseProvider,
+        destination_provider: OCPProvider,
+        source_provider_inventory: ForkliftInventory,
         target_namespace: str,
         multus_network_name: dict[str, str],
     ) -> None:
@@ -123,11 +123,11 @@ class TestSharedDiskWindowsMigration:
         self,
         prepared_plan: dict[str, Any],
         fixture_store: dict[str, Any],
-        ocp_admin_client: "DynamicClient",
-        source_provider: "BaseProvider",
-        destination_provider: "OCPProvider",
+        ocp_admin_client: DynamicClient,
+        source_provider: BaseProvider,
+        destination_provider: OCPProvider,
         target_namespace: str,
-        source_provider_inventory: "ForkliftInventory",
+        source_provider_inventory: ForkliftInventory,
     ) -> None:
         """Create MTV Plan CR with VM-level migrateSharedDisks overrides."""
         populate_vm_ids(prepared_plan, source_provider_inventory)
@@ -150,7 +150,7 @@ class TestSharedDiskWindowsMigration:
     def test_migrate_vms(
         self,
         fixture_store: dict[str, Any],
-        ocp_admin_client: "DynamicClient",
+        ocp_admin_client: DynamicClient,
         target_namespace: str,
     ) -> None:
         """Execute migration for both VMs in a single plan."""
@@ -164,9 +164,9 @@ class TestSharedDiskWindowsMigration:
     def test_verify_shared_disk_data(
         self,
         prepared_plan: dict[str, Any],
-        vm_ssh_connections: "SSHConnectionManager",
+        vm_ssh_connections: SSHConnectionManager,
         source_provider_data: dict[str, Any],
-        ocp_admin_client: "DynamicClient",
+        ocp_admin_client: DynamicClient,
     ) -> None:
         """Verify shared disk read/write access from both Windows VMs."""
         verify_shared_disk_data_windows(
@@ -179,12 +179,12 @@ class TestSharedDiskWindowsMigration:
     def test_check_vms(
         self,
         prepared_plan: dict[str, Any],
-        source_provider: "BaseProvider",
-        destination_provider: "OCPProvider",
+        source_provider: BaseProvider,
+        destination_provider: OCPProvider,
         source_provider_data: dict[str, Any],
         source_vms_namespace: str,
-        source_provider_inventory: "ForkliftInventory",
-        vm_ssh_connections: "SSHConnectionManager",
+        source_provider_inventory: ForkliftInventory,
+        vm_ssh_connections: SSHConnectionManager,
     ) -> None:
         """Validate both migrated VMs."""
         check_vms(

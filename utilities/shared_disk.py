@@ -120,7 +120,7 @@ def _write_marker(ssh_conn: VMSSHConnection, file_path: str, content: str, vm_la
 
 
 def _get_pvc_device_targets(
-    ocp_admin_client: "DynamicClient",
+    ocp_admin_client: DynamicClient,
     target_namespace: str,
     vm_name: str,
 ) -> dict[str, str]:
@@ -184,7 +184,7 @@ def _get_pvc_device_targets(
 
 
 def _get_shared_disk_devices(
-    ocp_admin_client: "DynamicClient",
+    ocp_admin_client: DynamicClient,
     target_namespace: str,
     vm1_dest_name: str,
     vm2_dest_name: str,
@@ -248,7 +248,7 @@ def _prepare_shared_disk_verification(
     prepared_plan: dict[str, Any],
     vm_ssh_connections: SSHConnectionManager,
     source_provider_data: dict[str, Any],
-    ocp_admin_client: "DynamicClient",
+    ocp_admin_client: DynamicClient,
 ) -> _SharedDiskContext:
     """Extract common setup for shared disk verification (Linux and Windows).
 
@@ -264,6 +264,9 @@ def _prepare_shared_disk_verification(
 
     Returns:
         _SharedDiskContext: Common context for shared disk verification.
+
+    Raises:
+        ValueError: If no shared PVC (or more than one) is found between the two VMs.
     """
     vm1_config = prepared_plan["virtual_machines"][0]
     vm2_config = prepared_plan["virtual_machines"][1]
@@ -296,7 +299,7 @@ def verify_shared_disk_data(
     prepared_plan: dict[str, Any],
     vm_ssh_connections: SSHConnectionManager,
     source_provider_data: dict[str, Any],
-    ocp_admin_client: "DynamicClient",
+    ocp_admin_client: DynamicClient,
 ) -> None:
     """Verify shared disk is accessible from both VMs by writing and reading data.
 
@@ -635,7 +638,7 @@ def _win_run_powershell(
     Raises:
         GuestCommandError: If the command fails (non-zero return code).
     """
-    return _run_cmd_on_vm(ssh_conn, ["powershell", "-Command", script], description)
+    return run_cmd_in_vm(ssh_conn, ["powershell", "-Command", script], description)
 
 
 def _win_ensure_shared_volume_online(ssh_conn: VMSSHConnection, vm_label: str, volume_label: str) -> str:
@@ -856,7 +859,7 @@ def verify_shared_disk_data_windows(
     prepared_plan: dict[str, Any],
     vm_ssh_connections: SSHConnectionManager,
     source_provider_data: dict[str, Any],
-    ocp_admin_client: "DynamicClient",
+    ocp_admin_client: DynamicClient,
 ) -> None:
     """Verify shared disk is accessible from both Windows VMs after migration.
 
