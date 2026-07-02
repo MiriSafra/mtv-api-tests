@@ -866,6 +866,7 @@ tests_params: dict = {
 | `preserve_static_ips` | No       | True to preserve static IP addresses after migration  |
 | `copyoffload`         | No       | True to enable copy-offload (XCOPY) migration         |
 | `xfs_compatibility`   | No       | True to enable XFS v4 filesystem compatibility        |
+| `migrate_shared_disks`| No       | True to enable shared disk migration at plan level    |
 
 **Test Verification Configuration:**
 

@@ -19,9 +19,7 @@ from pytest_testconfig import config as py_config
 from rrmngmnt import Host, RootUser, User, UserWithPKey
 from simple_logger.logger import get_logger
 from timeout_sampler import TimeoutSampler, TimeoutExpiredError
-from exceptions.exceptions import GuestCommandError
-
-from exceptions.exceptions import SSHConnectionSetupError
+from exceptions.exceptions import GuestCommandError, SSHConnectionSetupError
 from libs.base_provider import BaseProvider
 
 LOGGER = get_logger(__name__)
