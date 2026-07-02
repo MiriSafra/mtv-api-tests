@@ -610,8 +610,8 @@ def label_shared_disk_on_source_windows(
         LOGGER.info(f"Gracefully shutting down '{owner_name}' after shared disk labeling")
         try:
             source_provider.shutdown_vm_guest(owner_vm)
-        except Exception:
-            LOGGER.warning(f"Failed to shut down '{owner_name}' after labeling", exc_info=True)
+        except (vim.fault.VimFault, ConnectionError, OSError, TimeoutExpiredError) as e:
+            LOGGER.warning(f"Failed to shut down '{owner_name}' after labeling: {e}")
 
 
 def _win_run_powershell(

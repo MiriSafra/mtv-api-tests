@@ -1603,7 +1603,7 @@ class VMWareProvider(BaseProvider):
         """Find VMDKs shared across multiple VMs.
 
         Args:
-            vm_names: Source VM names to scan.
+            vm_names (list[str]): Source VM names to scan.
 
         Returns:
             dict mapping shared VMDK paths to their SCSI positions per VM.
