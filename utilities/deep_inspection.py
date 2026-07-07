@@ -15,10 +15,21 @@ from utilities.resources import create_and_store_resource
 if TYPE_CHECKING:
     from kubernetes.dynamic import DynamicClient
     from libs.base_provider import BaseProvider
+    from libs.providers.vmware import VMWareProvider
 
 LOGGER = get_logger(name=__name__)
 
 CONVERSION_TERMINAL_PHASES = {Conversion.Status.SUCCEEDED, Conversion.Status.FAILED, Conversion.Condition.CANCELED}
+CONVERSION_CANCELED_PHASE = Conversion.Condition.CANCELED
+# Not exposed by openshift-python-wrapper — mirrors forklift constants:
+CONVERSION_TYPE_DEEP_INSPECTION = "DeepInspection"  # forklift: DeepInspection (conversion.go:20)
+CONVERSION_STAGE_FINISHED = "Finished"  # forklift: StageFinished (conversion.go:55)
+VDDK_IMAGE_NOT_SET_CONDITION = "VDDKImageNotSet"  # forklift: validation.go:14
+DI_SNAPSHOT_NAME = "forklift-deep-inspection"  # forklift: snapshotName (client.go:21)
+DI_SNAPSHOT_CREATION_TIMEOUT = 120
+DI_POD_CLEANUP_TIMEOUT = 60
+DI_SNAPSHOT_CLEANUP_TIMEOUT = 180
+DI_SNAPSHOT_REMOVAL_TIMEOUT = 120
 
 
 def create_di_connection_secret(
@@ -96,6 +107,107 @@ def create_di_connection_secret(
     )
 
 
+def cancel_conversion(conversion: Conversion) -> None:
+    """Cancel a Conversion CR by patching the status subresource.
+
+    Mirrors the forklift controller's CancelConversion() pattern
+    (kubevirt.go:973-975): sets phase=Canceled, stage=Finished via
+    a status subresource merge-patch. The caller is responsible for
+    ensuring the conversion is in a cancelable state (e.g., Running).
+
+    Args:
+        conversion (Conversion): The Conversion CR to cancel.
+    """
+    api_resource = conversion.client.resources.get(api_version=conversion.api_version, kind=conversion.kind)
+    api_resource.status.patch(
+        body={"status": {"phase": CONVERSION_CANCELED_PHASE, "stage": CONVERSION_STAGE_FINISHED}},
+        name=conversion.name,
+        namespace=conversion.namespace,
+        content_type="application/merge-patch+json",
+    )
+    LOGGER.info(f"Canceled conversion '{conversion.name}'")
+
+
+def wait_for_conversion_phase(conversion: Conversion, phase: str, timeout: int) -> None:
+    """Wait for a Conversion CR to reach a specific phase.
+
+    Polls the Conversion CR status until the phase matches the expected
+    value. Useful for timing cancel operations (wait for Running before
+    canceling). Raises ConversionError if the conversion reaches a
+    different terminal phase before the target.
+
+    Args:
+        conversion (Conversion): The Conversion CR to monitor.
+        phase (str): Target phase to wait for (e.g., Conversion.Status.RUNNING).
+        timeout (int): Maximum wait time in seconds.
+
+    Raises:
+        ConversionError: If the conversion reaches a terminal phase other
+            than the target, or if the timeout expires.
+    """
+    last_phase = ""
+    is_target_terminal = phase in CONVERSION_TERMINAL_PHASES
+
+    try:
+        for sample in TimeoutSampler(
+            wait_timeout=timeout,
+            sleep=3,
+            func=lambda: conversion.instance.status,
+        ):
+            if not sample:
+                continue
+
+            current_phase = sample.get("phase", "")
+            last_phase = current_phase
+            if current_phase == phase:
+                LOGGER.info(f"Conversion '{conversion.name}' reached phase '{phase}'")
+                return
+
+            if not is_target_terminal and current_phase in CONVERSION_TERMINAL_PHASES:
+                raise ConversionError(
+                    conversion_name=conversion.name,
+                    phase=current_phase,
+                    message=f"Reached terminal phase '{current_phase}' before target phase '{phase}'",
+                )
+
+    except TimeoutExpiredError:
+        raise ConversionError(
+            conversion_name=conversion.name,
+            phase=last_phase or "Unknown",
+            message=f"Did not reach phase '{phase}' within {timeout}s",
+        )
+
+
+def wait_for_di_snapshot(
+    source_provider: "VMWareProvider",
+    vm_name: str,
+    timeout: int = DI_SNAPSHOT_CREATION_TIMEOUT,
+) -> None:
+    """Wait for the DI snapshot to appear on the source VM.
+
+    Polls the source provider until the forklift-deep-inspection snapshot
+    exists. Used to ensure the DI pipeline has fully started before
+    performing cancel operations.
+
+    Args:
+        source_provider (BaseProvider): Source provider with list_snapshots method.
+        vm_name (str): Source VM name to check snapshots on.
+        timeout (int): Maximum wait time in seconds.
+
+    Raises:
+        TimeoutExpiredError: If snapshot does not appear within timeout.
+    """
+    vm = source_provider.get_vm_by_name(query=vm_name)
+    for snapshots in TimeoutSampler(
+        wait_timeout=timeout,
+        sleep=5,
+        func=lambda: [s for s in source_provider.list_snapshots(vm) if s.name == DI_SNAPSHOT_NAME],
+    ):
+        if snapshots:
+            LOGGER.info(f"DI snapshot '{DI_SNAPSHOT_NAME}' found on VM '{vm_name}'")
+            return
+
+
 def create_conversion_resource(
     client: "DynamicClient",
     fixture_store: dict[str, Any],
@@ -131,7 +243,7 @@ def create_conversion_resource(
         fixture_store=fixture_store,
         resource=Conversion,
         namespace=target_namespace,
-        type="DeepInspection",
+        type=CONVERSION_TYPE_DEEP_INSPECTION,
         connection={"secret": {"name": connection_secret.name, "namespace": connection_secret.namespace}},
         vm={"id": vm_id, "name": vm_name, "type": "VirtualMachine"},
         vddk_image=vddk_image,
