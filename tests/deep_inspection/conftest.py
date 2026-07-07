@@ -8,11 +8,9 @@ from ocp_resources.conversion import Conversion
 from ocp_resources.secret import Secret
 
 from utilities.deep_inspection import (
-    CONVERSION_TYPE_DEEP_INSPECTION,
     create_conversion_resource,
     create_di_connection_secret,
 )
-from utilities.resources import create_and_store_resource
 from utilities.utils import populate_vm_ids
 
 if TYPE_CHECKING:
@@ -162,13 +160,11 @@ def di_invalid_conversion_resource(
     Returns:
         Conversion: The created Conversion CR (will have Critical conditions).
     """
-    return create_and_store_resource(
+    return create_conversion_resource(
         client=ocp_admin_client,
         fixture_store=fixture_store,
-        resource=Conversion,
-        namespace=target_namespace,
-        type=CONVERSION_TYPE_DEEP_INSPECTION,
-        connection={"secret": {"name": di_connection_secret.name, "namespace": di_connection_secret.namespace}},
-        vm={"id": di_resolved_vm["id"], "name": di_resolved_vm["name"], "type": "VirtualMachine"},
+        connection_secret=di_connection_secret,
+        vm_id=di_resolved_vm["id"],
+        vm_name=di_resolved_vm["name"],
         target_namespace=target_namespace,
     )

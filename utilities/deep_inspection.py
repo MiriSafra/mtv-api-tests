@@ -146,7 +146,6 @@ def wait_for_conversion_phase(conversion: Conversion, phase: str, timeout: int) 
             than the target, or if the timeout expires.
     """
     last_phase = ""
-    is_target_terminal = phase in CONVERSION_TERMINAL_PHASES
 
     try:
         for sample in TimeoutSampler(
@@ -163,7 +162,7 @@ def wait_for_conversion_phase(conversion: Conversion, phase: str, timeout: int) 
                 LOGGER.info(f"Conversion '{conversion.name}' reached phase '{phase}'")
                 return
 
-            if not is_target_terminal and current_phase in CONVERSION_TERMINAL_PHASES:
+            if current_phase in CONVERSION_TERMINAL_PHASES:
                 raise ConversionError(
                     conversion_name=conversion.name,
                     phase=current_phase,
@@ -198,6 +197,8 @@ def wait_for_di_snapshot(
         TimeoutExpiredError: If snapshot does not appear within timeout.
     """
     vm = source_provider.get_vm_by_name(query=vm_name)
+    if not vm:
+        raise ValueError(f"VM '{vm_name}' not found in source provider")
     for snapshots in TimeoutSampler(
         wait_timeout=timeout,
         sleep=5,
@@ -214,8 +215,8 @@ def create_conversion_resource(
     connection_secret: Secret,
     vm_id: str,
     vm_name: str,
-    vddk_image: str,
     target_namespace: str,
+    vddk_image: str | None = None,
     snapshot_moref: str | None = None,
 ) -> Conversion:
     """Create a standalone DeepInspection Conversion CR.
@@ -226,8 +227,9 @@ def create_conversion_resource(
         connection_secret (Secret): Connection secret for vSphere access.
         vm_id (str): Source VM ID from inventory.
         vm_name (str): Source VM name.
-        vddk_image (str): VDDK init container image (required for DeepInspection).
         target_namespace (str): Namespace for the Conversion CR and pods.
+        vddk_image (str | None): VDDK init container image. Required for
+            DeepInspection — omit to test validation error (VDDKImageNotSet).
         snapshot_moref (str | None): vSphere snapshot MOREF. If provided, snapshot
             creation stages are skipped.
 
@@ -238,18 +240,22 @@ def create_conversion_resource(
     if snapshot_moref:
         settings["SNAPSHOT_MOREF"] = snapshot_moref
 
-    return create_and_store_resource(
-        client=client,
-        fixture_store=fixture_store,
-        resource=Conversion,
-        namespace=target_namespace,
-        type=CONVERSION_TYPE_DEEP_INSPECTION,
-        connection={"secret": {"name": connection_secret.name, "namespace": connection_secret.namespace}},
-        vm={"id": vm_id, "name": vm_name, "type": "VirtualMachine"},
-        vddk_image=vddk_image,
-        target_namespace=target_namespace,
-        settings=settings or None,
-    )
+    kwargs: dict[str, Any] = {
+        "client": client,
+        "fixture_store": fixture_store,
+        "resource": Conversion,
+        "namespace": target_namespace,
+        "type": CONVERSION_TYPE_DEEP_INSPECTION,
+        "connection": {"secret": {"name": connection_secret.name, "namespace": connection_secret.namespace}},
+        "vm": {"id": vm_id, "name": vm_name, "type": "VirtualMachine"},
+        "target_namespace": target_namespace,
+    }
+    if vddk_image:
+        kwargs["vddk_image"] = vddk_image
+    if settings:
+        kwargs["settings"] = settings
+
+    return create_and_store_resource(**kwargs)
 
 
 def wait_for_conversion_complete(conversion: Conversion, timeout: int) -> None:
