@@ -1213,7 +1213,7 @@ requires-dist = [
     { name = "humanfriendly", specifier = ">=10.0" },
     { name = "jc", specifier = ">=1.25.0" },
     { name = "openshift-python-utilities", specifier = ">=6.0.7" },
-    { name = "openshift-python-wrapper", specifier = ">=11.0.134" },
+    { name = "openshift-python-wrapper", specifier = ">=11.0.136" },
     { name = "openstacksdk", specifier = ">=4.0.0" },
     { name = "ovirt-python-sdk", specifier = ">=1.2.0" },
     { name = "packaging", specifier = ">=24.0" },
