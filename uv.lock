@@ -1335,7 +1335,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/11/8c/5a03b7c28670dd355
 
 [[package]]
 name = "openshift-python-wrapper"
-version = "11.0.134"
+version = "11.0.136"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cloup" },
@@ -1355,7 +1355,7 @@ dependencies = [
     { name = "timeout-sampler" },
     { name = "xmltodict" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/45/da/4aa074979de5bad530caf42b250c9853d2aaa3f40e55a291bcd9f535771a/openshift_python_wrapper-11.0.134.tar.gz", hash = "sha256:bc95a458e7e66199cc123081752c3a493ce319f4af562f1c7b93c72adb0fca18", size = 7757872, upload-time = "2026-06-24T14:05:07.362Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/20/44/420c3fef800a3267ac0ef0c9a0660e796c8b274fbe231bf84ff7946909e8/openshift_python_wrapper-11.0.136.tar.gz", hash = "sha256:aff73bec511064871eb597707b6aa1cf1d35a819be404f29d92373620ab9d12e", size = 8151691, upload-time = "2026-07-08T10:40:53.604Z" }
 
 [[package]]
 name = "openshift-python-wrapper-data-collector"
@@ -1569,7 +1569,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ptyprocess" },
+    { name = "ptyprocess", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [
@@ -2337,8 +2337,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography" },
-    { name = "jeepney" },
+    { name = "cryptography", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "jeepney", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [

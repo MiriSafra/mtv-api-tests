@@ -146,6 +146,7 @@ def create_plan_resource(
     target_power_state: str | None = None,
     enable_nested_virtualization: bool | None = None,
     xfs_compatibility: bool = False,
+    run_preflight_inspection: bool | None = None,
 ) -> Plan:
     """Create MTV Plan CR resource.
 
@@ -182,6 +183,8 @@ def create_plan_resource(
         enable_nested_virtualization (bool | None): Whether to enable nested virtualization on migrated VMs.
             When False, CPU features vmx/svm are disabled. Defaults to None (not set on Plan CR).
         xfs_compatibility (bool): Whether to use XFS-compatible virt-v2v image for VMs with XFS v4 filesystems. Defaults to False.
+        run_preflight_inspection (bool | None): Whether to run preflight Deep Inspection on warm migrations.
+            Defaults to None (forklift default: True).
 
     Returns:
         Plan: The created Plan CR resource.
@@ -258,6 +261,9 @@ def create_plan_resource(
 
     if xfs_compatibility:
         plan_kwargs["xfs_compatibility"] = xfs_compatibility
+
+    if run_preflight_inspection is not None:
+        plan_kwargs["run_preflight_inspection"] = run_preflight_inspection
 
     plan = create_and_store_resource(**plan_kwargs)
 

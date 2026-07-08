@@ -110,6 +110,7 @@ class TestClusterroleWarmMtvMigration:
             virtual_machines_list=prepared_plan["virtual_machines"],
             target_namespace=target_namespace,
             warm_migration=prepared_plan.get("warm_migration", False),
+            run_preflight_inspection=prepared_plan.get("run_preflight_inspection"),
         )
         assert self.plan_resource, "Plan creation failed"
 
@@ -225,6 +226,7 @@ class TestClusterroleWarmWithSccMigration:
             virtual_machines_list=prepared_plan["virtual_machines"],
             target_namespace=target_namespace,
             warm_migration=prepared_plan.get("warm_migration", False),
+            run_preflight_inspection=prepared_plan.get("run_preflight_inspection"),
         )
         assert self.plan_resource, "Plan creation failed"
 

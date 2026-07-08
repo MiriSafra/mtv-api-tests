@@ -44,6 +44,7 @@ tests_params: dict = {
             },
         ],
         "warm_migration": True,
+        "run_preflight_inspection": False,
     },
     "test_sanity_cold_mtv_migration": {
         "virtual_machines": [
@@ -502,6 +503,7 @@ tests_params: dict = {
             },
         ],
         "warm_migration": True,
+        "run_preflight_inspection": False,
     },
     "test_mtv_clusterrole_warm_migration_with_scc": {
         "virtual_machines": [
@@ -512,6 +514,7 @@ tests_params: dict = {
             },
         ],
         "warm_migration": True,
+        "run_preflight_inspection": False,
     },
     "test_copyoffload_scale_migration": {
         "virtual_machines": [
