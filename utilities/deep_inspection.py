@@ -197,7 +197,7 @@ def wait_for_di_snapshot(
         TimeoutExpiredError: If snapshot does not appear within timeout.
     """
     vm = source_provider.get_vm_by_name(query=vm_name)
-    if not vm:
+    if vm is None:
         raise ValueError(f"VM '{vm_name}' not found in source provider")
     for snapshots in TimeoutSampler(
         wait_timeout=timeout,
@@ -250,7 +250,7 @@ def create_conversion_resource(
         "vm": {"id": vm_id, "name": vm_name, "type": "VirtualMachine"},
         "target_namespace": target_namespace,
     }
-    if vddk_image:
+    if vddk_image is not None:
         kwargs["vddk_image"] = vddk_image
     if settings:
         kwargs["settings"] = settings
