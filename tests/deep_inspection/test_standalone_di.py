@@ -136,7 +136,7 @@ class TestStandaloneDICancel:
             ):
                 if not pods:
                     return
-        except TimeoutExpiredError:
+        except TimeoutExpiredError as err:
             remaining = list(
                 Pod.get(
                     client=self.conversion.client,
@@ -146,7 +146,7 @@ class TestStandaloneDICancel:
             )
             raise AssertionError(
                 f"Conversion pods still present {DI_POD_CLEANUP_TIMEOUT}s after cancel: {[p.name for p in remaining]}"
-            )
+            ) from err
 
     def test_verify_snapshot_cleanup(self, di_vm_name: str, source_provider: "VMWareProvider") -> None:
         """Verify forklift DI snapshot is removed from the source VM after cancel."""
@@ -160,12 +160,12 @@ class TestStandaloneDICancel:
             ):
                 if not snapshots:
                     return
-        except TimeoutExpiredError:
+        except TimeoutExpiredError as err:
             remaining = [s.name for s in source_provider.list_snapshots(vm)]
             raise AssertionError(
                 f"DI snapshot '{DI_SNAPSHOT_NAME}' still present on VM '{di_vm_name}' "
                 f"{DI_SNAPSHOT_CLEANUP_TIMEOUT}s after cancel. All snapshots: {remaining}"
-            )
+            ) from err
 
     def test_rerun_di_after_cancel(
         self,
@@ -256,8 +256,10 @@ class TestStandaloneDIValidation:
                 if critical_conditions:
                     phase = sample.get("phase", "")
                     break
-        except TimeoutExpiredError:
-            raise AssertionError(f"Conversion '{self.conversion.name}' expected Critical conditions within {timeout}s")
+        except TimeoutExpiredError as err:
+            raise AssertionError(
+                f"Conversion '{self.conversion.name}' expected Critical conditions within {timeout}s"
+            ) from err
 
         condition_types = [c.get("type") for c in critical_conditions]
         assert VDDK_IMAGE_NOT_SET_CONDITION in condition_types, (

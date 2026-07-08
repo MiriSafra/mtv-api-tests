@@ -169,12 +169,12 @@ def wait_for_conversion_phase(conversion: Conversion, phase: str, timeout: int) 
                     message=f"Reached terminal phase '{current_phase}' before target phase '{phase}'",
                 )
 
-    except TimeoutExpiredError:
+    except TimeoutExpiredError as err:
         raise ConversionError(
             conversion_name=conversion.name,
             phase=last_phase or "Unknown",
             message=f"Did not reach phase '{phase}' within {timeout}s",
-        )
+        ) from err
 
 
 def wait_for_di_snapshot(
@@ -198,8 +198,6 @@ def wait_for_di_snapshot(
         TimeoutExpiredError: If snapshot does not appear within timeout.
     """
     vm = source_provider.get_vm_by_name(query=vm_name)
-    if vm is None:
-        raise ValueError(f"VM '{vm_name}' not found in source provider")
     try:
         for snapshots in TimeoutSampler(
             wait_timeout=timeout,
@@ -209,8 +207,10 @@ def wait_for_di_snapshot(
             if snapshots:
                 LOGGER.info(f"DI snapshot '{DI_SNAPSHOT_NAME}' found on VM '{vm_name}'")
                 return
-    except TimeoutExpiredError:
-        raise TimeoutExpiredError(f"DI snapshot '{DI_SNAPSHOT_NAME}' not found on VM '{vm_name}' within {timeout}s")
+    except TimeoutExpiredError as err:
+        raise TimeoutExpiredError(
+            f"DI snapshot '{DI_SNAPSHOT_NAME}' not found on VM '{vm_name}' within {timeout}s"
+        ) from err
 
 
 def create_conversion_resource(
@@ -307,12 +307,12 @@ def wait_for_conversion_complete(conversion: Conversion, timeout: int) -> None:
                     )
                 return
 
-    except TimeoutExpiredError:
+    except TimeoutExpiredError as err:
         raise ConversionError(
             conversion_name=conversion.name,
             phase=last_phase or "Unknown",
             message=f"Timed out after {timeout}s at stage '{last_stage}'",
-        )
+        ) from err
 
 
 def verify_di_results(conversion: Conversion, vm_name: str) -> None:
