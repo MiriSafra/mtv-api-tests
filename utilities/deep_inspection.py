@@ -189,24 +189,28 @@ def wait_for_di_snapshot(
     performing cancel operations.
 
     Args:
-        source_provider (BaseProvider): Source provider with list_snapshots method.
+        source_provider (VMWareProvider): Source provider with list_snapshots method.
         vm_name (str): Source VM name to check snapshots on.
         timeout (int): Maximum wait time in seconds.
 
     Raises:
+        ValueError: If the source VM is not found in the provider.
         TimeoutExpiredError: If snapshot does not appear within timeout.
     """
     vm = source_provider.get_vm_by_name(query=vm_name)
     if vm is None:
         raise ValueError(f"VM '{vm_name}' not found in source provider")
-    for snapshots in TimeoutSampler(
-        wait_timeout=timeout,
-        sleep=5,
-        func=lambda: [s for s in source_provider.list_snapshots(vm) if s.name == DI_SNAPSHOT_NAME],
-    ):
-        if snapshots:
-            LOGGER.info(f"DI snapshot '{DI_SNAPSHOT_NAME}' found on VM '{vm_name}'")
-            return
+    try:
+        for snapshots in TimeoutSampler(
+            wait_timeout=timeout,
+            sleep=5,
+            func=lambda: [s for s in source_provider.list_snapshots(vm) if s.name == DI_SNAPSHOT_NAME],
+        ):
+            if snapshots:
+                LOGGER.info(f"DI snapshot '{DI_SNAPSHOT_NAME}' found on VM '{vm_name}'")
+                return
+    except TimeoutExpiredError:
+        raise TimeoutExpiredError(f"DI snapshot '{DI_SNAPSHOT_NAME}' not found on VM '{vm_name}' within {timeout}s")
 
 
 def create_conversion_resource(
