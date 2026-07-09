@@ -251,11 +251,11 @@ class TestStandaloneDIValidation:
                 if not sample:
                     continue
                 conditions = sample.get("conditions", [])
+                phase = sample.get("phase", "")
                 critical_conditions = [
                     c for c in conditions if c.get("category") == "Critical" and c.get("status") == "True"
                 ]
                 if critical_conditions:
-                    phase = sample.get("phase", "")
                     break
         except TimeoutExpiredError as err:
             last_condition_types = [c.get("type") for c in conditions]
