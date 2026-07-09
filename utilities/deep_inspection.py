@@ -299,7 +299,7 @@ def wait_for_conversion_complete(conversion: Conversion, timeout: int) -> None:
             if phase in CONVERSION_TERMINAL_PHASES:
                 if phase != Conversion.Status.SUCCEEDED:
                     conditions = sample.get("conditions", [])
-                    messages = [c.get("message", "") for c in conditions if c.get("type") == "Critical"]
+                    messages = [c.get("message", "") for c in conditions if c.get("category") == "Critical"]
                     raise ConversionError(
                         conversion_name=conversion.name,
                         phase=phase,
