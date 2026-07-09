@@ -239,6 +239,7 @@ class TestStandaloneDIValidation:
         """
         timeout = py_config["plan_wait_timeout"]
         critical_conditions: list[Any] = []
+        conditions: list[Any] = []
         phase = ""
 
         try:
@@ -257,8 +258,10 @@ class TestStandaloneDIValidation:
                     phase = sample.get("phase", "")
                     break
         except TimeoutExpiredError as err:
+            last_condition_types = [c.get("type") for c in conditions]
             raise AssertionError(
-                f"Conversion '{self.conversion.name}' expected Critical conditions within {timeout}s"
+                f"Conversion '{self.conversion.name}' expected Critical conditions within {timeout}s. "
+                f"Last phase='{phase}', conditions={last_condition_types}"
             ) from err
 
         condition_types = [c.get("type") for c in critical_conditions]
