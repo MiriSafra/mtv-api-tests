@@ -4,6 +4,7 @@ import base64
 from typing import TYPE_CHECKING, Any
 
 from ocp_resources.conversion import Conversion
+from ocp_resources.pod import Pod
 from ocp_resources.resource import NotFoundError
 from ocp_resources.secret import Secret
 from simple_logger.logger import get_logger
@@ -297,7 +298,11 @@ def wait_for_conversion_complete(conversion: Conversion, timeout: int) -> None:
             if phase in CONVERSION_TERMINAL_PHASES:
                 if phase != Conversion.Status.SUCCEEDED:
                     conditions = sample.get("conditions", [])
-                    messages = [c.get("message", "") for c in conditions if c.get("category") == "Critical"]
+                    messages = [
+                        c.get("message", "")
+                        for c in conditions
+                        if c.get("category") == "Critical" and c.get("status") == "True"
+                    ]
                     raise ConversionError(
                         conversion_name=conversion.name,
                         phase=phase,
@@ -399,3 +404,82 @@ def wait_for_critical_conditions(
         ) from err
 
     return critical, phase
+
+
+def wait_for_conversion_pods_cleanup(
+    conversion: Conversion,
+    timeout: int = DI_POD_CLEANUP_TIMEOUT,
+) -> None:
+    """Wait for all pods associated with a Conversion CR to be cleaned up.
+
+    Polls for pods matching the conversion label selector until none remain.
+
+    Args:
+        conversion (Conversion): The Conversion CR whose pods to monitor.
+        timeout (int): Maximum wait time in seconds.
+
+    Raises:
+        AssertionError: If pods are still present after timeout.
+    """
+    try:
+        for pods in TimeoutSampler(
+            wait_timeout=timeout,
+            sleep=5,
+            func=lambda: list(
+                Pod.get(
+                    client=conversion.client,
+                    namespace=conversion.namespace,
+                    label_selector=f"conversion={conversion.name}",
+                )
+            ),
+        ):
+            if not pods:
+                LOGGER.info(f"All pods cleaned up for conversion '{conversion.name}'")
+                return
+    except TimeoutExpiredError as err:
+        remaining = list(
+            Pod.get(
+                client=conversion.client,
+                namespace=conversion.namespace,
+                label_selector=f"conversion={conversion.name}",
+            )
+        )
+        raise AssertionError(
+            f"Conversion pods still present {timeout}s after cancel: {[p.name for p in remaining]}"
+        ) from err
+
+
+def wait_for_di_snapshot_cleanup(
+    source_provider: "VMWareProvider",
+    vm_name: str,
+    timeout: int = DI_SNAPSHOT_CLEANUP_TIMEOUT,
+) -> None:
+    """Wait for the DI snapshot to be removed from the source VM.
+
+    Polls the source provider until the forklift-deep-inspection snapshot
+    no longer exists on the VM.
+
+    Args:
+        source_provider (VMWareProvider): Source provider with list_snapshots method.
+        vm_name (str): Source VM name to check snapshots on.
+        timeout (int): Maximum wait time in seconds.
+
+    Raises:
+        AssertionError: If DI snapshot is still present after timeout.
+    """
+    vm = source_provider.get_vm_by_name(query=vm_name)
+    try:
+        for snapshots in TimeoutSampler(
+            wait_timeout=timeout,
+            sleep=10,
+            func=lambda: [s for s in source_provider.list_snapshots(vm) if s.name == DI_SNAPSHOT_NAME],
+        ):
+            if not snapshots:
+                LOGGER.info(f"DI snapshot '{DI_SNAPSHOT_NAME}' cleaned up from VM '{vm_name}'")
+                return
+    except TimeoutExpiredError as err:
+        remaining = [s.name for s in source_provider.list_snapshots(vm)]
+        raise AssertionError(
+            f"DI snapshot '{DI_SNAPSHOT_NAME}' still present on VM '{vm_name}' "
+            f"{timeout}s after cancel. All snapshots: {remaining}"
+        ) from err

@@ -6,6 +6,7 @@ import pytest
 from ocp_resources.conversion import Conversion
 from ocp_resources.secret import Secret
 
+from libs.providers.vmware import VMWareProvider
 from utilities.deep_inspection import (
     create_conversion_resource,
     create_di_connection_secret,
@@ -48,6 +49,27 @@ def di_connection_secret(
 
 
 @pytest.fixture(scope="class")
+def vmware_source_provider(source_provider: "BaseProvider") -> VMWareProvider:
+    """Source provider validated as VMWare type.
+
+    Snapshot operations (create, list, cleanup) require vSphere-specific
+    APIs only available on VMWareProvider.
+
+    Args:
+        source_provider (BaseProvider): Source provider instance.
+
+    Returns:
+        VMWareProvider: The source provider, type-validated.
+
+    Raises:
+        TypeError: If source provider is not a VMWareProvider.
+    """
+    if not isinstance(source_provider, VMWareProvider):
+        raise TypeError(f"Snapshot operations require VMWareProvider, got {type(source_provider).__name__}")
+    return source_provider
+
+
+@pytest.fixture(scope="class")
 def di_resolved_vm(
     class_plan_config: dict[str, Any],
     source_provider_inventory: "ForkliftInventory",
@@ -59,7 +81,7 @@ def di_resolved_vm(
         source_provider_inventory (ForkliftInventory): Source provider inventory.
 
     Returns:
-        dict[str, Any]: VM dict with 'name' and 'id' keys.
+        dict[str, Any]: VM config dict with populated 'name' and 'id' keys.
     """
     populate_vm_ids(class_plan_config, source_provider_inventory)
     return class_plan_config["virtual_machines"][0]
@@ -106,14 +128,13 @@ def di_conversion_resource(
     ocp_admin_client: "DynamicClient",
     target_namespace: str,
 ) -> Conversion:
-    """Standalone DeepInspection Conversion CR for the first VM in the plan.
+    """Standalone DeepInspection Conversion CR for the first VM.
 
-    Uses class_plan_config directly (not prepared_plan) because Deep Inspection
-    only creates a snapshot, inspects, and removes the snapshot — no VM cloning
-    is needed.
+    Bypasses prepared_plan because Deep Inspection only creates a snapshot,
+    inspects, and removes it — no VM cloning is needed.
 
     Args:
-        di_resolved_vm (dict[str, Any]): Resolved VM dict with 'name' and 'id'.
+        di_resolved_vm (dict[str, Any]): VM config dict with 'name' and 'id'.
         di_connection_secret (Secret): Connection secret for vSphere access.
         di_vddk_image (str): VDDK init container image.
         fixture_store (dict[str, Any]): Resource tracking dictionary.
