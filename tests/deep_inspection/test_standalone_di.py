@@ -10,6 +10,7 @@ from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from exceptions.exceptions import ConversionError
+from libs.providers.vmware import VMWareProvider
 from utilities.deep_inspection import (
     DI_POD_CLEANUP_TIMEOUT,
     DI_SNAPSHOT_CLEANUP_TIMEOUT,
@@ -20,12 +21,13 @@ from utilities.deep_inspection import (
     verify_di_results,
     wait_for_conversion_complete,
     wait_for_conversion_phase,
+    wait_for_critical_conditions,
     wait_for_di_snapshot,
 )
 
 if TYPE_CHECKING:
     from kubernetes.dynamic import DynamicClient
-    from libs.providers.vmware import VMWareProvider
+    from libs.base_provider import BaseProvider
 
 
 @pytest.mark.parametrize(
@@ -97,19 +99,23 @@ class TestStandaloneDICancel:
     conversion: Conversion
     rerun_conversion: Conversion
 
-    def test_create_and_cancel_conversion(
-        self,
-        di_conversion_resource: Conversion,
-        di_vm_name: str,
-        source_provider: "VMWareProvider",
-    ) -> None:
-        """Create DI Conversion, wait for Running and snapshot, then cancel."""
+    def test_create_conversion(self, di_conversion_resource: Conversion) -> None:
+        """Create a standalone DeepInspection Conversion CR for cancel testing."""
         self.__class__.conversion = di_conversion_resource
+        assert self.conversion
+
+    @pytest.mark.usefixtures("di_vm_name")
+    def test_wait_for_running(self) -> None:
+        """Wait for the Conversion CR to reach Running phase."""
         wait_for_conversion_phase(
             conversion=self.conversion,
             phase=Conversion.Status.RUNNING,
             timeout=py_config["plan_wait_timeout"],
         )
+
+    def test_cancel_conversion(self, di_vm_name: str, source_provider: "BaseProvider") -> None:
+        """Wait for DI snapshot on source VM, then cancel the conversion."""
+        assert isinstance(source_provider, VMWareProvider), "Snapshot verification requires vSphere provider"
         wait_for_di_snapshot(source_provider=source_provider, vm_name=di_vm_name)
         cancel_conversion(conversion=self.conversion)
 
@@ -148,8 +154,9 @@ class TestStandaloneDICancel:
                 f"Conversion pods still present {DI_POD_CLEANUP_TIMEOUT}s after cancel: {[p.name for p in remaining]}"
             ) from err
 
-    def test_verify_snapshot_cleanup(self, di_vm_name: str, source_provider: "VMWareProvider") -> None:
+    def test_verify_snapshot_cleanup(self, di_vm_name: str, source_provider: "BaseProvider") -> None:
         """Verify forklift DI snapshot is removed from the source VM after cancel."""
+        assert isinstance(source_provider, VMWareProvider), "Snapshot verification requires vSphere provider"
         vm = source_provider.get_vm_by_name(query=di_vm_name)
         assert vm, f"VM '{di_vm_name}' not found in source provider"
         try:
@@ -169,7 +176,7 @@ class TestStandaloneDICancel:
 
     def test_rerun_di_after_cancel(
         self,
-        di_resolved_vm: dict[str, str],
+        di_resolved_vm: dict[str, Any],
         di_connection_secret: Secret,
         di_vddk_image: str,
         fixture_store: dict[str, Any],
@@ -232,37 +239,11 @@ class TestStandaloneDIValidation:
 
     @pytest.mark.usefixtures("di_vm_name")
     def test_verify_validation_error(self) -> None:
-        """Verify controller sets Critical condition for missing vddkImage.
-
-        Polls status until conditions appear (controller may not have
-        reconciled immediately after CR creation).
-        """
-        timeout = py_config["plan_wait_timeout"]
-        critical_conditions: list[Any] = []
-        conditions: list[Any] = []
-        phase = ""
-
-        try:
-            for sample in TimeoutSampler(
-                wait_timeout=timeout,
-                sleep=3,
-                func=lambda: self.conversion.instance.status,
-            ):
-                if not sample:
-                    continue
-                conditions = sample.get("conditions", [])
-                phase = sample.get("phase", "")
-                critical_conditions = [
-                    c for c in conditions if c.get("category") == "Critical" and c.get("status") == "True"
-                ]
-                if critical_conditions:
-                    break
-        except TimeoutExpiredError as err:
-            last_condition_types = [c.get("type") for c in conditions]
-            raise AssertionError(
-                f"Conversion '{self.conversion.name}' expected Critical conditions within {timeout}s. "
-                f"Last phase='{phase}', conditions={last_condition_types}"
-            ) from err
+        """Verify controller sets Critical condition for missing vddkImage."""
+        critical_conditions, phase = wait_for_critical_conditions(
+            conversion=self.conversion,
+            timeout=py_config["plan_wait_timeout"],
+        )
 
         condition_types = [c.get("type") for c in critical_conditions]
         assert VDDK_IMAGE_NOT_SET_CONDITION in condition_types, (

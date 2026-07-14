@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -52,7 +51,7 @@ def di_connection_secret(
 def di_resolved_vm(
     class_plan_config: dict[str, Any],
     source_provider_inventory: "ForkliftInventory",
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """First VM from the plan config with populated inventory ID.
 
     Args:
@@ -60,24 +59,23 @@ def di_resolved_vm(
         source_provider_inventory (ForkliftInventory): Source provider inventory.
 
     Returns:
-        dict[str, str]: VM dict with 'name' and 'id' keys.
+        dict[str, Any]: VM dict with 'name' and 'id' keys.
     """
-    plan_config = deepcopy(class_plan_config)
-    populate_vm_ids(plan_config, source_provider_inventory)
-    return plan_config["virtual_machines"][0]
+    populate_vm_ids(class_plan_config, source_provider_inventory)
+    return class_plan_config["virtual_machines"][0]
 
 
 @pytest.fixture(scope="class")
-def di_vm_name(di_resolved_vm: dict[str, str]) -> str:
-    """First VM name from the resolved plan config.
+def di_vm_name(class_plan_config: dict[str, Any]) -> str:
+    """First VM name from the plan config.
 
     Args:
-        di_resolved_vm (dict[str, str]): Resolved VM dict with 'name' and 'id'.
+        class_plan_config (dict[str, Any]): Raw plan config from parametrization.
 
     Returns:
         str: The VM name.
     """
-    return di_resolved_vm["name"]
+    return class_plan_config["virtual_machines"][0]["name"]
 
 
 @pytest.fixture(scope="class")
@@ -101,7 +99,7 @@ def di_vddk_image(source_provider_data: dict[str, Any]) -> str:
 
 @pytest.fixture(scope="class")
 def di_conversion_resource(
-    di_resolved_vm: dict[str, str],
+    di_resolved_vm: dict[str, Any],
     di_connection_secret: Secret,
     di_vddk_image: str,
     fixture_store: dict[str, Any],
@@ -115,7 +113,7 @@ def di_conversion_resource(
     is needed.
 
     Args:
-        di_resolved_vm (dict[str, str]): Resolved VM dict with 'name' and 'id'.
+        di_resolved_vm (dict[str, Any]): Resolved VM dict with 'name' and 'id'.
         di_connection_secret (Secret): Connection secret for vSphere access.
         di_vddk_image (str): VDDK init container image.
         fixture_store (dict[str, Any]): Resource tracking dictionary.
@@ -138,7 +136,7 @@ def di_conversion_resource(
 
 @pytest.fixture(scope="class")
 def di_invalid_conversion_resource(
-    di_resolved_vm: dict[str, str],
+    di_resolved_vm: dict[str, Any],
     di_connection_secret: Secret,
     fixture_store: dict[str, Any],
     ocp_admin_client: "DynamicClient",
@@ -151,7 +149,7 @@ def di_invalid_conversion_resource(
     and blocks pipeline execution.
 
     Args:
-        di_resolved_vm (dict[str, str]): Resolved VM dict with 'name' and 'id'.
+        di_resolved_vm (dict[str, Any]): Resolved VM dict with 'name' and 'id'.
         di_connection_secret (Secret): Connection secret for vSphere access.
         fixture_store (dict[str, Any]): Resource tracking dictionary.
         ocp_admin_client (DynamicClient): OpenShift admin client.

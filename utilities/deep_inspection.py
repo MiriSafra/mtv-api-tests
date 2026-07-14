@@ -20,7 +20,6 @@ if TYPE_CHECKING:
 LOGGER = get_logger(name=__name__)
 
 CONVERSION_TERMINAL_PHASES = {Conversion.Status.SUCCEEDED, Conversion.Status.FAILED, Conversion.Condition.CANCELED}
-CONVERSION_CANCELED_PHASE = Conversion.Condition.CANCELED
 # Not exposed by openshift-python-wrapper — mirrors forklift constants:
 CONVERSION_TYPE_DEEP_INSPECTION = "DeepInspection"  # forklift: DeepInspection (conversion.go:20)
 CONVERSION_STAGE_FINISHED = "Finished"  # forklift: StageFinished (conversion.go:55)
@@ -29,7 +28,6 @@ DI_SNAPSHOT_NAME = "forklift-deep-inspection"  # forklift: snapshotName (client.
 DI_SNAPSHOT_CREATION_TIMEOUT = 120
 DI_POD_CLEANUP_TIMEOUT = 60
 DI_SNAPSHOT_CLEANUP_TIMEOUT = 180
-DI_SNAPSHOT_REMOVAL_TIMEOUT = 120
 
 
 def create_di_connection_secret(
@@ -120,7 +118,7 @@ def cancel_conversion(conversion: Conversion) -> None:
     """
     api_resource = conversion.client.resources.get(api_version=conversion.api_version, kind=conversion.kind)
     api_resource.status.patch(
-        body={"status": {"phase": CONVERSION_CANCELED_PHASE, "stage": CONVERSION_STAGE_FINISHED}},
+        body={"status": {"phase": Conversion.Condition.CANCELED, "stage": CONVERSION_STAGE_FINISHED}},
         name=conversion.name,
         namespace=conversion.namespace,
         content_type="application/merge-patch+json",
@@ -352,3 +350,52 @@ def verify_di_results(conversion: Conversion, vm_name: str) -> None:
         f"os={os_info.get('name')} {os_info.get('version', '')}, "
         f"filesystems={len(filesystems)}"
     )
+
+
+def wait_for_critical_conditions(
+    conversion: Conversion,
+    timeout: int,
+) -> tuple[list[Any], str]:
+    """Wait for Critical conditions to appear on a Conversion CR.
+
+    Polls the Conversion CR status until at least one condition with
+    category=Critical and status=True appears. Returns the critical
+    conditions and the phase at the time they were found.
+
+    Args:
+        conversion (Conversion): The Conversion CR to monitor.
+        timeout (int): Maximum wait time in seconds.
+
+    Returns:
+        tuple[list[Any], str]: (critical_conditions, phase) at the time
+            critical conditions were detected.
+
+    Raises:
+        AssertionError: If no Critical conditions appear within timeout.
+    """
+    conditions: list[Any] = []
+    phase = ""
+    critical: list[Any] = []
+
+    try:
+        for sample in TimeoutSampler(
+            wait_timeout=timeout,
+            sleep=3,
+            func=lambda: conversion.instance.status,
+        ):
+            if not sample:
+                continue
+            conditions = sample.get("conditions", [])
+            phase = sample.get("phase", "")
+            critical = [c for c in conditions if c.get("category") == "Critical" and c.get("status") == "True"]
+            if critical:
+                LOGGER.info(f"Conversion '{conversion.name}' has {len(critical)} Critical condition(s)")
+                break
+    except TimeoutExpiredError as err:
+        last_condition_types = [c.get("type") for c in conditions]
+        raise AssertionError(
+            f"Conversion '{conversion.name}' expected Critical conditions within {timeout}s. "
+            f"Last phase='{phase}', conditions={last_condition_types}"
+        ) from err
+
+    return critical, phase
