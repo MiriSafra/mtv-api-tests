@@ -406,6 +406,50 @@ def wait_for_critical_conditions(
     return critical, phase
 
 
+DI_POD_CREATION_TIMEOUT = 120
+
+
+def wait_for_conversion_pods(
+    conversion: Conversion,
+    timeout: int = DI_POD_CREATION_TIMEOUT,
+) -> list["Pod"]:
+    """Wait for at least one pod associated with a Conversion CR to appear.
+
+    Polls for pods matching the conversion label selector until at least
+    one exists. The forklift controller creates the snapshot before the
+    pod, so the pod may not exist yet when the snapshot is found.
+
+    Args:
+        conversion (Conversion): The Conversion CR whose pods to wait for.
+        timeout (int): Maximum wait time in seconds.
+
+    Returns:
+        list[Pod]: The conversion pods found.
+
+    Raises:
+        AssertionError: If no pods appear within timeout.
+    """
+    try:
+        for pods in TimeoutSampler(
+            wait_timeout=timeout,
+            sleep=3,
+            func=lambda: list(
+                Pod.get(
+                    client=conversion.client,
+                    namespace=conversion.namespace,
+                    label_selector=f"conversion={conversion.name}",
+                )
+            ),
+        ):
+            if pods:
+                LOGGER.info(f"Found {len(pods)} pod(s) for conversion '{conversion.name}'")
+                return pods
+    except TimeoutExpiredError as err:
+        raise AssertionError(f"No conversion pods found for '{conversion.name}' within {timeout}s") from err
+
+    return []
+
+
 def wait_for_conversion_pods_cleanup(
     conversion: Conversion,
     timeout: int = DI_POD_CLEANUP_TIMEOUT,

@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 from ocp_resources.conversion import Conversion
-from ocp_resources.pod import Pod
 from ocp_resources.secret import Secret
 from pytest_testconfig import config as py_config
 
@@ -16,6 +15,7 @@ from utilities.deep_inspection import (
     verify_di_results,
     wait_for_conversion_complete,
     wait_for_conversion_phase,
+    wait_for_conversion_pods,
     wait_for_conversion_pods_cleanup,
     wait_for_critical_conditions,
     wait_for_di_snapshot,
@@ -111,16 +111,9 @@ class TestStandaloneDICancel:
         )
 
     def test_cancel_conversion(self, di_vm_name: str, vmware_source_provider: "VMWareProvider") -> None:
-        """Wait for DI snapshot on source VM, then cancel the conversion."""
+        """Wait for DI pod to be running on the cluster, then cancel the conversion."""
         wait_for_di_snapshot(source_provider=vmware_source_provider, vm_name=di_vm_name)
-        pods = list(
-            Pod.get(
-                client=self.conversion.client,
-                namespace=self.conversion.namespace,
-                label_selector=f"conversion={self.conversion.name}",
-            )
-        )
-        assert pods, f"No conversion pods found before cancel for '{self.conversion.name}'"
+        wait_for_conversion_pods(conversion=self.conversion)
         cancel_conversion(conversion=self.conversion)
 
     @pytest.mark.usefixtures("class_plan_config")
