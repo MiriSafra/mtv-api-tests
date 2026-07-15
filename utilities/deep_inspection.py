@@ -27,6 +27,7 @@ CONVERSION_STAGE_FINISHED = "Finished"  # forklift: StageFinished (conversion.go
 VDDK_IMAGE_NOT_SET_CONDITION = "VDDKImageNotSet"  # forklift: validation.go:14
 DI_SNAPSHOT_NAME = "forklift-deep-inspection"  # forklift: snapshotName (client.go:21)
 DI_SNAPSHOT_CREATION_TIMEOUT = 120
+DI_POD_CREATION_TIMEOUT = 120
 DI_POD_CLEANUP_TIMEOUT = 60
 DI_SNAPSHOT_CLEANUP_TIMEOUT = 180
 
@@ -406,9 +407,6 @@ def wait_for_critical_conditions(
     return critical, phase
 
 
-DI_POD_CREATION_TIMEOUT = 120
-
-
 def wait_for_conversion_pods(
     conversion: Conversion,
     timeout: int = DI_POD_CREATION_TIMEOUT,
@@ -419,6 +417,10 @@ def wait_for_conversion_pods(
     one exists. The forklift controller creates the snapshot before the
     pod, so the pod may not exist yet when the snapshot is found.
 
+    Also checks for terminal phases on each iteration — if the conversion
+    fails or is canceled before creating a pod, raises immediately instead
+    of waiting until timeout.
+
     Args:
         conversion (Conversion): The Conversion CR whose pods to wait for.
         timeout (int): Maximum wait time in seconds.
@@ -427,19 +429,32 @@ def wait_for_conversion_pods(
         list[Pod]: The conversion pods found.
 
     Raises:
+        ConversionError: If the conversion reaches a terminal phase before pods appear.
         AssertionError: If no pods appear within timeout.
     """
+
+    def _poll() -> list["Pod"]:
+        status = conversion.instance.status or {}
+        phase = status.get("phase", "")
+        if phase in CONVERSION_TERMINAL_PHASES:
+            raise ConversionError(
+                conversion_name=conversion.name,
+                phase=phase,
+                message=f"Reached terminal phase '{phase}' before pods were created",
+            )
+        return list(
+            Pod.get(
+                client=conversion.client,
+                namespace=conversion.namespace,
+                label_selector=f"conversion={conversion.name}",
+            )
+        )
+
     try:
         for pods in TimeoutSampler(
             wait_timeout=timeout,
             sleep=3,
-            func=lambda: list(
-                Pod.get(
-                    client=conversion.client,
-                    namespace=conversion.namespace,
-                    label_selector=f"conversion={conversion.name}",
-                )
-            ),
+            func=_poll,
         ):
             if pods:
                 LOGGER.info(f"Found {len(pods)} pod(s) for conversion '{conversion.name}'")
