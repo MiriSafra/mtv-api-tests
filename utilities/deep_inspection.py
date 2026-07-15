@@ -429,12 +429,20 @@ def wait_for_conversion_pods(
         list[Pod]: The conversion pods found.
 
     Raises:
-        ConversionError: If the conversion reaches a terminal phase before pods appear.
+        ConversionError: If the conversion reaches a terminal phase before pods appear,
+            or if the Conversion CR is deleted during polling.
         AssertionError: If no pods appear within timeout.
     """
 
     def _poll() -> list["Pod"]:
-        status = conversion.instance.status or {}
+        try:
+            status = conversion.instance.status or {}
+        except NotFoundError as err:
+            raise ConversionError(
+                conversion_name=conversion.name,
+                phase="Unknown",
+                message="Conversion not found while waiting for pods",
+            ) from err
         phase = status.get("phase", "")
         if phase in CONVERSION_TERMINAL_PHASES:
             raise ConversionError(
