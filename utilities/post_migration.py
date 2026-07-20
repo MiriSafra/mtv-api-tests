@@ -12,6 +12,7 @@ import jc
 import pytest
 from ocp_resources.datavolume import DataVolume
 from ocp_resources.network_map import NetworkMap
+from ocp_resources.plan import Plan
 from ocp_resources.provider import Provider
 from ocp_resources.secret import Secret
 from ocp_resources.storage_map import StorageMap
@@ -24,6 +25,7 @@ from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 from libs.base_provider import BaseProvider
 from libs.forklift_inventory import ForkliftInventory
 from libs.providers.rhv import OvirtProvider
+from utilities.deep_inspection import verify_captured_di_results, verify_no_conversion_crs
 from utilities.naming import resolve_destination_vm_name
 from utilities.ssh_utils import SSHConnectionManager, VMSSHConnection, run_cmd_in_vm
 from utilities.utils import get_cluster_version, get_value_from_py_config, rhv_provider
@@ -1619,6 +1621,8 @@ def check_vms(
     vm_ssh_connections: SSHConnectionManager | None = None,
     labeled_worker_node: dict[str, Any] | None = None,
     target_vm_labels: dict[str, Any] | None = None,
+    plan_resource: Plan | None = None,
+    di_results: list[dict[str, Any]] | None = None,
 ) -> None:
     res: dict[str, list[str]] = {}
 
@@ -1867,3 +1871,9 @@ def check_vms(
     if failed_checks:
         failure_details = "; ".join(f"{vm_name}: [{', '.join(errors)}]" for vm_name, errors in failed_checks.items())
         pytest.fail(f"VM validation failed — {failure_details}")
+
+    if plan_resource and plan.get("warm_migration") and source_provider.type == Provider.ProviderType.VSPHERE:
+        if plan.get("run_preflight_inspection") is False:
+            verify_no_conversion_crs(plan_resource=plan_resource)
+        elif di_results is not None:
+            verify_captured_di_results(di_results=di_results, plan_name=plan_resource.name)

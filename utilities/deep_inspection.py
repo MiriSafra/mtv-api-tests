@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from kubernetes.dynamic.exceptions import ApiException
 from ocp_resources.conversion import Conversion
+from ocp_resources.plan import Plan
 from ocp_resources.pod import Pod
 from ocp_resources.resource import NotFoundError
 from ocp_resources.secret import Secret
@@ -319,11 +322,36 @@ def wait_for_conversion_complete(conversion: Conversion, timeout: int) -> None:
         ) from err
 
 
+def _validate_inspection_result(results: dict[str, Any] | None, vm_name: str, context: str) -> None:
+    """Validate inspectionResult data from a DI Conversion CR.
+
+    Args:
+        results (dict[str, Any] | None): The inspectionResult dict.
+        vm_name (str): VM name for error context.
+        context (str): Additional context (e.g., conversion name or plan name).
+
+    Raises:
+        AssertionError: If results are missing or incomplete.
+    """
+    assert results, f"{context}, VM '{vm_name}': inspectionResult is empty"
+
+    os_info = results.get("osInfo")
+    assert os_info and os_info.get("name"), f"{context}, VM '{vm_name}': missing osInfo or osInfo.name"
+
+    filesystems = results.get("filesystems")
+    assert filesystems, f"{context}, VM '{vm_name}': missing filesystems"
+
+    passed = results.get("allChecksPassed")
+    assert isinstance(passed, bool), f"{context}, VM '{vm_name}': allChecksPassed is not a boolean: {passed}"
+
+    LOGGER.info(
+        f"DI verified for VM '{vm_name}': allChecksPassed={passed}, "
+        f"os={os_info.get('name')} {os_info.get('version', '')}, filesystems={len(filesystems)}"
+    )
+
+
 def verify_di_results(conversion: Conversion, vm_name: str) -> None:
     """Verify Deep Inspection results on a completed Conversion CR.
-
-    Checks that the inspection produced valid results including OS info
-    and filesystem data. Uses the source VM name for error context.
 
     Args:
         conversion (Conversion): A Succeeded Conversion CR.
@@ -334,28 +362,143 @@ def verify_di_results(conversion: Conversion, vm_name: str) -> None:
     """
     status = conversion.instance.status
     assert status, f"VM '{vm_name}': Conversion '{conversion.name}' has no status"
-
-    results = status.get("inspectionResult")
-    assert results, f"VM '{vm_name}': Conversion '{conversion.name}' has no inspectionResult in status"
-
-    os_info = results.get("osInfo")
-    assert os_info and os_info.get("name"), (
-        f"VM '{vm_name}': Conversion '{conversion.name}' inspectionResult missing osInfo or osInfo.name"
+    _validate_inspection_result(
+        results=status.get("inspectionResult"),
+        vm_name=vm_name,
+        context=f"Conversion '{conversion.name}'",
     )
 
-    filesystems = results.get("filesystems")
-    assert filesystems, f"VM '{vm_name}': Conversion '{conversion.name}' inspectionResult missing filesystems"
 
-    passed = results.get("allChecksPassed")
-    assert isinstance(passed, bool), (
-        f"VM '{vm_name}': Conversion '{conversion.name}' allChecksPassed is not a boolean: {passed}"
+def get_plan_conversion_crs(
+    plan_resource: Plan,
+    conversion_type: str | None = None,
+) -> list[Conversion]:
+    """Find Conversion CRs created by a plan, queried by plan UID label.
+
+    Plan-created CRs have labels: plan=<Plan UID>, conversion-type=<type>.
+    Currently only handles DeepInspection type.
+
+    Args:
+        plan_resource: The Plan CR whose UID is used for the label selector.
+        conversion_type: Optional filter (e.g., "DeepInspection"). If None, returns all types.
+
+    Returns:
+        List of matching Conversion CR objects.
+    """
+    plan_uid = plan_resource.instance.metadata.uid
+    label_parts = [f"plan={plan_uid}"]
+    if conversion_type:
+        label_parts.append(f"conversion-type={conversion_type}")
+    label_selector = ",".join(label_parts)
+
+    LOGGER.info(
+        f"Querying Conversion CRs with label_selector='{label_selector}' in namespace '{plan_resource.namespace}'"
+    )
+
+    return list(
+        Conversion.get(
+            client=plan_resource.client,
+            namespace=plan_resource.namespace,
+            label_selector=label_selector,
+        )
+    )
+
+
+def verify_plan_di_completed(plan_resource: Plan) -> None:
+    """Verify that plan-created DeepInspection CRs succeeded with valid results.
+
+    Finds all DeepInspection CRs for the plan, asserts each reached Succeeded
+    phase, and validates inspection results (OS info, filesystems, allChecksPassed).
+
+    Args:
+        plan_resource: The Plan CR to verify DI for.
+
+    Raises:
+        AssertionError: If no DI CRs found, or any CR is not Succeeded, or results are invalid.
+    """
+    conversions = get_plan_conversion_crs(plan_resource=plan_resource, conversion_type="DeepInspection")
+    assert conversions, (
+        f"Plan '{plan_resource.name}': No DeepInspection Conversion CRs found. "
+        f"Expected at least one for plan UID '{plan_resource.instance.metadata.uid}'."
+    )
+
+    for conversion in conversions:
+        vm_name = conversion.instance.spec.vm.get("name", conversion.name)
+        phase = conversion.instance.status.get("phase", "Unknown")
+        assert phase == Conversion.Status.SUCCEEDED, (
+            f"Plan '{plan_resource.name}', VM '{vm_name}': DeepInspection CR '{conversion.name}' "
+            f"phase is '{phase}', expected '{Conversion.Status.SUCCEEDED}'."
+        )
+        verify_di_results(conversion=conversion, vm_name=vm_name)
+
+    LOGGER.info(f"Plan '{plan_resource.name}': All {len(conversions)} DeepInspection CR(s) verified successfully.")
+
+
+def verify_no_conversion_crs(plan_resource: Plan) -> None:
+    """Verify that no DeepInspection CRs were created for a plan.
+
+    Used when run_preflight_inspection is False — DI should be skipped entirely.
+
+    Args:
+        plan_resource: The Plan CR to check.
+
+    Raises:
+        AssertionError: If any DeepInspection CRs are found.
+    """
+    conversions = get_plan_conversion_crs(plan_resource=plan_resource, conversion_type="DeepInspection")
+    assert not conversions, (
+        f"Plan '{plan_resource.name}': Expected no DeepInspection CRs (run_preflight_inspection=False), "
+        f"but found {len(conversions)}: {[c.name for c in conversions]}."
+    )
+    LOGGER.info(f"Plan '{plan_resource.name}': Confirmed no DeepInspection CRs exist (DI correctly skipped).")
+
+
+def verify_plan_vm_di_conditions(plan_resource: Plan, vm_name: str) -> list[dict[str, str]]:
+    """Verify that DI concerns were propagated to the plan's VMStatus conditions.
+
+    The plan controller calls propagateInspectionConcerns() which sets
+    InspectionHasConcerns conditions on the VM status. Critical/Error concerns
+    block migration.
+
+    Args:
+        plan_resource: The Plan CR to inspect.
+        vm_name: VM name to find in plan status.
+
+    Returns:
+        List of concern condition dicts (type, category, reason, message).
+
+    Raises:
+        AssertionError: If VM not found in plan status, or no concern conditions found.
+    """
+    vms_status = plan_resource.instance.status.migration.vms
+    vm_status = None
+    for vs in vms_status:
+        if getattr(vs, "name", "") == vm_name or getattr(vs, "id", "") == vm_name:
+            vm_status = vs
+            break
+
+    assert vm_status, (
+        f"Plan '{plan_resource.name}': VM '{vm_name}' not found in plan migration status. "
+        f"Available VMs: {[getattr(v, 'name', getattr(v, 'id', '?')) for v in vms_status]}."
+    )
+
+    conditions = getattr(vm_status, "conditions", []) or []
+    concern_conditions = [
+        {"type": c.type, "category": c.category, "reason": c.reason, "message": c.message}
+        for c in conditions
+        if getattr(c, "type", "") == "InspectionHasConcerns"
+    ]
+
+    assert concern_conditions, (
+        f"Plan '{plan_resource.name}', VM '{vm_name}': No InspectionHasConcerns conditions found. "
+        f"Conditions present: {[getattr(c, 'type', '?') for c in conditions]}."
     )
 
     LOGGER.info(
-        f"DI results for VM '{vm_name}': allChecksPassed={passed}, "
-        f"os={os_info.get('name')} {os_info.get('version', '')}, "
-        f"filesystems={len(filesystems)}"
+        f"Plan '{plan_resource.name}', VM '{vm_name}': Found {len(concern_conditions)} DI concern(s): "
+        f"{[c['reason'] for c in concern_conditions]}"
     )
+    return concern_conditions
 
 
 def wait_for_critical_conditions(
@@ -550,3 +693,77 @@ def wait_for_di_snapshot_cleanup(
             f"DI snapshot '{DI_SNAPSHOT_NAME}' still present on VM '{vm_name}' "
             f"{timeout}s after cancel. All snapshots: {remaining}"
         ) from err
+
+
+DI_RESULTS_KEY = "di_results"
+
+
+def create_di_capture_callback(
+    plan: Plan,
+    fixture_store: dict[str, Any],
+) -> Callable[[str], None]:
+    """Create callback that snapshots DI CR results into fixture_store during migration.
+
+    Returns a callback compatible with wait_for_migration_complate's on_status_poll.
+    On the first EXECUTING poll where Succeeded DI CRs are found, copies their
+    inspectionResult into fixture_store and stops querying on subsequent calls.
+
+    Args:
+        plan (Plan): Plan CR whose DI CRs to capture.
+        fixture_store (dict[str, Any]): Store where captured data is saved under DI_RESULTS_KEY.
+
+    Returns:
+        Callable[[str], None]: Callback that accepts migration status string.
+    """
+
+    def _capture(status: str) -> None:
+        """Capture DI CR results for one migration status poll.
+
+        Args:
+            status (str): Current migration status from migration polling.
+        """
+        if status != Plan.Status.EXECUTING or DI_RESULTS_KEY in fixture_store:
+            return
+
+        try:
+            conversions = get_plan_conversion_crs(plan_resource=plan, conversion_type="DeepInspection")
+        except ApiException as e:
+            LOGGER.debug(f"Could not query DI CRs during migration: {e}")
+            return
+
+        results = []
+        for conv in conversions:
+            conv_status = conv.instance.status
+            if not conv_status or conv_status.get("phase") != Conversion.Status.SUCCEEDED:
+                continue
+            results.append({
+                "vm_name": conv.instance.spec.vm.get("name", conv.name),
+                "inspectionResult": dict(conv_status.get("inspectionResult", {})),
+            })
+
+        if results:
+            fixture_store[DI_RESULTS_KEY] = results
+            LOGGER.info(f"Captured DI results for {len(results)} VM(s) from plan '{plan.name}'")
+
+    return _capture
+
+
+def verify_captured_di_results(di_results: list[dict[str, Any]], plan_name: str) -> None:
+    """Verify DI results captured during migration.
+
+    Args:
+        di_results (list[dict[str, Any]]): Captured DI data from fixture_store[DI_RESULTS_KEY].
+        plan_name (str): Plan name for error context.
+
+    Raises:
+        AssertionError: If results are missing or incomplete.
+    """
+    assert di_results, (
+        f"Plan '{plan_name}': No DI data captured during migration. DI CRs may have been deleted before capture."
+    )
+    for entry in di_results:
+        _validate_inspection_result(
+            results=entry["inspectionResult"],
+            vm_name=entry["vm_name"],
+            context=f"Plan '{plan_name}'",
+        )

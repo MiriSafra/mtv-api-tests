@@ -4,6 +4,7 @@ from ocp_resources.plan import Plan
 from ocp_resources.storage_map import StorageMap
 from pytest_testconfig import py_config
 
+from utilities.deep_inspection import DI_RESULTS_KEY, create_di_capture_callback
 from utilities.migration_utils import get_cutover_value
 from utilities.mtv_migration import (
     create_plan_resource,
@@ -179,16 +180,22 @@ class TestSanityWarmMtvMigration:
         Returns:
             None
         """
+        di_callback = create_di_capture_callback(
+            plan=self.plan_resource,
+            fixture_store=fixture_store,
+        )
         execute_migration(
             ocp_admin_client=ocp_admin_client,
             fixture_store=fixture_store,
             plan=self.plan_resource,
             target_namespace=target_namespace,
             cut_over=get_cutover_value(),
+            on_status_poll=di_callback,
         )
 
     def test_check_vms(
         self,
+        fixture_store,
         prepared_plan,
         source_provider,
         destination_provider,
@@ -201,6 +208,7 @@ class TestSanityWarmMtvMigration:
         """Validate migrated VMs.
 
         Args:
+            fixture_store (dict[str, Any]): Fixture store for DI result retrieval.
             prepared_plan (dict[str, Any]): The prepared migration plan.
             source_provider (BaseProvider): Source provider instance.
             destination_provider (BaseProvider): Destination provider instance.
@@ -223,6 +231,8 @@ class TestSanityWarmMtvMigration:
             source_vms_namespace=source_vms_namespace,
             source_provider_inventory=source_provider_inventory,
             vm_ssh_connections=vm_ssh_connections,
+            plan_resource=self.plan_resource,
+            di_results=fixture_store[DI_RESULTS_KEY],
         )
 
 
@@ -387,16 +397,22 @@ class TestMtvMigrationWarm2disks2nics:
         Returns:
             None
         """
+        di_callback = create_di_capture_callback(
+            plan=self.plan_resource,
+            fixture_store=fixture_store,
+        )
         execute_migration(
             ocp_admin_client=ocp_admin_client,
             fixture_store=fixture_store,
             plan=self.plan_resource,
             target_namespace=target_namespace,
             cut_over=get_cutover_value(),
+            on_status_poll=di_callback,
         )
 
     def test_check_vms(
         self,
+        fixture_store,
         prepared_plan,
         source_provider,
         destination_provider,
@@ -409,6 +425,7 @@ class TestMtvMigrationWarm2disks2nics:
         """Validate migrated VMs.
 
         Args:
+            fixture_store (dict[str, Any]): Fixture store for DI result retrieval.
             prepared_plan (dict[str, Any]): The prepared migration plan.
             source_provider (BaseProvider): Source provider instance.
             destination_provider (BaseProvider): Destination provider instance.
@@ -431,6 +448,8 @@ class TestMtvMigrationWarm2disks2nics:
             source_vms_namespace=source_vms_namespace,
             source_provider_inventory=source_provider_inventory,
             vm_ssh_connections=vm_ssh_connections,
+            plan_resource=self.plan_resource,
+            di_results=fixture_store[DI_RESULTS_KEY],
         )
 
 
@@ -642,4 +661,5 @@ class TestWarmRemoteOcp:
             source_vms_namespace=source_vms_namespace,
             source_provider_inventory=source_provider_inventory,
             vm_ssh_connections=vm_ssh_connections,
+            plan_resource=self.plan_resource,
         )

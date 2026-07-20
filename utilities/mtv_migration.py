@@ -284,6 +284,7 @@ def execute_migration(
     plan: Plan,
     target_namespace: str,
     cut_over: datetime | None = None,
+    on_status_poll: Callable[[str], None] | None = None,
 ) -> None:
     """Create Migration CR and wait for completion.
 
@@ -299,6 +300,8 @@ def execute_migration(
         plan (Plan): The Plan CR resource defining the migration configuration.
         target_namespace (str): Target namespace for the Migration CR.
         cut_over (datetime | None): Cut-over datetime for warm migration. Defaults to None.
+        on_status_poll (Callable[[str], None] | None): Optional callback invoked on each poll
+            with the current migration status string.
 
     Raises:
         MigrationPlanExecError: If migration fails or times out.
@@ -313,7 +316,7 @@ def execute_migration(
         cut_over=cut_over,
     )
 
-    wait_for_migration_complate(plan=plan)
+    wait_for_migration_complate(plan=plan, on_status_poll=on_status_poll)
 
 
 def get_vm_suffix(warm_migration: bool) -> str:
