@@ -1875,5 +1875,9 @@ def check_vms(
     if plan_resource and plan.get("warm_migration") and source_provider.type == Provider.ProviderType.VSPHERE:
         if plan.get("run_preflight_inspection") is False:
             verify_no_conversion_crs(plan_resource=plan_resource)
-        elif di_results is not None:
+        else:
+            assert di_results is not None, (
+                f"Plan '{plan_resource.name}': DI results not captured. "
+                f"Pass di_results from create_di_capture_callback() to check_vms()."
+            )
             verify_captured_di_results(di_results=di_results, plan_name=plan_resource.name)

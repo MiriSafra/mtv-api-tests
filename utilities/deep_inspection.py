@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import base64
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from kubernetes.dynamic.exceptions import ApiException
 from ocp_resources.conversion import Conversion
 from ocp_resources.plan import Plan
 from ocp_resources.pod import Pod
@@ -33,6 +33,7 @@ DI_SNAPSHOT_CREATION_TIMEOUT = 120
 DI_POD_CREATION_TIMEOUT = 120
 DI_POD_CLEANUP_TIMEOUT = 60
 DI_SNAPSHOT_CLEANUP_TIMEOUT = 180
+DI_RESULTS_KEY = "di_results"
 
 
 def create_di_connection_secret(
@@ -695,9 +696,6 @@ def wait_for_di_snapshot_cleanup(
         ) from err
 
 
-DI_RESULTS_KEY = "di_results"
-
-
 def create_di_capture_callback(
     plan: Plan,
     fixture_store: dict[str, Any],
@@ -716,34 +714,43 @@ def create_di_capture_callback(
         Callable[[str], None]: Callback that accepts migration status string.
     """
 
+    fixture_store.pop(DI_RESULTS_KEY, None)
+    last_poll_time = 0.0
+    poll_interval = 10
+
     def _capture(status: str) -> None:
         """Capture DI CR results for one migration status poll.
 
         Args:
             status (str): Current migration status from migration polling.
         """
+        nonlocal last_poll_time
+
         if status != Plan.Status.EXECUTING or DI_RESULTS_KEY in fixture_store:
             return
 
+        now = time.monotonic()
+        if now - last_poll_time < poll_interval:
+            return
+        last_poll_time = now
+
         try:
             conversions = get_plan_conversion_crs(plan_resource=plan, conversion_type="DeepInspection")
-        except ApiException as e:
-            LOGGER.debug(f"Could not query DI CRs during migration: {e}")
-            return
+            results = []
+            for conv in conversions:
+                conv_status = conv.instance.status
+                if not conv_status or conv_status.get("phase") != Conversion.Status.SUCCEEDED:
+                    continue
+                results.append({
+                    "vm_name": conv.instance.spec.vm.get("name", conv.name),
+                    "inspectionResult": dict(conv_status.get("inspectionResult") or {}),
+                })
 
-        results = []
-        for conv in conversions:
-            conv_status = conv.instance.status
-            if not conv_status or conv_status.get("phase") != Conversion.Status.SUCCEEDED:
-                continue
-            results.append({
-                "vm_name": conv.instance.spec.vm.get("name", conv.name),
-                "inspectionResult": dict(conv_status.get("inspectionResult", {})),
-            })
-
-        if results:
-            fixture_store[DI_RESULTS_KEY] = results
-            LOGGER.info(f"Captured DI results for {len(results)} VM(s) from plan '{plan.name}'")
+            if results:
+                fixture_store[DI_RESULTS_KEY] = results
+                LOGGER.info(f"Captured DI results for {len(results)} VM(s) from plan '{plan.name}'")
+        except Exception:
+            LOGGER.warning(f"Error querying DI CRs for plan '{plan.name}'", exc_info=True)
 
     return _capture
 

@@ -261,5 +261,5 @@ class TestWarmMigrationXfs:
             source_provider_inventory=source_provider_inventory,
             vm_ssh_connections=vm_ssh_connections,
             plan_resource=self.plan_resource,
-            di_results=fixture_store[DI_RESULTS_KEY],
+            di_results=fixture_store.get(DI_RESULTS_KEY),
         )

@@ -261,5 +261,5 @@ class TestWarmMigrationComprehensive:
             vm_ssh_connections=vm_ssh_connections,
             target_vm_labels=target_vm_labels,
             plan_resource=self.plan_resource,
-            di_results=fixture_store[DI_RESULTS_KEY],
+            di_results=fixture_store.get(DI_RESULTS_KEY),
         )
