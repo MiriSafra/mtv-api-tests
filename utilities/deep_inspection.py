@@ -392,7 +392,7 @@ def get_plan_conversion_crs(
         label_parts.append(f"conversion-type={conversion_type}")
     label_selector = ",".join(label_parts)
 
-    LOGGER.info(
+    LOGGER.debug(
         f"Querying Conversion CRs with label_selector='{label_selector}' in namespace '{plan_resource.namespace}'"
     )
 
@@ -416,7 +416,7 @@ def verify_no_conversion_crs(plan_resource: Plan) -> None:
     Raises:
         AssertionError: If any DeepInspection CRs are found.
     """
-    conversions = get_plan_conversion_crs(plan_resource=plan_resource, conversion_type="DeepInspection")
+    conversions = get_plan_conversion_crs(plan_resource=plan_resource, conversion_type=CONVERSION_TYPE_DEEP_INSPECTION)
     assert not conversions, (
         f"Plan '{plan_resource.name}': Expected no DeepInspection CRs (run_preflight_inspection=False), "
         f"but found {len(conversions)}: {[c.name for c in conversions]}."
@@ -640,25 +640,12 @@ def create_di_capture_callback(
     last_poll_time = 0.0
     poll_interval = 10
     captured_vm_names: set[str] = set()
+    was_executing = False
 
-    def _capture(status: str) -> None:
-        """Capture DI CR results for one migration status poll.
-
-        Args:
-            status (str): Current migration status from migration polling.
-        """
-        nonlocal last_poll_time
-
-        if status != Plan.Status.EXECUTING:
-            return
-
-        now = time.monotonic()
-        if now - last_poll_time < poll_interval:
-            return
-        last_poll_time = now
-
+    def _try_capture() -> None:
+        """Query DI CRs and capture any newly-Succeeded results."""
         try:
-            conversions = get_plan_conversion_crs(plan_resource=plan, conversion_type="DeepInspection")
+            conversions = get_plan_conversion_crs(plan_resource=plan, conversion_type=CONVERSION_TYPE_DEEP_INSPECTION)
             new_results = []
             for conv in conversions:
                 vm_name = conv.instance.spec.vm.get("name", conv.name)
@@ -676,8 +663,30 @@ def create_di_capture_callback(
             if new_results:
                 fixture_store.setdefault(DI_RESULTS_KEY, []).extend(new_results)
                 LOGGER.info(f"Captured DI results for {len(new_results)} VM(s) from plan '{plan.name}'")
-        except Exception:
-            LOGGER.warning(f"Error querying DI CRs for plan '{plan.name}'", exc_info=True)
+        except NotFoundError:
+            LOGGER.debug(f"Plan or Conversion CR not found during DI capture for plan '{plan.name}'")
+
+    def _capture(status: str) -> None:
+        """Capture DI CR results for one migration status poll.
+
+        Args:
+            status (str): Current migration status from migration polling.
+        """
+        nonlocal last_poll_time, was_executing
+
+        if status != Plan.Status.EXECUTING:
+            if was_executing:
+                _try_capture()
+                was_executing = False
+            return
+
+        was_executing = True
+        now = time.monotonic()
+        if now - last_poll_time < poll_interval:
+            return
+        last_poll_time = now
+
+        _try_capture()
 
     return _capture
 

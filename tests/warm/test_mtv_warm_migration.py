@@ -205,22 +205,7 @@ class TestSanityWarmMtvMigration:
         source_provider_inventory,
         vm_ssh_connections,
     ):
-        """Validate migrated VMs.
-
-        Args:
-            fixture_store (dict[str, Any]): Fixture store for DI result retrieval.
-            prepared_plan (dict[str, Any]): The prepared migration plan.
-            source_provider (BaseProvider): Source provider instance.
-            destination_provider (BaseProvider): Destination provider instance.
-            source_provider_data (dict[str, Any]): Source provider configuration data.
-            target_namespace (Namespace): Target namespace for migration.
-            source_vms_namespace (str): Namespace of source VMs.
-            source_provider_inventory (ForkliftInventory): Source provider inventory.
-            vm_ssh_connections (dict[str, Any]): SSH connections to migrated VMs.
-
-        Returns:
-            None
-        """
+        """Validate migrated VMs."""
         check_vms(
             plan=prepared_plan,
             source_provider=source_provider,
@@ -422,22 +407,7 @@ class TestMtvMigrationWarm2disks2nics:
         source_provider_inventory,
         vm_ssh_connections,
     ):
-        """Validate migrated VMs.
-
-        Args:
-            fixture_store (dict[str, Any]): Fixture store for DI result retrieval.
-            prepared_plan (dict[str, Any]): The prepared migration plan.
-            source_provider (BaseProvider): Source provider instance.
-            destination_provider (BaseProvider): Destination provider instance.
-            source_provider_data (dict[str, Any]): Source provider configuration data.
-            target_namespace (Namespace): Target namespace for migration.
-            source_vms_namespace (str): Namespace of source VMs.
-            source_provider_inventory (ForkliftInventory): Source provider inventory.
-            vm_ssh_connections (dict[str, Any]): SSH connections to migrated VMs.
-
-        Returns:
-            None
-        """
+        """Validate migrated VMs."""
         check_vms(
             plan=prepared_plan,
             source_provider=source_provider,
@@ -607,26 +577,23 @@ class TestWarmRemoteOcp:
         ocp_admin_client,
         target_namespace,
     ):
-        """Execute warm migration with cutover.
-
-        Args:
-            fixture_store (dict[str, Any]): Fixture store for resource tracking.
-            ocp_admin_client (DynamicClient): OpenShift admin client.
-            target_namespace (Namespace): Target namespace for migration.
-
-        Returns:
-            None
-        """
+        """Execute warm migration with cutover."""
+        di_callback = create_di_capture_callback(
+            plan=self.plan_resource,
+            fixture_store=fixture_store,
+        )
         execute_migration(
             ocp_admin_client=ocp_admin_client,
             fixture_store=fixture_store,
             plan=self.plan_resource,
             target_namespace=target_namespace,
             cut_over=get_cutover_value(),
+            on_status_poll=di_callback,
         )
 
     def test_check_vms(
         self,
+        fixture_store,
         prepared_plan,
         source_provider,
         destination_ocp_provider,
@@ -636,21 +603,7 @@ class TestWarmRemoteOcp:
         source_provider_inventory,
         vm_ssh_connections,
     ):
-        """Validate migrated VMs.
-
-        Args:
-            prepared_plan (dict[str, Any]): The prepared migration plan.
-            source_provider (BaseProvider): Source provider instance.
-            destination_ocp_provider (BaseProvider): Destination OCP provider instance.
-            source_provider_data (dict[str, Any]): Source provider configuration data.
-            target_namespace (Namespace): Target namespace for migration.
-            source_vms_namespace (str): Namespace of source VMs.
-            source_provider_inventory (ForkliftInventory): Source provider inventory.
-            vm_ssh_connections (dict[str, Any]): SSH connections to migrated VMs.
-
-        Returns:
-            None
-        """
+        """Validate migrated VMs."""
         check_vms(
             plan=prepared_plan,
             source_provider=source_provider,
@@ -662,4 +615,5 @@ class TestWarmRemoteOcp:
             source_provider_inventory=source_provider_inventory,
             vm_ssh_connections=vm_ssh_connections,
             plan_resource=self.plan_resource,
+            di_results=fixture_store.get(DI_RESULTS_KEY),
         )

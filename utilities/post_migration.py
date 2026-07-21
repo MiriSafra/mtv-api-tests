@@ -1609,6 +1609,32 @@ def check_vm_command_output(
             )
 
 
+def _verify_warm_vsphere_di(
+    plan_resource: Plan,
+    plan: dict[str, Any],
+    di_results: list[dict[str, Any]] | None,
+) -> None:
+    """Verify Deep Inspection results for a warm vSphere migration.
+
+    Args:
+        plan_resource (Plan): The Plan CR resource.
+        plan (dict[str, Any]): The prepared plan configuration.
+        di_results (list[dict[str, Any]] | None): Captured DI data, if any.
+
+    Raises:
+        AssertionError: If DI validation fails or expected results are missing.
+    """
+    if plan.get("run_preflight_inspection") is False:
+        verify_no_conversion_crs(plan_resource=plan_resource)
+        return
+
+    assert di_results is not None, (
+        f"Plan '{plan_resource.name}': DI results not captured. "
+        f"Pass di_results from create_di_capture_callback() to check_vms()."
+    )
+    verify_captured_di_results(di_results=di_results, plan_name=plan_resource.name)
+
+
 def check_vms(
     plan: dict[str, Any],
     source_provider: BaseProvider,
@@ -1873,11 +1899,4 @@ def check_vms(
         pytest.fail(f"VM validation failed — {failure_details}")
 
     if plan_resource and plan.get("warm_migration") and source_provider.type == Provider.ProviderType.VSPHERE:
-        if plan.get("run_preflight_inspection") is False:
-            verify_no_conversion_crs(plan_resource=plan_resource)
-        else:
-            assert di_results is not None, (
-                f"Plan '{plan_resource.name}': DI results not captured. "
-                f"Pass di_results from create_di_capture_callback() to check_vms()."
-            )
-            verify_captured_di_results(di_results=di_results, plan_name=plan_resource.name)
+        _verify_warm_vsphere_di(plan_resource=plan_resource, plan=plan, di_results=di_results)
