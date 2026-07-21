@@ -471,7 +471,15 @@ def verify_plan_vm_di_conditions(plan_resource: Plan, vm_name: str) -> list[dict
     Raises:
         AssertionError: If VM not found in plan status, or no concern conditions found.
     """
-    vms_status = plan_resource.instance.status.migration.vms
+    status = plan_resource.instance.status
+    assert status, f"Plan '{plan_resource.name}': Plan has no status — may not be reconciled yet."
+
+    migration = getattr(status, "migration", None)
+    assert migration, f"Plan '{plan_resource.name}': Plan status has no migration field."
+
+    vms_status = getattr(migration, "vms", None) or []
+    assert vms_status, f"Plan '{plan_resource.name}': Plan migration status has no VMs."
+
     vm_status = None
     for vs in vms_status:
         if getattr(vs, "name", "") == vm_name or getattr(vs, "id", "") == vm_name:
@@ -700,11 +708,11 @@ def create_di_capture_callback(
     plan: Plan,
     fixture_store: dict[str, Any],
 ) -> Callable[[str], None]:
-    """Create callback that snapshots DI CR results into fixture_store during migration.
+    """Create callback that captures DI CR results into fixture_store during migration.
 
     Returns a callback compatible with wait_for_migration_complate's on_status_poll.
-    On the first EXECUTING poll where Succeeded DI CRs are found, copies their
-    inspectionResult into fixture_store and stops querying on subsequent calls.
+    Accumulates per-VM DI results across polls so that multi-VM plans where VMs
+    finish DI at different times are all captured.
 
     Args:
         plan (Plan): Plan CR whose DI CRs to capture.
@@ -717,6 +725,7 @@ def create_di_capture_callback(
     fixture_store.pop(DI_RESULTS_KEY, None)
     last_poll_time = 0.0
     poll_interval = 10
+    captured_vm_names: set[str] = set()
 
     def _capture(status: str) -> None:
         """Capture DI CR results for one migration status poll.
@@ -726,7 +735,7 @@ def create_di_capture_callback(
         """
         nonlocal last_poll_time
 
-        if status != Plan.Status.EXECUTING or DI_RESULTS_KEY in fixture_store:
+        if status != Plan.Status.EXECUTING:
             return
 
         now = time.monotonic()
@@ -736,19 +745,23 @@ def create_di_capture_callback(
 
         try:
             conversions = get_plan_conversion_crs(plan_resource=plan, conversion_type="DeepInspection")
-            results = []
+            new_results = []
             for conv in conversions:
+                vm_name = conv.instance.spec.vm.get("name", conv.name)
+                if vm_name in captured_vm_names:
+                    continue
                 conv_status = conv.instance.status
                 if not conv_status or conv_status.get("phase") != Conversion.Status.SUCCEEDED:
                     continue
-                results.append({
-                    "vm_name": conv.instance.spec.vm.get("name", conv.name),
+                new_results.append({
+                    "vm_name": vm_name,
                     "inspectionResult": dict(conv_status.get("inspectionResult") or {}),
                 })
+                captured_vm_names.add(vm_name)
 
-            if results:
-                fixture_store[DI_RESULTS_KEY] = results
-                LOGGER.info(f"Captured DI results for {len(results)} VM(s) from plan '{plan.name}'")
+            if new_results:
+                fixture_store.setdefault(DI_RESULTS_KEY, []).extend(new_results)
+                LOGGER.info(f"Captured DI results for {len(new_results)} VM(s) from plan '{plan.name}'")
         except Exception:
             LOGGER.warning(f"Error querying DI CRs for plan '{plan.name}'", exc_info=True)
 
