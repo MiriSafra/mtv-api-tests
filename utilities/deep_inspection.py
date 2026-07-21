@@ -646,8 +646,13 @@ def create_di_capture_callback(
         """Query DI CRs and capture any newly-Succeeded results."""
         try:
             conversions = get_plan_conversion_crs(plan_resource=plan, conversion_type=CONVERSION_TYPE_DEEP_INSPECTION)
-            new_results = []
-            for conv in conversions:
+        except NotFoundError:
+            LOGGER.debug(f"Plan or Conversion CR not found during DI capture for plan '{plan.name}'")
+            return
+
+        new_results = []
+        for conv in conversions:
+            try:
                 vm_name = conv.instance.spec.vm.get("name", conv.name)
                 if vm_name in captured_vm_names:
                     continue
@@ -659,12 +664,12 @@ def create_di_capture_callback(
                     "inspectionResult": dict(conv_status.get("inspectionResult") or {}),
                 })
                 captured_vm_names.add(vm_name)
+            except NotFoundError:
+                LOGGER.debug(f"Conversion CR '{conv.name}' disappeared during DI capture, skipping")
 
-            if new_results:
-                fixture_store.setdefault(DI_RESULTS_KEY, []).extend(new_results)
-                LOGGER.info(f"Captured DI results for {len(new_results)} VM(s) from plan '{plan.name}'")
-        except NotFoundError:
-            LOGGER.debug(f"Plan or Conversion CR not found during DI capture for plan '{plan.name}'")
+        if new_results:
+            fixture_store.setdefault(DI_RESULTS_KEY, []).extend(new_results)
+            LOGGER.info(f"Captured DI results for {len(new_results)} VM(s) from plan '{plan.name}'")
 
     def _capture(status: str) -> None:
         """Capture DI CR results for one migration status poll.
