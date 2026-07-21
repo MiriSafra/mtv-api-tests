@@ -405,36 +405,6 @@ def get_plan_conversion_crs(
     )
 
 
-def verify_plan_di_completed(plan_resource: Plan) -> None:
-    """Verify that plan-created DeepInspection CRs succeeded with valid results.
-
-    Finds all DeepInspection CRs for the plan, asserts each reached Succeeded
-    phase, and validates inspection results (OS info, filesystems, allChecksPassed).
-
-    Args:
-        plan_resource: The Plan CR to verify DI for.
-
-    Raises:
-        AssertionError: If no DI CRs found, or any CR is not Succeeded, or results are invalid.
-    """
-    conversions = get_plan_conversion_crs(plan_resource=plan_resource, conversion_type="DeepInspection")
-    assert conversions, (
-        f"Plan '{plan_resource.name}': No DeepInspection Conversion CRs found. "
-        f"Expected at least one for plan UID '{plan_resource.instance.metadata.uid}'."
-    )
-
-    for conversion in conversions:
-        vm_name = conversion.instance.spec.vm.get("name", conversion.name)
-        phase = conversion.instance.status.get("phase", "Unknown")
-        assert phase == Conversion.Status.SUCCEEDED, (
-            f"Plan '{plan_resource.name}', VM '{vm_name}': DeepInspection CR '{conversion.name}' "
-            f"phase is '{phase}', expected '{Conversion.Status.SUCCEEDED}'."
-        )
-        verify_di_results(conversion=conversion, vm_name=vm_name)
-
-    LOGGER.info(f"Plan '{plan_resource.name}': All {len(conversions)} DeepInspection CR(s) verified successfully.")
-
-
 def verify_no_conversion_crs(plan_resource: Plan) -> None:
     """Verify that no DeepInspection CRs were created for a plan.
 
@@ -452,62 +422,6 @@ def verify_no_conversion_crs(plan_resource: Plan) -> None:
         f"but found {len(conversions)}: {[c.name for c in conversions]}."
     )
     LOGGER.info(f"Plan '{plan_resource.name}': Confirmed no DeepInspection CRs exist (DI correctly skipped).")
-
-
-def verify_plan_vm_di_conditions(plan_resource: Plan, vm_name: str) -> list[dict[str, str]]:
-    """Verify that DI concerns were propagated to the plan's VMStatus conditions.
-
-    The plan controller calls propagateInspectionConcerns() which sets
-    InspectionHasConcerns conditions on the VM status. Critical/Error concerns
-    block migration.
-
-    Args:
-        plan_resource: The Plan CR to inspect.
-        vm_name: VM name to find in plan status.
-
-    Returns:
-        List of concern condition dicts (type, category, reason, message).
-
-    Raises:
-        AssertionError: If VM not found in plan status, or no concern conditions found.
-    """
-    status = plan_resource.instance.status
-    assert status, f"Plan '{plan_resource.name}': Plan has no status — may not be reconciled yet."
-
-    migration = getattr(status, "migration", None)
-    assert migration, f"Plan '{plan_resource.name}': Plan status has no migration field."
-
-    vms_status = getattr(migration, "vms", None) or []
-    assert vms_status, f"Plan '{plan_resource.name}': Plan migration status has no VMs."
-
-    vm_status = None
-    for vs in vms_status:
-        if getattr(vs, "name", "") == vm_name or getattr(vs, "id", "") == vm_name:
-            vm_status = vs
-            break
-
-    assert vm_status, (
-        f"Plan '{plan_resource.name}': VM '{vm_name}' not found in plan migration status. "
-        f"Available VMs: {[getattr(v, 'name', getattr(v, 'id', '?')) for v in vms_status]}."
-    )
-
-    conditions = getattr(vm_status, "conditions", []) or []
-    concern_conditions = [
-        {"type": c.type, "category": c.category, "reason": c.reason, "message": c.message}
-        for c in conditions
-        if getattr(c, "type", "") == "InspectionHasConcerns"
-    ]
-
-    assert concern_conditions, (
-        f"Plan '{plan_resource.name}', VM '{vm_name}': No InspectionHasConcerns conditions found. "
-        f"Conditions present: {[getattr(c, 'type', '?') for c in conditions]}."
-    )
-
-    LOGGER.info(
-        f"Plan '{plan_resource.name}', VM '{vm_name}': Found {len(concern_conditions)} DI concern(s): "
-        f"{[c['reason'] for c in concern_conditions]}"
-    )
-    return concern_conditions
 
 
 def wait_for_critical_conditions(
