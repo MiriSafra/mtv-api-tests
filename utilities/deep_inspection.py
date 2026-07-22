@@ -653,7 +653,7 @@ def create_di_capture_callback(
         new_results = []
         for conv in conversions:
             try:
-                vm_name = conv.instance.spec.vm.get("name", conv.name)
+                vm_name = (conv.instance.spec.vm or {}).get("name", conv.name)
                 if vm_name in captured_vm_names:
                     continue
                 conv_status = conv.instance.status
