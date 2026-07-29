@@ -332,18 +332,22 @@ def _validate_inspection_result(results: dict[str, Any] | None, vm_name: str, co
         context (str): Additional context (e.g., conversion name or plan name).
 
     Raises:
-        AssertionError: If results are missing or incomplete.
+        ValueError: If results are missing or incomplete.
     """
-    assert results, f"{context}, VM '{vm_name}': inspectionResult is empty"
+    if not results:
+        raise ValueError(f"{context}, VM '{vm_name}': inspectionResult is empty")
 
     os_info = results.get("osInfo")
-    assert os_info and os_info.get("name"), f"{context}, VM '{vm_name}': missing osInfo or osInfo.name"
+    if not os_info or not os_info.get("name"):
+        raise ValueError(f"{context}, VM '{vm_name}': missing osInfo or osInfo.name")
 
     filesystems = results.get("filesystems")
-    assert filesystems, f"{context}, VM '{vm_name}': missing filesystems"
+    if not filesystems:
+        raise ValueError(f"{context}, VM '{vm_name}': missing filesystems")
 
     passed = results.get("allChecksPassed")
-    assert isinstance(passed, bool), f"{context}, VM '{vm_name}': allChecksPassed is not a boolean: {passed}"
+    if not isinstance(passed, bool):
+        raise ValueError(f"{context}, VM '{vm_name}': allChecksPassed is not a boolean: {passed}")
 
     LOGGER.info(
         f"DI verified for VM '{vm_name}': allChecksPassed={passed}, "
@@ -359,10 +363,11 @@ def verify_di_results(conversion: Conversion, vm_name: str) -> None:
         vm_name (str): Source VM name for error context.
 
     Raises:
-        AssertionError: If results are missing or incomplete.
+        ValueError: If results are missing or incomplete.
     """
     status = conversion.instance.status
-    assert status, f"VM '{vm_name}': Conversion '{conversion.name}' has no status"
+    if not status:
+        raise ValueError(f"VM '{vm_name}': Conversion '{conversion.name}' has no status")
     _validate_inspection_result(
         results=status.get("inspectionResult"),
         vm_name=vm_name,
@@ -414,13 +419,14 @@ def verify_no_conversion_crs(plan_resource: Plan) -> None:
         plan_resource: The Plan CR to check.
 
     Raises:
-        AssertionError: If any DeepInspection CRs are found.
+        ValueError: If any DeepInspection CRs are found.
     """
     conversions = get_plan_conversion_crs(plan_resource=plan_resource, conversion_type=CONVERSION_TYPE_DEEP_INSPECTION)
-    assert not conversions, (
-        f"Plan '{plan_resource.name}': Expected no DeepInspection CRs (run_preflight_inspection=False), "
-        f"but found {len(conversions)}: {[c.name for c in conversions]}."
-    )
+    if conversions:
+        raise ValueError(
+            f"Plan '{plan_resource.name}': Expected no DeepInspection CRs (run_preflight_inspection=False), "
+            f"but found {len(conversions)}: {[c.name for c in conversions]}."
+        )
     LOGGER.info(f"Plan '{plan_resource.name}': Confirmed no DeepInspection CRs exist (DI correctly skipped).")
 
 
@@ -704,11 +710,12 @@ def verify_captured_di_results(di_results: list[dict[str, Any]], plan_name: str)
         plan_name (str): Plan name for error context.
 
     Raises:
-        AssertionError: If results are missing or incomplete.
+        ValueError: If results are missing or incomplete.
     """
-    assert di_results, (
-        f"Plan '{plan_name}': No DI data captured during migration. DI CRs may have been deleted before capture."
-    )
+    if not di_results:
+        raise ValueError(
+            f"Plan '{plan_name}': No DI data captured during migration. DI CRs may have been deleted before capture."
+        )
     for entry in di_results:
         _validate_inspection_result(
             results=entry["inspectionResult"],
