@@ -418,26 +418,6 @@ def get_plan_conversion_crs(
     )
 
 
-def verify_no_conversion_crs(plan_resource: Plan) -> None:
-    """Verify that no DeepInspection CRs were created for a plan.
-
-    Used when run_preflight_inspection is False — DI should be skipped entirely.
-
-    Args:
-        plan_resource: The Plan CR to check.
-
-    Raises:
-        ValueError: If any DeepInspection CRs are found.
-    """
-    conversions = get_plan_conversion_crs(plan_resource=plan_resource, conversion_type=CONVERSION_TYPE_DEEP_INSPECTION)
-    if conversions:
-        raise ValueError(
-            f"Plan '{plan_resource.name}': Expected no DeepInspection CRs (run_preflight_inspection=False), "
-            f"but found {len(conversions)}: {[c.name for c in conversions]}."
-        )
-    LOGGER.info(f"Plan '{plan_resource.name}': Confirmed no DeepInspection CRs exist (DI correctly skipped).")
-
-
 def wait_for_critical_conditions(
     conversion: Conversion,
     timeout: int,
