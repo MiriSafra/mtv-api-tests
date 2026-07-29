@@ -1622,16 +1622,17 @@ def _verify_warm_vsphere_di(
         di_results (list[dict[str, Any]] | None): Captured DI data, if any.
 
     Raises:
-        AssertionError: If DI validation fails or expected results are missing.
+        ValueError: If DI validation fails or expected results are missing.
     """
     if plan.get("run_preflight_inspection") is False:
         verify_no_conversion_crs(plan_resource=plan_resource)
         return
 
-    assert di_results is not None, (
-        f"Plan '{plan_resource.name}': DI results not captured. "
-        f"Pass di_results from create_di_capture_callback() to check_vms()."
-    )
+    if di_results is None:
+        raise ValueError(
+            f"Plan '{plan_resource.name}': DI results not captured. "
+            f"Pass di_results from create_di_capture_callback() to check_vms()."
+        )
     verify_captured_di_results(di_results=di_results, plan_name=plan_resource.name)
 
 

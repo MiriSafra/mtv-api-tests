@@ -41,6 +41,7 @@ DI_POD_CREATION_TIMEOUT = 120
 DI_POD_CLEANUP_TIMEOUT = 60
 DI_SNAPSHOT_CLEANUP_TIMEOUT = 180
 DI_RESULTS_KEY = "di_results"
+DI_CAPTURE_POLL_INTERVAL_SECONDS = 10
 
 
 def create_di_connection_secret(
@@ -651,7 +652,7 @@ def create_di_capture_callback(
 
     fixture_store.pop(DI_RESULTS_KEY, None)
     last_poll_time = 0.0
-    poll_interval = 10
+    poll_interval = DI_CAPTURE_POLL_INTERVAL_SECONDS
     captured_vm_names: set[str] = set()
     was_executing = False
 
