@@ -1908,7 +1908,7 @@ def check_vms(
     ):
         try:
             _verify_warm_vsphere_di(plan_resource=plan_resource, plan=plan, di_results=di_results)
-        except Exception as exp:
+        except ValueError as exp:
             res.setdefault(plan_resource.name, []).append(f"warm_vsphere_di - {str(exp)}")
 
     failed_checks = {vm_name: errors for vm_name, errors in res.items() if errors}
