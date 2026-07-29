@@ -1,3 +1,10 @@
+"""Utilities for Deep Inspection (DI) Conversion CR lifecycle.
+
+Covers standalone DI (user-created CRs) and plan-driven DI (auto-created
+during migration). Provides CR creation, polling, result verification,
+and mid-migration capture via on_status_poll callbacks.
+"""
+
 from __future__ import annotations
 
 import base64
