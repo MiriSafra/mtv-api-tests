@@ -649,7 +649,7 @@ def precopy_interval_forkliftcontroller(
 
     current_interval = getattr(forklift_controller.instance.spec, "controller_precopy_interval", None)
 
-    if current_interval == snapshots_interval:
+    if current_interval is not None and int(current_interval) == snapshots_interval:
         LOGGER.info(
             f"ForkliftController controller_precopy_interval already set to {snapshots_interval}, skipping update"
         )
