@@ -639,7 +639,12 @@ def precopy_interval_forkliftcontroller(
         ensure_exists=True,
     )
 
-    snapshots_interval = int(py_config["snapshots_interval"])
+    try:
+        snapshots_interval = int(py_config["snapshots_interval"])
+    except (TypeError, ValueError) as exp:
+        raise ValueError(
+            f"Config 'snapshots_interval' must be numeric, got {py_config.get('snapshots_interval')!r}"
+        ) from exp
 
     forklift_controller.wait_for_condition(
         status=forklift_controller.Condition.Status.TRUE,
@@ -649,7 +654,14 @@ def precopy_interval_forkliftcontroller(
 
     current_interval = getattr(forklift_controller.instance.spec, "controller_precopy_interval", None)
 
-    if current_interval is not None and int(current_interval) == snapshots_interval:
+    try:
+        current_interval_int = int(current_interval) if current_interval is not None else None
+    except (TypeError, ValueError) as exp:
+        raise ValueError(
+            f"ForkliftController controller_precopy_interval must be numeric, got {current_interval!r}"
+        ) from exp
+
+    if current_interval_int is not None and current_interval_int == snapshots_interval:
         LOGGER.info(
             f"ForkliftController controller_precopy_interval already set to {snapshots_interval}, skipping update"
         )
