@@ -1639,7 +1639,8 @@ def _verify_warm_vsphere_di(
             f"Plan '{plan_resource.name}': DI results not captured. "
             f"Pass di_results from create_di_capture_callback() to check_vms()."
         )
-    verify_captured_di_results(di_results=di_results, plan_name=plan_resource.name)
+    expected_vm_names = {vm["name"] for vm in plan["virtual_machines"]}
+    verify_captured_di_results(di_results=di_results, plan_name=plan_resource.name, expected_vm_names=expected_vm_names)
 
 
 def check_vms(

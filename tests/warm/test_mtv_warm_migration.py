@@ -1,6 +1,7 @@
 import pytest
 from ocp_resources.network_map import NetworkMap
 from ocp_resources.plan import Plan
+from ocp_resources.provider import Provider
 from ocp_resources.storage_map import StorageMap
 from pytest_testconfig import py_config
 
@@ -169,6 +170,7 @@ class TestSanityWarmMtvMigration:
         fixture_store,
         ocp_admin_client,
         target_namespace,
+        source_provider,
     ):
         """Execute warm migration with cutover.
 
@@ -176,13 +178,15 @@ class TestSanityWarmMtvMigration:
             fixture_store (dict[str, Any]): Fixture store for resource tracking.
             ocp_admin_client (DynamicClient): OpenShift admin client.
             target_namespace (Namespace): Target namespace for migration.
+            source_provider (BaseProvider): Source provider, used to gate DI capture to vSphere.
 
         Returns:
             None
         """
-        di_callback = create_di_capture_callback(
-            plan=self.plan_resource,
-            fixture_store=fixture_store,
+        di_callback = (
+            create_di_capture_callback(plan=self.plan_resource, fixture_store=fixture_store)
+            if source_provider.type == Provider.ProviderType.VSPHERE
+            else None
         )
         execute_migration(
             ocp_admin_client=ocp_admin_client,
@@ -386,6 +390,7 @@ class TestMtvMigrationWarm2disks2nics:
         fixture_store,
         ocp_admin_client,
         target_namespace,
+        source_provider,
     ):
         """Execute warm migration with cutover.
 
@@ -393,13 +398,15 @@ class TestMtvMigrationWarm2disks2nics:
             fixture_store (dict[str, Any]): Fixture store for resource tracking.
             ocp_admin_client (DynamicClient): OpenShift admin client.
             target_namespace (Namespace): Target namespace for migration.
+            source_provider (BaseProvider): Source provider, used to gate DI capture to vSphere.
 
         Returns:
             None
         """
-        di_callback = create_di_capture_callback(
-            plan=self.plan_resource,
-            fixture_store=fixture_store,
+        di_callback = (
+            create_di_capture_callback(plan=self.plan_resource, fixture_store=fixture_store)
+            if source_provider.type == Provider.ProviderType.VSPHERE
+            else None
         )
         execute_migration(
             ocp_admin_client=ocp_admin_client,
@@ -606,6 +613,7 @@ class TestWarmRemoteOcp:
         fixture_store,
         ocp_admin_client,
         target_namespace,
+        source_provider,
     ):
         """Execute warm migration with cutover.
 
@@ -613,13 +621,15 @@ class TestWarmRemoteOcp:
             fixture_store (dict[str, Any]): Fixture store for resource tracking.
             ocp_admin_client (DynamicClient): OpenShift admin client.
             target_namespace (Namespace): Target namespace for migration.
+            source_provider (BaseProvider): Source provider, used to gate DI capture to vSphere.
 
         Returns:
             None
         """
-        di_callback = create_di_capture_callback(
-            plan=self.plan_resource,
-            fixture_store=fixture_store,
+        di_callback = (
+            create_di_capture_callback(plan=self.plan_resource, fixture_store=fixture_store)
+            if source_provider.type == Provider.ProviderType.VSPHERE
+            else None
         )
         execute_migration(
             ocp_admin_client=ocp_admin_client,

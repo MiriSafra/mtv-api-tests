@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from ocp_resources.network_map import NetworkMap
 from ocp_resources.plan import Plan
+from ocp_resources.provider import Provider
 from ocp_resources.storage_map import StorageMap
 from pytest_testconfig import config as py_config
 
@@ -197,6 +198,7 @@ class TestWarmMigrationComprehensive:
         fixture_store: dict[str, Any],
         ocp_admin_client: "DynamicClient",
         target_namespace: str,
+        source_provider: "BaseProvider",
     ) -> None:
         """Execute warm migration with cutover.
 
@@ -204,13 +206,15 @@ class TestWarmMigrationComprehensive:
             fixture_store: Fixture store for resource tracking
             ocp_admin_client: OpenShift admin client
             target_namespace: Target namespace for migration
+            source_provider: Source provider, used to gate DI capture to vSphere
 
         Returns:
             None
         """
-        di_callback = create_di_capture_callback(
-            plan=self.plan_resource,
-            fixture_store=fixture_store,
+        di_callback = (
+            create_di_capture_callback(plan=self.plan_resource, fixture_store=fixture_store)
+            if source_provider.type == Provider.ProviderType.VSPHERE
+            else None
         )
         execute_migration(
             ocp_admin_client=ocp_admin_client,

@@ -690,12 +690,17 @@ def create_di_capture_callback(
     return _capture
 
 
-def verify_captured_di_results(di_results: list[dict[str, Any]], plan_name: str) -> None:
+def verify_captured_di_results(
+    di_results: list[dict[str, Any]],
+    plan_name: str,
+    expected_vm_names: set[str],
+) -> None:
     """Verify DI results captured during migration.
 
     Args:
         di_results (list[dict[str, Any]]): Captured DI data from fixture_store[DI_RESULTS_KEY].
         plan_name (str): Plan name for error context.
+        expected_vm_names (set[str]): Names of VMs the plan migrated; every one must have a captured result.
 
     Raises:
         ValueError: If results are missing or incomplete.
@@ -703,6 +708,13 @@ def verify_captured_di_results(di_results: list[dict[str, Any]], plan_name: str)
     if not di_results:
         raise ValueError(
             f"Plan '{plan_name}': No DI data captured during migration. DI CRs may have been deleted before capture."
+        )
+    captured_vm_names = {entry["vm_name"] for entry in di_results}
+    missing_vm_names = expected_vm_names - captured_vm_names
+    if missing_vm_names:
+        raise ValueError(
+            f"Plan '{plan_name}': DI results missing for VM(s) {sorted(missing_vm_names)}. "
+            f"Captured: {sorted(captured_vm_names)}"
         )
     for entry in di_results:
         _validate_inspection_result(
