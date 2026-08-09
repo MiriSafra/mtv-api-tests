@@ -136,7 +136,7 @@ class TestWarmDIConcernsBlockMigration:
         target_namespace: str,
     ) -> None:
         """Execute migration and verify it fails due to Critical DI concerns."""
-        with pytest.raises(MigrationPlanExecError):
+        with pytest.raises(MigrationPlanExecError, match="PreflightInspection"):
             execute_migration(
                 ocp_admin_client=ocp_admin_client,
                 fixture_store=fixture_store,
