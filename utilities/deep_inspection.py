@@ -751,7 +751,7 @@ def verify_di_concerns_block_migration(
         if vm_status is None:
             raise ValueError(f"VM '{vm_name}' not found in plan migration status")
 
-        pipeline = getattr(vm_status, "pipeline", [])
+        pipeline = getattr(vm_status, "pipeline", None) or []
         di_step = None
         for step in pipeline:
             if getattr(step, "name", "") == "PreflightInspection":
