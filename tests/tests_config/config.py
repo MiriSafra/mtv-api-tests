@@ -842,6 +842,10 @@ tests_params: dict = {
             },
         ],
     },
+    "test_warm_di_concerns": {
+        "virtual_machines": [{"name": "mtv-test-di-concern-bypath-fstab", "source_vm_power": "on"}],
+        "warm_migration": True,
+    },
 }
 
 for _dir in dir():

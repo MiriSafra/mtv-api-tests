@@ -722,3 +722,53 @@ def verify_captured_di_results(
             vm_name=entry["vm_name"],
             context=f"Plan '{plan_name}'",
         )
+
+
+def verify_di_concerns_block_migration(
+    plan_resource: Plan,
+    expected_vm_names: set[str],
+) -> None:
+    """Verify that Critical DI concerns blocked migration for all expected VMs.
+
+    After a migration fails due to Critical concerns, checks that each VM's
+    pipeline has a PreflightInspection step with an error mentioning
+    "critical concerns".
+
+    Args:
+        plan_resource (Plan): The Plan CR (must have completed/failed migration).
+        expected_vm_names (set[str]): VM names expected to be blocked.
+
+    Raises:
+        ValueError: If concerns verification fails for any VM.
+    """
+    vms_status = plan_resource.instance.status.migration.vms
+    for vm_name in expected_vm_names:
+        vm_status = None
+        for vs in vms_status:
+            if getattr(vs, "name", "") == vm_name or getattr(vs, "id", "") == vm_name:
+                vm_status = vs
+                break
+        if vm_status is None:
+            raise ValueError(f"VM '{vm_name}' not found in plan migration status")
+
+        pipeline = getattr(vm_status, "pipeline", [])
+        di_step = None
+        for step in pipeline:
+            if getattr(step, "name", "") == "PreflightInspection":
+                di_step = step
+                break
+        if di_step is None:
+            raise ValueError(f"VM '{vm_name}': PreflightInspection step not found in pipeline")
+
+        step_error = getattr(di_step, "error", None)
+        if not step_error:
+            raise ValueError(f"VM '{vm_name}': PreflightInspection step has no error — concerns did not block")
+
+        error_reasons = getattr(step_error, "reasons", [])
+        concern_blocked = any("critical concerns" in str(r).lower() for r in error_reasons)
+        if not concern_blocked:
+            raise ValueError(
+                f"VM '{vm_name}': PreflightInspection error reasons don't mention critical concerns: {error_reasons}"
+            )
+
+    LOGGER.info(f"All {len(expected_vm_names)} VM(s) blocked by Critical DI concerns as expected")
