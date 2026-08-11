@@ -764,7 +764,7 @@ def verify_di_concerns_block_migration(
         if not step_error:
             raise ValueError(f"VM '{vm_name}': PreflightInspection step has no error — concerns did not block")
 
-        error_reasons = getattr(step_error, "reasons", [])
+        error_reasons = getattr(step_error, "reasons", None) or []
         concern_blocked = any("critical concerns" in str(r).lower() for r in error_reasons)
         if not concern_blocked:
             raise ValueError(
