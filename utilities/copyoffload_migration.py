@@ -58,6 +58,7 @@ _POPULATE_POD_LOGS_CACHE_KEY = "populate_pod_logs"
 _POPULATE_POD_NAME_PREFIX = "populate-"
 # Phases where the vSphere copy-offload scheduler assigns cost=0 to a VM.
 _ZERO_COST_VM_PHASES = frozenset({"CreateVM", "PostHook", "Completed", "Canceled"})
+_DISK_TRANSFER_STEP_NAME = "DiskTransfer"
 
 
 def apply_copyoffload_vm_name_override(
@@ -565,6 +566,29 @@ def wait_for_cloud_init(
             LOGGER.info(f"Leaving VM {vm_name} powered on")
 
 
+def _get_plan_migration_status(plan: Plan) -> Any:
+    """Extract migration status block from Plan CR status.
+
+    Args:
+        plan (Plan): The Plan CR resource.
+
+    Returns:
+        Any: Migration status block from Plan CR (dynamic Kubernetes object).
+
+    Raises:
+        ValueError: If plan has no status or no migration status.
+    """
+    plan_status = plan.instance.status
+    if plan_status is None:
+        raise ValueError(f"Plan '{plan.name}' has no status")
+
+    migration_status = plan_status.migration
+    if migration_status is None:
+        raise ValueError(f"Plan '{plan.name}' has no migration status")
+
+    return migration_status
+
+
 def get_migration_uid(plan: Plan) -> str:
     """Extract the migration UID from a completed Plan's migration history.
 
@@ -580,13 +604,7 @@ def get_migration_uid(plan: Plan) -> str:
     Raises:
         ValueError: If plan status, migration, history, or UID is missing.
     """
-    plan_status = plan.instance.status
-    if plan_status is None:
-        raise ValueError(f"Plan '{plan.name}' has no status")
-
-    migration = plan_status.migration
-    if migration is None:
-        raise ValueError(f"Plan '{plan.name}' has no migration in status")
+    migration = _get_plan_migration_status(plan=plan)
 
     migration_history = migration.history
     if not migration_history:
@@ -887,6 +905,240 @@ def _get_populate_pod_logs(
     return pod_logs
 
 
+def _get_disk_transfer_tasks(plan: Plan) -> list[Any]:
+    """Extract all DiskTransfer tasks from Plan CR migration status.
+
+    Args:
+        plan (Plan): The Plan CR resource with completed migration status.
+
+    Returns:
+        list[Any]: All tasks from DiskTransfer pipeline steps across all VMs.
+
+    Raises:
+        ValueError: If plan has no migration status, no VMs, or no DiskTransfer tasks.
+    """
+    migration_status = _get_plan_migration_status(plan=plan)
+    vms: list[Any] = migration_status.vms or []
+    if not vms:
+        raise ValueError(f"Plan '{plan.name}' has no VMs in migration status")
+
+    tasks: list[Any] = []
+    for vm_status in vms:
+        vm_name = getattr(vm_status, "name", "<unknown>")
+        pipeline = getattr(vm_status, "pipeline", None) or []
+        for step in pipeline:
+            if getattr(step, "name", "") == _DISK_TRANSFER_STEP_NAME:
+                step_tasks: list[Any] = getattr(step, "tasks", None) or []
+                tasks.extend(step_tasks)
+                LOGGER.info(f"VM '{vm_name}': found {len(step_tasks)} DiskTransfer task(s)")
+
+    if not tasks:
+        raise ValueError(f"Plan '{plan.name}' has no DiskTransfer tasks in any VM pipeline")
+    return tasks
+
+
+def _get_xcopy_used_annotation(task: Any, plan_name: str) -> str:
+    """Extract and validate the xcopyUsed annotation from a DiskTransfer task.
+
+    Args:
+        task (Any): A DiskTransfer task object from Plan CR migration status.
+        plan_name (str): Plan name for error context.
+
+    Returns:
+        str: The xcopyUsed annotation value as a string.
+
+    Raises:
+        ValueError: If annotations or xcopyUsed attribute is missing from the task.
+    """
+    task_name = getattr(task, "name", "<unknown>")
+    annotations = getattr(task, "annotations", None)
+    if annotations is None:
+        raise ValueError(f"DiskTransfer task '{task_name}' in Plan '{plan_name}' has no annotations")
+    xcopy_used = getattr(annotations, "xcopyUsed", None)
+    if xcopy_used is None:
+        raise ValueError(f"DiskTransfer task '{task_name}' in Plan '{plan_name}' has no xcopyUsed annotation")
+    return xcopy_used
+
+
+def _verify_disk_transfer_task_count(plan: Plan, expected_task_count: int) -> list[Any]:
+    """Verify Plan DiskTransfer task count matches verified populate pod count.
+
+    Args:
+        plan (Plan): The Plan CR resource with completed migration status.
+        expected_task_count (int): Number of populate pods verified from logs.
+
+    Returns:
+        list[Any]: DiskTransfer tasks from Plan CR migration status.
+
+    Raises:
+        ValueError: If task count differs from expected_task_count or tasks are missing.
+    """
+    tasks = _get_disk_transfer_tasks(plan=plan)
+    if len(tasks) != expected_task_count:
+        raise ValueError(
+            f"Plan '{plan.name}' has {len(tasks)} DiskTransfer task(s) but {expected_task_count} populate pod(s) were verified"
+        )
+    return tasks
+
+
+def _verify_xcopy_plan_annotations(
+    plan: Plan,
+    expected_xcopy_used: bool,
+    expected_task_count: int,
+) -> None:
+    """Verify xcopyUsed annotations on Plan CR DiskTransfer tasks.
+
+    After copy-offload migrations, Forklift propagates xcopyUsed from populate pods
+    to Plan CR task annotations. This cross-verifies the Plan CR against expected values.
+
+    Args:
+        plan (Plan): The Plan CR resource with completed migration status.
+        expected_xcopy_used (bool): Expected XCOPY usage (True -> xcopyUsed="1", False -> xcopyUsed="0").
+        expected_task_count (int): Number of populate pods verified from logs; must match
+            DiskTransfer task count on the Plan.
+
+    Raises:
+        ValueError: If DiskTransfer task count differs from expected_task_count, tasks are
+            missing, or annotations are missing.
+        AssertionError: If any task's xcopyUsed annotation doesn't match expected.
+    """
+    tasks = _verify_disk_transfer_task_count(plan=plan, expected_task_count=expected_task_count)
+    expected_str = "1" if expected_xcopy_used else "0"
+
+    LOGGER.info(
+        f"Verifying xcopyUsed Plan CR annotations: expecting '{expected_str}' on {len(tasks)} DiskTransfer task(s)"
+    )
+
+    for task in tasks:
+        task_name = getattr(task, "name", "<unknown>")
+        actual = _get_xcopy_used_annotation(task=task, plan_name=plan.name)
+        LOGGER.info(f"Plan annotation: task '{task_name}' xcopyUsed={actual} (expected={expected_str})")
+        assert actual == expected_str, (
+            f"Plan '{plan.name}' DiskTransfer task '{task_name}': "
+            f"expected xcopyUsed='{expected_str}', got xcopyUsed='{actual}'"
+        )
+
+    LOGGER.info(
+        f"Plan CR annotation verification passed: all {len(tasks)} DiskTransfer task(s) have xcopyUsed='{expected_str}'"
+    )
+
+
+def _parse_datastore_name_from_task_name(task_name: str) -> str:
+    """Extract the datastore display name from a DiskTransfer task name.
+
+    Task names contain the datastore name in brackets at the start, e.g.:
+    ``[eco-iscsi-ds3] auto-w5jd-xcopy-template/disk.vmdk``
+
+    Args:
+        task_name (str): DiskTransfer task name from Plan CR.
+
+    Returns:
+        str: Datastore display name extracted from brackets.
+
+    Raises:
+        ValueError: If task name is missing, empty, not a string, or does not contain
+            a bracketed datastore name.
+    """
+    if not isinstance(task_name, str) or not task_name:
+        raise ValueError(f"Cannot parse datastore name from DiskTransfer task name: '{task_name}'")
+    match = re.match(r"\[([^\]]+)\]", task_name)
+    if not match:
+        raise ValueError(f"Cannot parse datastore name from DiskTransfer task name: '{task_name}'")
+    return match.group(1)
+
+
+def _build_expected_by_display_name(
+    expected_xcopy_by_datastore_id: dict[str, bool],
+    datastore_names_by_id: dict[str, str],
+) -> dict[str, bool]:
+    """Build per-display-name XCOPY expectations from MoRef ID mappings.
+
+    Args:
+        expected_xcopy_by_datastore_id (dict[str, bool]): Maps each datastore MoRef ID to
+            whether XCOPY is expected.
+        datastore_names_by_id (dict[str, str]): Maps each MoRef ID to its vSphere display name.
+
+    Returns:
+        dict[str, bool]: Maps each datastore display name to expected XCOPY usage.
+
+    Raises:
+        ValueError: If duplicate display names map to different datastore IDs.
+    """
+    expected_by_display_name: dict[str, bool] = {}
+    for ds_id, display_name in datastore_names_by_id.items():
+        if display_name in expected_by_display_name:
+            matching_ids: list[str] = [
+                datastore_id for datastore_id, name in datastore_names_by_id.items() if name == display_name
+            ]
+            raise ValueError(f"Datastore display name '{display_name}' matches multiple configured IDs: {matching_ids}")
+        expected_by_display_name[display_name] = expected_xcopy_by_datastore_id[ds_id]
+    return expected_by_display_name
+
+
+def _verify_xcopy_plan_annotations_per_datastore(
+    plan: Plan,
+    expected_xcopy_by_datastore_id: dict[str, bool],
+    datastore_names_by_id: dict[str, str],
+    expected_task_count: int,
+) -> None:
+    """Verify per-datastore xcopyUsed annotations on Plan CR DiskTransfer tasks.
+
+    Cross-verifies Plan CR task annotations against per-datastore expected values.
+    Parses the datastore display name from each task name and maps it back to the
+    expected xcopyUsed value.
+
+    Args:
+        plan (Plan): The Plan CR resource with completed migration status.
+        expected_xcopy_by_datastore_id (dict[str, bool]): Maps each datastore MoRef ID to
+            whether XCOPY is expected (True -> xcopyUsed="1", False -> xcopyUsed="0").
+        datastore_names_by_id (dict[str, str]): Maps each MoRef ID to its vSphere display
+            name for correlating task names.
+        expected_task_count (int): Number of populate pods verified from logs; must match
+            DiskTransfer task count on the Plan.
+
+    Raises:
+        ValueError: If DiskTransfer task count differs from expected_task_count, tasks are
+            missing, annotations are missing, display names are duplicated, or a task's
+            datastore cannot be matched.
+        AssertionError: If any task's xcopyUsed annotation doesn't match its datastore
+            expectation.
+    """
+    expected_by_display_name = _build_expected_by_display_name(
+        expected_xcopy_by_datastore_id=expected_xcopy_by_datastore_id,
+        datastore_names_by_id=datastore_names_by_id,
+    )
+    tasks = _verify_disk_transfer_task_count(plan=plan, expected_task_count=expected_task_count)
+
+    LOGGER.info(f"Verifying per-datastore xcopyUsed Plan CR annotations on {len(tasks)} DiskTransfer task(s)")
+
+    for task in tasks:
+        task_name = getattr(task, "name", "<unknown>")
+        datastore_name = _parse_datastore_name_from_task_name(task_name=task_name)
+
+        if datastore_name not in expected_by_display_name:
+            raise ValueError(
+                f"Datastore '{datastore_name}' from task '{task_name}' not found in "
+                f"configured datastores: {sorted(expected_by_display_name)}"
+            )
+
+        expected_xcopy = expected_by_display_name[datastore_name]
+        expected_str = "1" if expected_xcopy else "0"
+
+        actual = _get_xcopy_used_annotation(task=task, plan_name=plan.name)
+
+        LOGGER.info(
+            f"Plan annotation: task '{task_name}' (datastore '{datastore_name}') "
+            f"xcopyUsed={actual} (expected={expected_str})"
+        )
+        assert actual == expected_str, (
+            f"Plan '{plan.name}' DiskTransfer task '{task_name}' "
+            f"(datastore '{datastore_name}'): expected xcopyUsed='{expected_str}', "
+            f"got xcopyUsed='{actual}'"
+        )
+
+    LOGGER.info(f"Plan CR per-datastore annotation verification passed for all {len(tasks)} DiskTransfer task(s)")
+
+
 def verify_xcopy_used(
     ocp_admin_client: DynamicClient,
     plan: Plan,
@@ -896,12 +1148,14 @@ def verify_xcopy_used(
 ) -> None:
     """Verify xcopyUsed matches expected value for all disks in a copy-offload migration.
 
-    Checks populate pod logs to verify XCOPY usage. Uses cached logs from fixture_store
-    if available (captured during migration), otherwise queries live pods.
+    Verifies XCOPY usage via both populate pod logs and Plan CR task annotations.
+    Uses cached logs from fixture_store if available (captured during migration),
+    otherwise queries live pods.
 
     Args:
         ocp_admin_client (DynamicClient): OpenShift admin client for API interactions.
-        plan (Plan): The Plan CR resource (used to find the migration UID).
+        plan (Plan): The Plan CR resource (used to find the migration UID and
+            task annotations).
         target_namespace (str): Namespace where populate pods exist.
         expected_xcopy_used (bool): Expected xcopyUsed value.
             True (xcopyUsed=1) for XCOPY-capable datastores.
@@ -909,7 +1163,8 @@ def verify_xcopy_used(
         fixture_store (dict[str, Any]): Fixture store containing cached populate pod logs.
 
     Raises:
-        ValueError: If no populate pods found or xcopyUsed not found in pod logs.
+        ValueError: If no populate pods found, xcopyUsed not found in pod logs,
+            or Plan CR task annotations are missing.
         AssertionError: If any disk's xcopyUsed value doesn't match expected.
     """
     migration_uid: str = get_migration_uid(plan=plan)
@@ -943,6 +1198,12 @@ def verify_xcopy_used(
             f"Pod '{pod_log['pod_name']}' (PVC '{pod_log['pvc_name']}'): expected xcopyUsed={expected_value}, "
             f"got xcopyUsed={xcopy_used}; log: {xcopy_log_line}"
         )
+
+    _verify_xcopy_plan_annotations(
+        plan=plan,
+        expected_xcopy_used=expected_xcopy_used,
+        expected_task_count=len(pod_logs),
+    )
 
 
 def _resolve_datastore_id_from_display_name(
@@ -994,12 +1255,14 @@ def verify_xcopy_used_per_datastore(
     behavior (e.g. mixed XCOPY-capable and fallback datastores). Provider configuration
     supplies MoRef IDs and expected values; populate pod logs use datastore display names.
 
-    Checks populate pod logs to verify per-datastore XCOPY usage. Uses cached logs from
-    fixture_store if available (captured during migration), otherwise queries live pods.
+    Cross-verifies XCOPY usage via both populate pod logs and Plan CR task annotations
+    per datastore. Uses cached logs from fixture_store if available (captured during
+    migration), otherwise queries live pods.
 
     Args:
         ocp_admin_client (DynamicClient): OpenShift admin client for API interactions.
-        plan (Plan): The Plan CR resource (used to find the migration UID).
+        plan (Plan): The Plan CR resource (used to find the migration UID and
+            task annotations).
         target_namespace (str): Namespace where populate pods exist.
         expected_xcopy_by_datastore_id (dict[str, bool]): Maps each datastore MoRef ID to
             whether XCOPY is expected (True → xcopyUsed=1, False → xcopyUsed=0).
@@ -1012,8 +1275,8 @@ def verify_xcopy_used_per_datastore(
             share a datastore and you only need per-pod verification.
 
     Raises:
-        ValueError: If mappings are invalid, populate pods are missing, or a log datastore
-            cannot be matched.
+        ValueError: If mappings are invalid, populate pods are missing, a log datastore
+            cannot be matched, or Plan CR task annotations are missing.
         AssertionError: If any disk's xcopyUsed value does not match its datastore expectation.
     """
     if set(expected_xcopy_by_datastore_id.keys()) != set(datastore_names_by_id.keys()):
@@ -1078,6 +1341,13 @@ def verify_xcopy_used_per_datastore(
             "Migration must include at least one disk from each configured datastore; "
             f"verified datastore IDs: {sorted(verified_datastore_ids)}"
         )
+
+    _verify_xcopy_plan_annotations_per_datastore(
+        plan=plan,
+        expected_xcopy_by_datastore_id=expected_xcopy_by_datastore_id,
+        datastore_names_by_id=datastore_names_by_id,
+        expected_task_count=len(pod_logs),
+    )
 
 
 def _count_active_populator_pods_by_host(
