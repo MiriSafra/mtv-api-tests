@@ -329,7 +329,9 @@ def pytest_collection_modifyitems(session, config, items):
             if source_provider_type != Provider.ProviderType.VSPHERE:
                 vsphere_only_skip = pytest.mark.skip(reason="Test is only applicable to vSphere source providers")
                 for item in items:
-                    if any(kw in item.keywords for kw in ("copyoffload", "shared_disk", "deep_inspection", "aap")):
+                    if any(
+                        kw in item.keywords for kw in ("copyoffload", "shared_disk", "deep_inspection", "aap", "luks")
+                    ):
                         item.add_marker(vsphere_only_skip)
 
             # Skip CA cert tests for providers that don't use CA certificates.
