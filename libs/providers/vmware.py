@@ -989,15 +989,14 @@ class VMWareProvider(BaseProvider):
             return backing.deviceName
         return ""
 
-    def clone_secondary_nic(self, vm: vim.VirtualMachine, connected: bool) -> str | None:
-        """Clone the VM's existing secondary-network NIC onto a new NIC and return its MAC.
+    def add_nic(self, vm: vim.VirtualMachine, connected: bool) -> str | None:
+        """Add a NIC to the VM by duplicating an existing secondary NIC, and return its MAC.
 
-        This does not attach to an arbitrary network: it duplicates the backing of the
-        first existing NIC that is not on the pod network, so the new NIC lands on the
-        same secondary (migratable) network. Copying an existing backing guarantees a
-        valid, migratable network reference — building one for a network the VM is not
-        already attached to is not reliable here. That dependency is why this needs an
-        existing NIC to copy from, hence the name (not a generic ``add_nic``).
+        Rather than building a network reference from scratch (which requires a valid DVS
+        portgroupKey/switchUuid or standard network ref), this duplicates the backing of
+        the first existing NIC that is not on the pod network. That guarantees the new NIC
+        lands on a valid, migratable secondary network. This is why the function requires
+        an existing secondary NIC to copy from.
 
         Returns None if the VM has no NIC on a secondary network to copy.
 

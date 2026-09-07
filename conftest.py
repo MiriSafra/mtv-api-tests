@@ -1300,7 +1300,7 @@ def prepared_plan(
                         for dev in provider_vm_api.config.hardware.device
                         if isinstance(dev, vim.vm.device.VirtualEthernetCard)
                     )
-                    mac = source_provider.clone_secondary_nic(provider_vm_api, connected=connected)
+                    mac = source_provider.add_nic(provider_vm_api, connected=connected)
                     if mac is not None:
                         vm["disconnected_nic_mac" if not connected else "connected_nic_mac"] = mac
                         added_nic_expected_counts[vm["name"]] = nic_count_before + 1
