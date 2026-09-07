@@ -989,11 +989,17 @@ class VMWareProvider(BaseProvider):
             return backing.deviceName
         return ""
 
-    def add_nic(self, vm: vim.VirtualMachine, connected: bool) -> str | None:
-        """Add a NIC to the VM on a secondary network and return its MAC address.
+    def clone_secondary_nic(self, vm: vim.VirtualMachine, connected: bool) -> str | None:
+        """Clone the VM's existing secondary-network NIC onto a new NIC and return its MAC.
 
-        The NIC is added on the same network as the first existing NIC not on the pod
-        network. Returns None if the VM has no secondary network available.
+        This does not attach to an arbitrary network: it duplicates the backing of the
+        first existing NIC that is not on the pod network, so the new NIC lands on the
+        same secondary (migratable) network. Copying an existing backing guarantees a
+        valid, migratable network reference — building one for a network the VM is not
+        already attached to is not reliable here. That dependency is why this needs an
+        existing NIC to copy from, hence the name (not a generic ``add_nic``).
+
+        Returns None if the VM has no NIC on a secondary network to copy.
 
         This reconfigures the VM's hardware after it was already synced to the Forklift
         inventory, so the caller must force an inventory refresh and wait for the new NIC
@@ -1007,13 +1013,14 @@ class VMWareProvider(BaseProvider):
 
         Returns:
             str | None: MAC address VMware assigned to the new NIC (lowercase), or None
-                if the VM has no secondary network to attach the NIC to.
+                if the VM has no secondary-network NIC to copy.
 
         Raises:
             ValueError: If the VM has no NICs, the secondary NIC has an unsupported
                 backing type, or the reconfig task fails.
         """
-        # Network selection: pick the first NIC not on the pod network to clone the NIC onto.
+        # Baseline: the pod network is taken from the first NIC, so we need at least one NIC.
+        # (existing_nics[0] below would IndexError otherwise.)
         existing_nics = [dev for dev in vm.config.hardware.device if isinstance(dev, vim.vm.device.VirtualEthernetCard)]
         if not existing_nics:
             raise ValueError(f"VM '{vm.name}' has no existing NICs")
@@ -1027,7 +1034,7 @@ class VMWareProvider(BaseProvider):
         )
 
         if secondary_nic is None:
-            LOGGER.info(f"VM '{vm.name}' has no NIC on a secondary network — skipping add_nic setup")
+            LOGGER.info(f"VM '{vm.name}' has no NIC on a secondary network — skipping secondary NIC clone")
             return None
 
         # Backing construction: replicate the secondary NIC's backing (distributed or standard).

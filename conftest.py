@@ -1288,11 +1288,11 @@ def prepared_plan(
                 # Store complete source VM data separately (keeps virtual_machines clean for Plan CR serialization)
                 plan["source_vms_data"][vm["name"]] = source_vm_details
 
-                # Add a NIC to the cloned VM. This reconfigures the VM's hardware AFTER it was
-                # already synced to the Forklift inventory during cloning, so the inventory is now
-                # stale (missing the new NIC). A forced refresh + NIC-count wait runs after the loop
-                # (see wait_for_added_nics_in_forklift_inventory) to guarantee NetworkMap creation
-                # sees the added NIC — otherwise Forklift drops it during VM creation.
+                # Clone the VM's secondary-network NIC onto a new NIC. This reconfigures the VM's
+                # hardware AFTER it was already synced to the Forklift inventory during cloning, so the
+                # inventory is now stale (missing the new NIC). A forced refresh + NIC-count wait runs
+                # after the loop (see wait_for_added_nics_in_forklift_inventory) to guarantee NetworkMap
+                # creation sees the added NIC — otherwise Forklift drops it during VM creation.
                 if vm.get("add_nic"):
                     connected: bool = vm["add_nic_start_connected"]
                     nic_count_before = sum(
@@ -1300,7 +1300,7 @@ def prepared_plan(
                         for dev in provider_vm_api.config.hardware.device
                         if isinstance(dev, vim.vm.device.VirtualEthernetCard)
                     )
-                    mac = source_provider.add_nic(provider_vm_api, connected=connected)
+                    mac = source_provider.clone_secondary_nic(provider_vm_api, connected=connected)
                     if mac is not None:
                         vm["disconnected_nic_mac" if not connected else "connected_nic_mac"] = mac
                         added_nic_expected_counts[vm["name"]] = nic_count_before + 1
