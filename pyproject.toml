@@ -27,7 +27,7 @@ dev = ["ipdb>=0.13.13", "ipython>=8.12.3", "python-jenkins>=1.8.2"]
 [project]
 requires-python = ">=3.12, <3.14"
 name = "mtv-api-tests"
-version = "2.12.0"
+version = "5.0.0"
 description = "MTV API Tests"
 authors = []
 license = "Apache-2.0"
