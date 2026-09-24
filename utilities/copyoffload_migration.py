@@ -1739,13 +1739,16 @@ def resolve_non_dedicated_esxi_host(
     dedicated_hosts = set(get_configured_dedicated_hosts(source_provider_data))
     hosts = source_provider_inventory.hosts
     total_hosts = len(hosts)
+    # Only count configured dedicated hosts that actually exist in inventory — a stale/typo'd
+    # host ID must not be able to mask an otherwise-available non-dedicated host.
+    present_dedicated_hosts = dedicated_hosts & {host.get("id") for host in hosts}
 
-    if total_hosts <= len(dedicated_hosts):
+    if total_hosts <= len(present_dedicated_hosts):
         raise ValueError(
-            f"Provider inventory has only {total_hosts} ESXi host(s), but {len(dedicated_hosts)} are "
-            f"configured as dedicated ({sorted(dedicated_hosts)}) — no non-dedicated host can exist. "
-            "This test needs at least one non-dedicated host to pin VMs to. Use a lab with more ESXi "
-            "hosts or reduce dedicated_migration_hosts."
+            f"Provider inventory has only {total_hosts} ESXi host(s), but {len(present_dedicated_hosts)} are "
+            f"configured as dedicated and present in inventory ({sorted(present_dedicated_hosts)}) — no "
+            "non-dedicated host can exist. This test needs at least one non-dedicated host to pin VMs to. "
+            "Use a lab with more ESXi hosts or reduce dedicated_migration_hosts."
         )
 
     for host in hosts:
