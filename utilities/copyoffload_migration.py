@@ -1686,13 +1686,19 @@ def get_configured_dedicated_hosts(source_provider_data: dict[str, Any]) -> list
         list[str]: Configured ESXi host MoRef IDs for dedicated migration hosts.
 
     Raises:
-        ValueError: If dedicated_migration_hosts is missing or empty in the copyoffload config.
+        ValueError: If dedicated_migration_hosts is missing, empty, or not a list of non-empty
+            strings in the copyoffload config.
     """
     dedicated_hosts = source_provider_data["copyoffload"].get("dedicated_migration_hosts")
     if not dedicated_hosts:
         raise ValueError(
             "dedicated_migration_hosts is required in the copyoffload section of provider config "
             "for dedicated migration host tests (e.g. ['host-3078'])."
+        )
+    if not isinstance(dedicated_hosts, list) or not all(isinstance(host, str) and host for host in dedicated_hosts):
+        raise ValueError(
+            "dedicated_migration_hosts must be a non-empty list of ESXi host MoRef ID strings "
+            f"(e.g. ['host-3078']), got: {dedicated_hosts!r}"
         )
     return dedicated_hosts
 
@@ -1815,8 +1821,9 @@ def verify_dedicated_migration_host(
         fixture_store=fixture_store,
     )
     observed_hosts = _verify_source_host_labels_against_allowed_set(pod_logs=pod_logs, allowed_hosts=dedicated_hosts)
+    distinct_dedicated_hosts = set(dedicated_hosts)
 
-    if len(dedicated_hosts) == 1:
+    if len(distinct_dedicated_hosts) == 1:
         # With one dedicated host, every disk shares its throttle budget — same sequence
         # (labels, throttled events, peak concurrency) as the non-dedicated-host throttling
         # test, so delegate to it instead of re-implementing it here. _get_populate_pod_logs
@@ -1836,10 +1843,10 @@ def verify_dedicated_migration_host(
             max_concurrent_by_host=max_concurrent_by_host,
             max_populator_inflight=max_populator_inflight,
         )
-        if len(observed_hosts) < len(dedicated_hosts):
+        if len(observed_hosts) < len(distinct_dedicated_hosts):
             LOGGER.warning(
-                f"Configured {len(dedicated_hosts)} dedicated hosts {sorted(set(dedicated_hosts))} but only "
-                f"{len(observed_hosts)} distinct host(s) were observed executing XCOPY: {sorted(observed_hosts)}. "
+                f"Configured {len(distinct_dedicated_hosts)} dedicated hosts {sorted(distinct_dedicated_hosts)} but "
+                f"only {len(observed_hosts)} distinct host(s) were observed executing XCOPY: {sorted(observed_hosts)}. "
                 "Host selection is random per disk; re-run with more disks for stronger distribution coverage."
             )
 
