@@ -3964,7 +3964,8 @@ class CopyoffloadDedicatedMigrationHostBase:
             target_namespace (str): Namespace where populate pods and PVCs exist.
             fixture_store (dict[str, Any]): Fixture store containing cached populate pod logs.
             configured_dedicated_hosts (list[str]): Configured dedicatedMigrationHosts.
-            prepared_plan (dict[str, Any]): Plan configuration with the populator limit.
+            prepared_plan (dict[str, Any]): Plan configuration with the populator limit and
+                shared-host contention requirement.
         """
         verify_dedicated_migration_host(
             ocp_admin_client=ocp_admin_client,
@@ -3974,6 +3975,7 @@ class CopyoffloadDedicatedMigrationHostBase:
             max_concurrent_by_host=self.max_concurrent_by_host,
             fixture_store=fixture_store,
             max_populator_inflight=prepared_plan.get("populator_inflight_limit", POPULATOR_INFLIGHT_LIMIT),
+            require_cross_source_contention=prepared_plan.get("require_cross_source_contention", False),
         )
 
     def test_check_xcopy_used(
