@@ -1456,20 +1456,20 @@ def _count_active_populator_pods_by_host(
     return dict(counts)
 
 
-def _as_utc_datetime(value: Any) -> datetime | None:
+def _as_utc_datetime(timestamp_value: Any) -> datetime | None:
     """Parse a Kubernetes timestamp value into an aware UTC datetime.
 
     Args:
-        value (Any): Datetime or ISO-8601 timestamp string from the Kubernetes API.
+        timestamp_value (Any): Datetime or ISO-8601 timestamp string from the Kubernetes API.
 
     Returns:
         datetime | None: The parsed UTC timestamp, or None for an unsupported or invalid value.
     """
-    if isinstance(value, datetime):
-        timestamp = value
-    elif isinstance(value, str) and value:
+    if isinstance(timestamp_value, datetime):
+        timestamp = timestamp_value
+    elif isinstance(timestamp_value, str) and timestamp_value:
         try:
-            timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            timestamp = datetime.fromisoformat(timestamp_value.replace("Z", "+00:00"))
         except ValueError:
             return None
     else:
@@ -1488,14 +1488,14 @@ def _event_timestamp(event: Any) -> datetime | None:
     """
     series = event.get("series") or {}
     metadata = event.get("metadata") or {}
-    for value in (
+    for candidate_timestamp in (
         series.get("lastObservedTime"),
         event.get("lastTimestamp"),
         event.get("eventTime"),
         event.get("firstTimestamp"),
         metadata.get("creationTimestamp"),
     ):
-        timestamp = _as_utc_datetime(value)
+        timestamp = _as_utc_datetime(candidate_timestamp)
         if timestamp is not None:
             return timestamp
     return None
@@ -1611,11 +1611,9 @@ def _cross_source_host_contention_observed(
         for throttled_source_host, event_time in throttled_sources_by_runtime_host.get(runtime_host, []):
             if throttled_source_host != active_source_host and event_time >= started_at:
                 LOGGER.info(
-                    "Observed cross-source-host populator contention on runtime host '%s': "
-                    "source host '%s' had a Running worker while source host '%s' was throttled",
-                    runtime_host,
-                    active_source_host,
-                    throttled_source_host,
+                    f"Observed cross-source-host populator contention on runtime host '{runtime_host}': "
+                    f"source host '{active_source_host}' had a Running worker while source host "
+                    f"'{throttled_source_host}' was throttled"
                 )
                 return True
     return False
