@@ -32,6 +32,23 @@ def get_worker_nodes(ocp_client: DynamicClient) -> list[str]:
     ]
 
 
+def get_session_unique_label_key(label_key: str, session_uuid: str) -> str:
+    """Append a session identifier to a Kubernetes label key without exceeding 63 characters.
+
+    Args:
+        label_key (str): Label key to make unique within the test session.
+        session_uuid (str): Unique pytest session identifier.
+
+    Returns:
+        str: Session-specific label key.
+    """
+    suffix = f"-{session_uuid}"
+    if "/" in label_key:
+        prefix, name = label_key.split("/", 1)
+        return f"{prefix}/{name[: 63 - len(suffix)]}{suffix}"
+    return f"{label_key[: 63 - len(suffix)]}{suffix}"
+
+
 def _query_prometheus_safe(prometheus: Prometheus, query: str, metric_name: str) -> list[dict[str, Any]]:
     """Query Prometheus and return result list, or [] on failure.
 

@@ -25,6 +25,29 @@ tests_params: dict = {
         "warm_migration": True,
         "preserve_static_ips": True,
     },
+    "test_warm_convertor_node_selector_pending": {
+        "virtual_machines": [
+            {
+                "name": "mtv-tests-rhel8",
+                "source_vm_power": "on",
+                "guest_agent": True,
+            },
+        ],
+        "warm_migration": True,
+        "vm_target_namespace": f"mtv-vms-warm-selector-pending-{uuid.uuid4().hex[:6]}",
+        "convertor_node_selector": {"mtv-warm-test": None},
+    },
+    "test_warm_convertor_node_selector_default": {
+        "virtual_machines": [
+            {
+                "name": "mtv-tests-rhel8",
+                "source_vm_power": "on",
+                "guest_agent": True,
+            },
+        ],
+        "warm_migration": True,
+        "vm_target_namespace": f"mtv-vms-warm-selector-default-{uuid.uuid4().hex[:6]}",
+    },
     "test_mtv_migration_warm_2disks2nics": {
         "virtual_machines": [
             {

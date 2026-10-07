@@ -213,6 +213,7 @@ def create_plan_resource(
     xfs_compatibility: bool = False,
     run_preflight_inspection: bool | None = None,
     rdm_as_lun: bool | None = None,
+    convertor_node_selector: dict[str, str] | None = None,
 ) -> Plan:
     """Create MTV Plan CR resource.
 
@@ -253,6 +254,8 @@ def create_plan_resource(
             Defaults to None (forklift default: True).
         rdm_as_lun (bool | None): Whether to map RDM disks as LUN devices with SCSI bus
             on the target VM. Only applies to vSphere source providers. Defaults to None.
+        convertor_node_selector (dict[str, str] | None): Optional node selector for virt-v2v conversion pods and
+            vSphere warm VDDK CDI importer pods. Defaults to None.
 
     Returns:
         Plan: The created Plan CR resource.
@@ -325,6 +328,9 @@ def create_plan_resource(
     if rdm_as_lun is not None:
         plan_kwargs["rdm_as_lun"] = rdm_as_lun
 
+    if convertor_node_selector is not None:
+        plan_kwargs["convertor_node_selector"] = convertor_node_selector
+
     # Add copy-offload specific parameters if enabled
     if copyoffload:
         # Set PVC naming template for copy-offload migrations
@@ -349,6 +355,36 @@ def create_plan_resource(
         raise
 
     return plan
+
+
+def create_migration_resource(
+    ocp_admin_client: DynamicClient,
+    fixture_store: dict[str, Any],
+    plan: Plan,
+    target_namespace: str,
+    cut_over: datetime | None = None,
+) -> Migration:
+    """Create a Migration CR for a Plan without waiting for completion.
+
+    Args:
+        ocp_admin_client (DynamicClient): OpenShift admin client for API interactions.
+        fixture_store (dict[str, Any]): Fixture store for resource tracking and cleanup.
+        plan (Plan): The Plan CR resource defining the migration configuration.
+        target_namespace (str): Namespace for the Migration CR.
+        cut_over (datetime | None): Cut-over datetime for warm migration. Defaults to None.
+
+    Returns:
+        Migration: The created Migration CR resource.
+    """
+    return create_and_store_resource(
+        client=ocp_admin_client,
+        fixture_store=fixture_store,
+        resource=Migration,
+        namespace=target_namespace,
+        plan_name=plan.name,
+        plan_namespace=plan.namespace,
+        cut_over=cut_over,
+    )
 
 
 def execute_migration(
@@ -379,13 +415,11 @@ def execute_migration(
     Raises:
         MigrationPlanExecError: If migration fails or times out.
     """
-    create_and_store_resource(
-        client=ocp_admin_client,
+    create_migration_resource(
+        ocp_admin_client=ocp_admin_client,
         fixture_store=fixture_store,
-        resource=Migration,
-        namespace=target_namespace,
-        plan_name=plan.name,
-        plan_namespace=plan.namespace,
+        plan=plan,
+        target_namespace=target_namespace,
         cut_over=cut_over,
     )
 

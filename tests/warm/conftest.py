@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from ocp_resources.cluster_role import ClusterRole
 from ocp_resources.cluster_role_binding import ClusterRoleBinding
+from ocp_resources.node import Node
 from ocp_resources.provider import Provider
 from ocp_resources.role_binding import RoleBinding
 from ocp_resources.secret import Secret
@@ -15,11 +16,102 @@ from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from libs.providers.openshift import OCPProvider
 from utilities.resources import create_and_store_resource
+from utilities.worker_node_selection import (
+    get_session_unique_label_key,
+    get_worker_nodes,
+)
 
 if TYPE_CHECKING:
     from kubernetes.dynamic import DynamicClient
 
 FORKLIFT_MIGRATOR_ROLE_NAME = "forklift-migrator-role"
+
+
+@pytest.fixture(scope="class")
+def convertor_node_selector(
+    prepared_plan: dict[str, Any],
+    fixture_store: dict[str, Any],
+) -> dict[str, str] | None:
+    """Resolve an optional Plan selector to a unique label for this test session.
+
+    Args:
+        prepared_plan (dict[str, Any]): Prepared migration plan configuration.
+        fixture_store (dict[str, Any]): Fixture store containing the unique session ID.
+
+    Returns:
+        dict[str, str] | None: Unique selector for the pending scenario, or None for the default scenario.
+
+    Raises:
+        ValueError: If the configured selector does not contain exactly one label.
+    """
+    configured_selector = prepared_plan.get("convertor_node_selector")
+    if configured_selector is None:
+        return None
+
+    if len(configured_selector) != 1:
+        raise ValueError(f"convertor_node_selector must contain exactly one label, got {len(configured_selector)}")
+
+    base_label_key, configured_value = next(iter(configured_selector.items()))
+    session_uuid: str = fixture_store["session_uuid"]
+    label_key = get_session_unique_label_key(label_key=base_label_key, session_uuid=session_uuid)
+    label_value = session_uuid if configured_value is None else configured_value
+    return {label_key: label_value}
+
+
+@pytest.fixture(scope="class")
+def convertor_worker_nodes(
+    convertor_node_selector: dict[str, str] | None,
+    ocp_admin_client: "DynamicClient",
+) -> list[Node] | None:
+    """List ready, schedulable workers for selector recovery.
+
+    Args:
+        convertor_node_selector (dict[str, str] | None): Selector configured for this scenario.
+        ocp_admin_client (DynamicClient): OpenShift admin client.
+
+    Returns:
+        list[Node] | None: Eligible worker nodes, or None for the default scenario.
+
+    Raises:
+        ValueError: If no eligible worker exists or the selector already matches a node.
+    """
+    if convertor_node_selector is None:
+        return None
+
+    nodes = list(Node.get(client=ocp_admin_client))
+    matching_nodes = [
+        node.name
+        for node in nodes
+        if all((node.labels or {}).get(key) == value for key, value in convertor_node_selector.items())
+    ]
+    if matching_nodes:
+        raise ValueError(
+            f"The pending scenario requires no node to match convertor_node_selector; matching nodes: {matching_nodes}"
+        )
+
+    worker_node_names = set(get_worker_nodes(ocp_client=ocp_admin_client))
+    schedulable_worker_nodes: list[Node] = []
+    for node in nodes:
+        if node.name not in worker_node_names:
+            continue
+
+        status = node.instance.get("status", {})
+        is_ready = any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in status.get("conditions") or []
+        )
+        is_schedulable = not node.instance.get("spec", {}).get("unschedulable", False)
+        has_blocking_taint = any(
+            taint.get("effect") in {"NoSchedule", "NoExecute"}
+            for taint in node.instance.get("spec", {}).get("taints") or []
+        )
+        if is_ready and is_schedulable and not has_blocking_taint:
+            schedulable_worker_nodes.append(node)
+
+    if not schedulable_worker_nodes:
+        raise ValueError("No Ready, schedulable, untainted worker node is available for selector recovery")
+
+    return schedulable_worker_nodes
 
 
 @pytest.fixture(scope="session")
