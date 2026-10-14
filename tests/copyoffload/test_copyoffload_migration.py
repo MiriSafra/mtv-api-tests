@@ -4126,9 +4126,9 @@ class TestCopyoffloadDedicatedHostSharedPopulatorLimit(CopyoffloadDedicatedMigra
            argument, and logs identify the dedicated host. Prefer throttleHost when
            present; otherwise use --migration-host (the current controller may write the
            runtime host to sourceHost). Monitor Pending and Running pods per runtime host
-           and verify the observed peak never exceeds 1. Also require a throttled PVC from
-           one source host while another source host has a Running worker on that runtime
-           host; no fixed event count is required.
+           and verify the observed peak never exceeds 1. Also require a throttled PVC
+           Event's reported range from one source host to overlap another source host's
+           worker interval on that runtime host; no fixed event count is required.
         4. Confirm all disks used XCOPY and both migrated VMs pass connectivity and
            disk-count checks. Remove migration resources, destination VMs and PVCs,
            disposable source clones, generated secrets and network attachments, and
