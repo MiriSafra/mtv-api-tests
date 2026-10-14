@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import bdb
+import json
 import logging
 import os
 import pickle
@@ -10,6 +10,7 @@ import tempfile
 import uuid
 from collections.abc import Generator
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 from shutil import rmtree
 from typing import TYPE_CHECKING, Any
@@ -44,17 +45,18 @@ from exceptions.exceptions import (
     MtvOperatorNotInstalledError,
     RemoteClusterAndLocalCluterNamesError,
 )
+from libs.base_provider import BaseProvider, supports_add_nic
+from libs.forklift_inventory import ForkliftInventory, create_forklift_inventory
+from libs.providers.openshift import OCPProvider
+from libs.providers.vmware import VMWareProvider
+from utilities.constants import MTV_OPERATOR_NAME
 from utilities.copyoffload_constants import FORKLIFT_CONTROLLER_NAME
 from utilities.copyoffload_migration import (
     apply_copyoffload_vm_name_override,
     resolve_dedicated_esxi_host,
     resolve_non_dedicated_esxi_host,
 )
-from libs.base_provider import BaseProvider, supports_add_nic
-from libs.forklift_inventory import ForkliftInventory, create_forklift_inventory
-from libs.providers.openshift import OCPProvider
-from libs.providers.vmware import VMWareProvider
-from utilities.constants import MTV_OPERATOR_NAME
+from utilities.debug import remote_debugger_enabled, remote_post_mortem
 from utilities.hooks import create_hook_if_configured
 from utilities.logger import separator, setup_logging
 from utilities.mtv_migration import get_vm_suffix, resolve_pvc_name_template
@@ -68,17 +70,18 @@ from utilities.must_gather import (
     mark_class_pending_must_gather,
     run_must_gather,
 )
+from utilities.naming import (
+    generate_name_with_uuid,
+    resolve_destination_vm_name,
+    sanitize_kubernetes_name,
+)
 from utilities.provider_inventory import (
     validate_source_vms_exist,
     wait_for_added_nics_in_forklift_inventory,
     wait_for_cloned_vms_in_forklift_inventory,
     wait_for_inventory_guest_networks,
 )
-from utilities.naming import (
-    generate_name_with_uuid,
-    resolve_destination_vm_name,
-    sanitize_kubernetes_name,
-)
+from utilities.provider_latency import select_provider_from_pool, store_provider_selection
 from utilities.pytest_utils import (
     collect_created_resources,
     enrich_junit_xml,
@@ -90,7 +93,6 @@ from utilities.pytest_utils import (
 )
 from utilities.resources import create_and_store_resource, get_or_create_namespace
 from utilities.ssh_utils import SSHConnectionManager
-from utilities.debug import remote_debugger_enabled, remote_post_mortem
 from utilities.utils import (
     create_source_cnv_vms,
     create_source_provider,
@@ -172,6 +174,72 @@ def pytest_runtest_makereport(item, call):
         item.parent._previousfailed = item
 
 
+@pytest.fixture(scope="session")
+def selected_source_provider(request: pytest.FixtureRequest, ocp_admin_client: DynamicClient) -> str:
+    """Resolve the run's source provider, selecting the fastest pool member when requested.
+
+    Explicit `source_provider` config is returned unchanged - nothing is probed and
+    nothing changes. Otherwise the `source_provider_type` + `source_provider_version`
+    pool (with optional `source_provider_feature`) is probed once per run using the
+    session's admin client: in a single-process run the provider is selected inline,
+    and under xdist the first worker to hold the run-scoped file lock probes and
+    writes the selection while every other worker reads the same file, so all
+    workers run against the same provider.
+
+    Args:
+        request (pytest.FixtureRequest): Request supplying the providers JSON option.
+        ocp_admin_client (DynamicClient): Client used to run the probe pod.
+
+    Returns:
+        str: The explicitly configured or latency-selected source provider key.
+
+    Raises:
+        ValueError: When the pool is empty or has no reachable member.
+    """
+    if py_config.get("source_provider"):
+        return py_config["source_provider"]
+
+    select_from_pool = partial(
+        select_provider_from_pool,
+        client=ocp_admin_client,
+        providers_json_path=request.config.getoption("providers_json"),
+        provider_type=py_config["source_provider_type"],
+        provider_version=py_config.get("source_provider_version"),
+        required_feature=py_config.get("source_provider_feature"),
+    )
+    run_uid = os.environ.get("PYTEST_XDIST_TESTRUNUID")
+    if run_uid is None:
+        selection = select_from_pool()
+    else:
+        # The testrunuid scopes the file to this run, so parallel runs never share it.
+        # The first worker through the lock probes once; the rest read its selection.
+        # A failed selection is recorded too, so the failure happens once instead of
+        # once per worker, and workers see the original error instead of a lock timeout.
+        selection_path = Path(tempfile.gettempdir()) / f"pytest-provider-selection-{run_uid}.json"
+        # The lock timeout must cover one full probe cycle held by the first worker:
+        # namespace deploy + Active wait, up to PROBE_POD_START_TIMEOUT_SECONDS of pod
+        # start, PROBE_SCRIPT_TIMEOUT_SECONDS of exec, and the blocking namespace
+        # cleanup — 900s leaves margin over that worst case.
+        with filelock.FileLock(f"{selection_path}.lock", timeout=900):
+            if selection_path.exists():
+                selection = json.loads(selection_path.read_text())
+                if "error" in selection:
+                    raise ValueError(f"Provider selection failed on the first worker: {selection['error']}")
+            else:
+                try:
+                    selection = select_from_pool()
+                except (ValueError, TimeoutExpiredError) as selection_error:
+                    store_provider_selection(selection_path=selection_path, content={"error": str(selection_error)})
+                    raise
+                store_provider_selection(selection_path=selection_path, content=selection)
+    py_config["source_provider"] = selection["provider"]
+    if selection["rtt_ms"] is None:
+        LOGGER.info(f"Source provider for this run: {selection['provider']} (selected without probing)")
+    else:
+        LOGGER.info(f"Source provider for this run: {selection['provider']} ({selection['rtt_ms']:.1f} ms)")
+    return selection["provider"]
+
+
 def pytest_sessionstart(session):
     required_config = ("storage_class", "source_provider")
 
@@ -180,7 +248,21 @@ def pytest_sessionstart(session):
 
         missing_configs: list[str] = []
 
+        # Latency-based pool selection (issue #728): a provider-type pool key
+        # (version optional) replaces the explicit provider key. The selection itself
+        # runs later, in the selected_source_provider fixture, once per run.
+        pool_type = py_config.get("source_provider_type")
+        pool_version = py_config.get("source_provider_version")
+        if not py_config.get("source_provider") and pool_version and not pool_type:
+            pytest.exit(
+                reason="source_provider_version requires source_provider_type",
+                returncode=1,
+            )
+
         for _req in required_config:
+            if _req == "source_provider" and pool_type:
+                # Pool mode: the provider is resolved by the latency fixture.
+                continue
             if not py_config.get(_req):
                 missing_configs.append(_req)
 
@@ -430,8 +512,12 @@ def pytest_collection_modifyitems(session, config, items):
         providers_json_path = config.getoption("providers_json", default=None)
         providers = load_source_providers(providers_json_path=providers_json_path)
         # .get() with default is intentional: source_provider may not be configured (e.g., partial config),
-        # in which case provider-type gating is silently skipped.
-        source_provider_type = providers.get(py_config.get("source_provider", ""), {}).get("type")
+        # in which case provider-type gating is silently skipped. In pool mode the provider key is
+        # unresolved at collection time (the latency fixture runs later), so the pool's
+        # type key drives the gating instead.
+        source_provider_type = providers.get(py_config.get("source_provider", ""), {}).get("type") or py_config.get(
+            "source_provider_type"
+        )
 
         if source_provider_type:
             # Skip warm migration tests for providers that do not support warm migration.
@@ -485,9 +571,11 @@ def pytest_collection_modifyitems(session, config, items):
 
     _session_store = get_fixture_store(session)
     vms_for_current_session: set = set()
+    # In pool mode the provider is unresolved at collection time; the pool type labels the items.
+    provider_label = py_config.get("source_provider") or py_config.get("source_provider_type")
 
     for item, test_config in resolved_plan_configs:
-        item.name = f"{item.name}-{py_config.get('source_provider')}-{py_config.get('storage_class')}"
+        item.name = f"{item.name}-{provider_label}-{py_config.get('storage_class')}"
 
         if test_config and "virtual_machines" in test_config:
             for _vm in test_config["virtual_machines"]:
@@ -660,9 +748,16 @@ def pytest_harvest_xdist_cleanup():
 
 @pytest.fixture(scope="session", autouse=True)
 def autouse_fixtures(
-    source_provider_data, nfs_storage_profile, base_resource_name, forklift_pods_state, virtctl_binary
+    selected_source_provider,
+    source_provider_data,
+    nfs_storage_profile,
+    base_resource_name,
+    forklift_pods_state,
+    virtctl_binary,
 ):
-    # source_provider_data called here to fail fast in provider not found in the providers list from config
+    # selected_source_provider runs first so pool-mode runs resolve their
+    # provider before anything consumes it. source_provider_data is called here to
+    # fail fast if the provider is not found in the providers list from config.
     yield
 
 
@@ -936,6 +1031,7 @@ def destination_provider(session_uuid, ocp_admin_client, target_namespace, fixtu
 
 @pytest.fixture(scope="session")
 def source_provider_data(
+    selected_source_provider: str,
     source_providers: dict[str, dict[str, Any]],
     fixture_store: dict[str, Any],
     request: pytest.FixtureRequest,
@@ -943,6 +1039,8 @@ def source_provider_data(
     """Resolve source provider configuration from the loaded providers data.
 
     Args:
+        selected_source_provider (str): The explicit or latency-selected provider
+            key; requested directly so selection always runs before this fixture.
         source_providers (dict[str, dict[str, Any]]): All provider configurations loaded from providers JSON file.
         fixture_store (dict[str, Any]): Session fixture store for teardown tracking.
         request (pytest.FixtureRequest): Pytest request object to access CLI options.
@@ -959,7 +1057,7 @@ def source_provider_data(
     if not source_providers:
         raise MissingProvidersFileError(path=providers_path)
 
-    requested_provider = py_config["source_provider"]
+    requested_provider = selected_source_provider
     if requested_provider not in source_providers:
         raise ValueError(
             f"Source provider '{requested_provider}' not found in '{providers_path}'. "
@@ -1354,6 +1452,11 @@ def prepared_plan(
         )
 
         if openshift_source_provider:
+            # OCPProvider.get_vm_by_name resolves VMs only within this namespace:
+            # concurrent sessions create identically-named VMs in their own
+            # source namespaces.
+            source_provider.source_vms_namespace = source_vms_namespace
+
             # Generate unique network name for class-based tests
             hash_prefix = generate_class_hash_prefix(request.node.nodeid, session_uuid=fixture_store["session_uuid"])
             multus_network_name = f"cb-{hash_prefix}"
