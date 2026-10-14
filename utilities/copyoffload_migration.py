@@ -1487,6 +1487,25 @@ def _as_utc_datetime(timestamp_value: Any) -> datetime | None:
     return timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else timestamp.astimezone(timezone.utc)
 
 
+def _resource_as_mapping(resource: Any) -> Mapping[str, Any] | None:
+    """Return a resource object as a mapping when its shape can be normalized.
+
+    Args:
+        resource (Any): Mapping or Kubernetes dynamic-client resource object.
+
+    Returns:
+        Mapping[str, Any] | None: Resource fields, or None when they cannot be read as a mapping.
+    """
+    if isinstance(resource, Mapping):
+        return resource
+
+    to_dict = getattr(resource, "to_dict", None)
+    if not callable(to_dict):
+        return None
+    resource_data = to_dict()
+    return resource_data if isinstance(resource_data, Mapping) else None
+
+
 def _event_time_range(event: Mapping[str, Any]) -> tuple[datetime, datetime] | None:
     """Return the first and last available observation times for a Kubernetes Event.
 
@@ -1595,10 +1614,11 @@ def _get_throttled_sources_by_runtime_host(
 
     # Correlate well-formed PVC Events to source hosts and their runtime-host message.
     for event in response.items or []:
-        if not isinstance(event, Mapping):
+        event_data = _resource_as_mapping(event)
+        if event_data is None:
             continue
-        involved_object = event.get("involvedObject")
-        if not isinstance(involved_object, Mapping):
+        involved_object = _resource_as_mapping(event_data.get("involvedObject"))
+        if involved_object is None:
             continue
         involved_kind = involved_object.get("kind")
         pvc_name = involved_object.get("name")
@@ -1613,11 +1633,11 @@ def _get_throttled_sources_by_runtime_host(
                 continue
             pvc_labels: dict[str, str] = pvc.instance.metadata.labels or {}
             source_host = pvc_labels.get(SOURCE_HOST_LABEL)
-            message = event.get("message")
+            message = event_data.get("message")
             if not isinstance(source_host, str) or not source_host or not isinstance(message, str):
                 continue
             host_match = re.search(r"available populator slot on host (\S+) \((\d+)/(\d+) in-flight\)", message)
-            event_time_range = _event_time_range(event)
+            event_time_range = _event_time_range(event_data)
             if not host_match or not event_time_range:
                 continue
 
