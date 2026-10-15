@@ -11,9 +11,9 @@ import json
 import os
 import re
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from kubernetes.dynamic.exceptions import ApiException
 from ocp_resources.event import Event
@@ -2087,22 +2087,23 @@ def get_configured_dedicated_hosts(source_provider_data: dict[str, Any]) -> list
     return dedicated_hosts
 
 
-def _inventory_esxi_host_name(host: dict[str, Any]) -> str:
-    """Return a valid ESXi host name from a dynamic inventory record.
+def _inventory_esxi_host_field(host: Mapping[str, object], field: Literal["id", "name"]) -> str:
+    """Return a non-empty string field without surrounding whitespace.
 
     Args:
-        host (dict[str, Any]): Host record from the vSphere inventory API.
+        host (Mapping[str, object]): Host record from the vSphere inventory API.
+        field (Literal["id", "name"]): ESXi host field to retrieve.
 
     Returns:
-        str: Non-empty ESXi display name without surrounding whitespace.
+        str: Field value containing no surrounding whitespace.
 
     Raises:
-        ValueError: If the inventory record has a missing or malformed name.
+        ValueError: If the inventory record has a missing or malformed field.
     """
-    host_name = host.get("name")
-    if not isinstance(host_name, str) or not host_name.strip() or host_name != host_name.strip():
-        raise ValueError(f"ESXi host inventory entry has an invalid 'name' field: {host!r}")
-    return host_name
+    value = host.get(field)
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ValueError(f"ESXi host inventory entry has an invalid '{field}' field: {host!r}")
+    return value
 
 
 def resolve_non_dedicated_esxi_host(
@@ -2140,10 +2141,11 @@ def resolve_non_dedicated_esxi_host(
 
     dedicated_hosts = set(get_configured_dedicated_hosts(source_provider_data))
     hosts = source_provider_inventory.hosts
-    total_hosts = len(hosts)
+    hosts_with_ids = [(host, _inventory_esxi_host_field(host, "id")) for host in hosts]
+    total_hosts = len(hosts_with_ids)
     # Only count configured dedicated hosts that actually exist in inventory — a stale/typo'd
     # host ID must not be able to mask an otherwise-available non-dedicated host.
-    present_dedicated_hosts = dedicated_hosts & {host.get("id") for host in hosts}
+    present_dedicated_hosts = dedicated_hosts & {host_id for _, host_id in hosts_with_ids}
 
     if total_hosts <= len(present_dedicated_hosts):
         raise ValueError(
@@ -2153,12 +2155,9 @@ def resolve_non_dedicated_esxi_host(
             "Use a lab with more ESXi hosts or reduce dedicated_migration_hosts."
         )
 
-    for host in hosts:
-        host_id = host.get("id")
-        if not host_id:
-            raise ValueError(f"ESXi host entry missing 'id' field: {host!r}")
+    for host, host_id in hosts_with_ids:
         if host_id not in dedicated_hosts:
-            host_name = _inventory_esxi_host_name(host)
+            host_name = _inventory_esxi_host_field(host, "name")
             LOGGER.info(f"Pinning VMs to non-dedicated ESXi host '{host_name}' (id={host_id})")
             return host_name
 
@@ -2201,12 +2200,13 @@ def resolve_dedicated_esxi_host(
             f"Mixed-host throttling requires exactly one distinct dedicated ESXi host, got {sorted(dedicated_hosts)}"
         )
     dedicated_host_id = dedicated_hosts.pop()
-    matching_hosts = [host for host in source_provider_inventory.hosts if host.get("id") == dedicated_host_id]
+    hosts_with_ids = [(host, _inventory_esxi_host_field(host, "id")) for host in source_provider_inventory.hosts]
+    matching_hosts = [host for host, host_id in hosts_with_ids if host_id == dedicated_host_id]
     if len(matching_hosts) != 1:
         raise ValueError(
             f"Expected one inventory entry for dedicated ESXi host '{dedicated_host_id}', found {len(matching_hosts)}"
         )
-    host_name = _inventory_esxi_host_name(matching_hosts[0])
+    host_name = _inventory_esxi_host_field(matching_hosts[0], "name")
     LOGGER.info(f"Pinning first VM to dedicated ESXi host '{host_name}' (id={dedicated_host_id})")
     return host_name
 
