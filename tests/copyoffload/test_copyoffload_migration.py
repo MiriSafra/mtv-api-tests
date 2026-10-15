@@ -3935,8 +3935,13 @@ class CopyoffloadDedicatedMigrationHostBase:
         ocp_admin_client: DynamicClient,
         target_namespace: str,
         prepared_plan: dict[str, Any],
+        configured_dedicated_hosts: list[str],
     ) -> None:
         """Execute migration while monitoring active populate pods per runtime host."""
+        contention_runtime_host: str | None = None
+        if prepared_plan.get("require_cross_source_contention", False):
+            contention_runtime_host = configured_dedicated_hosts[0]
+
         self.__class__.max_concurrent_by_host = execute_migration_monitoring_populator_inflight(
             ocp_admin_client=ocp_admin_client,
             fixture_store=fixture_store,
@@ -3946,7 +3951,7 @@ class CopyoffloadDedicatedMigrationHostBase:
             host_label=THROTTLE_HOST_LABEL,
             include_pending=True,
             use_runtime_host=True,
-            require_cross_source_contention=prepared_plan.get("require_cross_source_contention", False),
+            contention_runtime_host=contention_runtime_host,
         )
 
     def test_verify_dedicated_migration_host(
@@ -4066,7 +4071,7 @@ class TestCopyoffloadDedicatedMigrationHost(CopyoffloadDedicatedMigrationHostBas
            a cold Plan for both VMs. Confirm the Plan is Ready.
         3. Migrate both VMs and confirm every populate pod uses a configured dedicated
            host and no observed host exceeds the configured populator limit. With one
-           dedicated host, verify the observed Running-pod peak; with
+           dedicated host, verify the observed active-pod peak (Pending and Running); with
            multiple configured hosts, host selection is random per disk and only the
            per-host ceiling is required.
         4. Confirm all disks used XCOPY and both migrated VMs pass connectivity and
@@ -4076,8 +4081,8 @@ class TestCopyoffloadDedicatedMigrationHost(CopyoffloadDedicatedMigrationHostBas
 
     Expected result:
         Migration succeeds and each populate pod is routed to a configured host that
-        differs from both VMs' registered hosts. The observed Running-pod peak stays
-        within the configured per-host limit.
+        differs from both VMs' registered hosts. The observed active-pod peak (Pending
+        and Running) stays within the configured per-host limit.
     """
 
 
@@ -4110,11 +4115,11 @@ class TestCopyoffloadDedicatedHostSharedPopulatorLimit(CopyoffloadDedicatedMigra
     Prerequisites:
         Register a vSphere source and OpenShift destination with accessible network
         and XCOPY-capable shared storage. Prepare two disposable Linux VMs or clones
-        with two disks each on that storage. Configure exactly one dedicated ESXi
-        host and at least one other ESXi host. Provide the copy-offload storage secret
-        and permission to change the ForkliftController VM and populator in-flight
-        limits. Use an isolated migration namespace and prevent DRS from moving the
-        VMs during the check.
+        with three disks each (one template disk and two added disks) on that storage.
+        Configure exactly one dedicated ESXi host and at least one other ESXi host.
+        Provide the copy-offload secret and permissions to patch the ForkliftController and its
+        VM/populator deployments. The test changes and restores the VM and populator limits.
+        Use an isolated migration namespace and prevent DRS from moving the VMs during the check.
 
     Test plan:
         1. Set the VM in-flight limit to 2 and the per-host populator limit to 1. Clone
@@ -4125,10 +4130,12 @@ class TestCopyoffloadDedicatedHostSharedPopulatorLimit(CopyoffloadDedicatedMigra
         3. Migrate both VMs. Confirm each populate pod's runtime-host metadata, worker
            argument, and logs identify the dedicated host. Prefer throttleHost when
            present; otherwise use --migration-host (the current controller may write the
-           runtime host to sourceHost). Monitor Pending and Running pods per runtime host
-           and verify the observed peak never exceeds 1. Also require a throttled PVC
-           Event's reported range from one source host to overlap another source host's
-           worker interval on that runtime host; no fixed event count is required.
+           runtime host to sourceHost). Verify the observed active-pod peak never exceeds
+           1. During one poll, require a still-Pending PVC with a structured
+           PopulatorThrottled event, plus a Running worker from the other source host.
+           The sole configured dedicated host is the shared runtime host. Match the Event
+           to the current PVC by UID and require its timestamp to be at or after the other
+           worker's start time.
         4. Confirm all disks used XCOPY and both migrated VMs pass connectivity and
            disk-count checks. Remove migration resources, destination VMs and PVCs,
            disposable source clones, generated secrets and network attachments, and

@@ -913,8 +913,13 @@ class TestNameHere:
   limit. `TestCopyoffloadDedicatedHostSharedPopulatorLimit` configures exactly one dedicated host,
   pins VM1 there and VM2 elsewhere, and lowers the populator limit to 1 to check the observed runtime-host
   concurrency ceiling.
-  It also requires an event from one source host while the other source host has an active worker
-  on the shared runtime host; it does not depend on a fixed event count.
+  During migration polling, it also requires a Pending PVC with a structured
+  `PopulatorThrottled` event and a Running worker from another source host on the sole configured
+  dedicated host. It matches the Event's involved PVC by name and UID, then uses the PVC's
+  sourceHost label and the worker's runtime-host metadata. The event timestamp must be at or after
+  the worker's start time. This avoids parsing Event messages and does not depend on a fixed event
+  count or compare historical worker intervals. Reuse the populate-Pod snapshot already fetched for
+  concurrency counting; query Events on each poll and list migration PVCs only when such Events exist.
   Both scenarios verify source placement and determine the runtime XCOPY host from `throttleHost`
   when available, otherwise from `--migration-host` (current controllers may write that host to
   the populate Pod's `sourceHost` label). Do not confuse Pod labels with the original host on the

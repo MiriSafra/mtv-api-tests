@@ -329,19 +329,29 @@ def rdm_config(source_provider_data: dict[str, Any]) -> None:
 
 
 @pytest.fixture(scope="class")
-def configured_dedicated_hosts(source_provider_data: dict[str, Any]) -> list[str]:
+def configured_dedicated_hosts(
+    source_provider_data: dict[str, Any],
+    class_plan_config: dict[str, Any],
+) -> list[str]:
     """Validate and return the configured dedicatedMigrationHosts list for the test class.
 
     Args:
         source_provider_data (dict[str, Any]): Source provider configuration data.
+        class_plan_config (dict[str, Any]): Test configuration that may require one dedicated host.
 
     Returns:
         list[str]: Configured ESXi host MoRef IDs for dedicated migration hosts.
 
     Raises:
-        ValueError: If dedicated_migration_hosts is missing or empty in the copyoffload config.
+        ValueError: If dedicated_migration_hosts is invalid, or contention coverage requires one
+            distinct host and the configuration contains more than one.
     """
     dedicated_hosts = get_configured_dedicated_hosts(source_provider_data)
+    if class_plan_config.get("require_cross_source_contention") and len(set(dedicated_hosts)) != 1:
+        raise ValueError(
+            "Cross-source-host populator verification requires exactly one distinct dedicated host; "
+            f"found {sorted(set(dedicated_hosts))}"
+        )
     LOGGER.info(f"✓ Dedicated migration hosts configured: {dedicated_hosts}")
     return dedicated_hosts
 

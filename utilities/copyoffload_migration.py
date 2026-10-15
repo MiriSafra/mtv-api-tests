@@ -11,7 +11,7 @@ import json
 import os
 import re
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -97,16 +97,6 @@ class PopulatePodLogData(TypedDict):
     throttle_host: str  # Raw throttleHost pod label; not present on all supported builds
     container_args: list[str]
     log_content: str
-
-
-class _ObservedPopulateWorkerInterval(TypedDict):
-    """Observed execution interval for one populate worker Pod."""
-
-    runtime_host: str
-    source_host: str
-    started_at: datetime
-    finished_at: datetime | None
-    last_observed_running_at: datetime
 
 
 def _migration_host_from_args(container_args: list[str]) -> str | None:
@@ -1418,9 +1408,7 @@ def verify_xcopy_used_per_datastore(
 
 
 def _count_active_populator_pods_by_host(
-    ocp_admin_client: DynamicClient,
-    namespace: str,
-    migration_uid: str,
+    populate_pods: list[Pod],
     host_label: str = SOURCE_HOST_LABEL,
     include_pending: bool = True,
     use_runtime_host: bool = False,
@@ -1433,9 +1421,7 @@ def _count_active_populator_pods_by_host(
     the runtime host to the Pod's ``sourceHost`` label.
 
     Args:
-        ocp_admin_client (DynamicClient): OpenShift admin client.
-        namespace (str): Namespace where populate pods exist.
-        migration_uid (str): Migration UID to filter populate pods by.
+        populate_pods (list[Pod]): Populate pods already fetched for this migration poll.
         host_label (str): Pod label identifying the host used for grouping.
         include_pending (bool): Whether Pending pods should be included in the count.
         use_runtime_host (bool): Resolve the execution host from runtime metadata instead of
@@ -1446,12 +1432,7 @@ def _count_active_populator_pods_by_host(
     """
     counts: dict[str, int] = defaultdict(int)
     counted_phases = _ACTIVE_POPULATOR_POD_PHASES if include_pending else frozenset({Pod.Status.RUNNING})
-    for pod in _find_populate_pods(
-        ocp_admin_client=ocp_admin_client,
-        namespace=namespace,
-        migration_uid=migration_uid,
-        require_pods=False,
-    ):
+    for pod in populate_pods:
         pod_status = pod.instance.status
         if not pod_status or pod_status.phase not in counted_phases:
             continue
@@ -1467,289 +1448,238 @@ def _count_active_populator_pods_by_host(
 
 
 def _as_utc_datetime(timestamp_value: Any) -> datetime | None:
-    """Parse a Kubernetes timestamp value into an aware UTC datetime.
+    """Parse a Kubernetes timestamp as an aware UTC datetime.
 
     Args:
-        timestamp_value (Any): Datetime or ISO-8601 timestamp string from the Kubernetes API.
+        timestamp_value (Any): Datetime or ISO-8601 timestamp returned by the Kubernetes API.
 
     Returns:
-        datetime | None: The parsed UTC timestamp, or None for an unsupported or invalid value.
+        datetime | None: The timestamp normalized to UTC, or None when it cannot be parsed.
     """
-    if isinstance(timestamp_value, datetime):
-        timestamp = timestamp_value
-    elif isinstance(timestamp_value, str) and timestamp_value:
+    if isinstance(timestamp_value, str):
         try:
-            timestamp = datetime.fromisoformat(timestamp_value.replace("Z", "+00:00"))
+            timestamp_value = datetime.fromisoformat(timestamp_value.replace("Z", "+00:00"))
         except ValueError:
             return None
-    else:
+    if not isinstance(timestamp_value, datetime):
         return None
-    return timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else timestamp.astimezone(timezone.utc)
+    if timestamp_value.tzinfo is None:
+        return timestamp_value.replace(tzinfo=timezone.utc)
+    return timestamp_value.astimezone(timezone.utc)
 
 
-def _resource_as_mapping(resource: Any) -> Mapping[str, Any] | None:
-    """Return a resource object as a mapping when its shape can be normalized.
+def _pending_pvc_source_hosts(
+    pvcs: list[PersistentVolumeClaim],
+) -> dict[str, tuple[str, str]]:
+    """Find Pending migration PVCs and their source host and UID.
+
+    The shared-limit scenario configures exactly one dedicated host, so every XCOPY PVC in this
+    migration targets that runtime host. The controller emits the throttling Event before it
+    creates a populate Pod for a queued PVC.
 
     Args:
-        resource (Any): Mapping or Kubernetes dynamic-client resource object.
+        pvcs (list[PersistentVolumeClaim]): PVCs belonging to the migration.
 
     Returns:
-        Mapping[str, Any] | None: Resource fields, or None when they cannot be read as a mapping.
+        dict[str, tuple[str, str]]: Pending PVC names mapped to their original source host
+            and UID, so stale Events from a previous PVC with the same name are ignored.
     """
-    if isinstance(resource, Mapping):
-        return resource
-
-    to_dict = getattr(resource, "to_dict", None)
-    if not callable(to_dict):
-        return None
-    resource_data = to_dict()
-    return resource_data if isinstance(resource_data, Mapping) else None
-
-
-def _event_time_range(event: Mapping[str, Any]) -> tuple[datetime, datetime] | None:
-    """Return the first and last available observation times for a Kubernetes Event.
-
-    Args:
-        event (Mapping[str, Any]): Event object represented as a mapping.
-
-    Returns:
-        tuple[datetime, datetime] | None: The event observation range in UTC, or None.
-    """
-    timestamps: list[datetime] = []
-    series = event.get("series")
-    if isinstance(series, Mapping):
-        series_timestamp = _as_utc_datetime(series.get("lastObservedTime"))
-        if series_timestamp:
-            timestamps.append(series_timestamp)
-    for candidate_timestamp in (
-        event.get("firstTimestamp"),
-        event.get("eventTime"),
-        event.get("lastTimestamp"),
-    ):
-        timestamp = _as_utc_datetime(candidate_timestamp)
-        if timestamp is not None:
-            timestamps.append(timestamp)
-    if not timestamps:
-        metadata = event.get("metadata")
-        if isinstance(metadata, Mapping):
-            creation_timestamp = _as_utc_datetime(metadata.get("creationTimestamp"))
-            if creation_timestamp:
-                timestamps.append(creation_timestamp)
-    if not timestamps:
-        return None
-    return min(timestamps), max(timestamps)
-
-
-def _populate_worker_time_range(pod: Pod) -> tuple[datetime, datetime | None] | None:
-    """Return a populate worker's execution interval when the Pod records it.
-
-    Args:
-        pod (Pod): Populate Pod resource with worker container arguments and status.
-
-    Returns:
-        tuple[datetime, datetime | None] | None: Worker start and optional finish times in
-            UTC, or None when the worker interval cannot be determined.
-    """
-    status = pod.instance.status
-    if not status or status.phase not in {Pod.Status.RUNNING, Pod.Status.SUCCEEDED, Pod.Status.FAILED}:
-        return None
-
-    containers = (pod.instance.spec.containers or []) if pod.instance.spec else []
-    worker_container_names = {
-        container.name for container in containers if _migration_host_from_args(container.args or [])
-    }
-    worker_status = next(
-        (
-            container_status
-            for container_status in (status.containerStatuses or [])
-            if container_status.name in worker_container_names
-        ),
-        None,
-    )
-    if not worker_status or not worker_status.state:
-        return None
-
-    if status.phase == Pod.Status.RUNNING and worker_status.state.running:
-        started_at = _as_utc_datetime(worker_status.state.running.startedAt)
-        started_at = started_at or _as_utc_datetime(status.startTime)
-        return (started_at, None) if started_at else None
-
-    if not worker_status.state.terminated:
-        return None
-    started_at = _as_utc_datetime(worker_status.state.terminated.startedAt)
-    finished_at = _as_utc_datetime(worker_status.state.terminated.finishedAt)
-    if not started_at or not finished_at or finished_at < started_at:
-        return None
-    return started_at, finished_at
-
-
-def _get_throttled_sources_by_runtime_host(
-    ocp_admin_client: DynamicClient,
-    namespace: str,
-    pvc_by_name: dict[str, PersistentVolumeClaim],
-    max_populator_inflight: int,
-) -> dict[str, list[tuple[str, datetime, datetime]]]:
-    """Collect valid throttling events by runtime host and originating source host.
-
-    Malformed Kubernetes Event fields are ignored so they cannot interrupt migration
-    verification. Event timestamps preserve the full observation range when available.
-
-    Args:
-        ocp_admin_client (DynamicClient): OpenShift admin client for API queries.
-        namespace (str): Namespace containing the migration's PVCs and Events.
-        pvc_by_name (dict[str, PersistentVolumeClaim]): Migration PVCs keyed by name.
-        max_populator_inflight (int): Configured per-host populator concurrency limit.
-
-    Returns:
-        dict[str, list[tuple[str, datetime, datetime]]]: Runtime host to source host and
-            event observation range entries for valid full-limit throttling events.
-    """
-    # Query only throttling Events for this namespace; the PVC map scopes them to this migration.
-    event_resource = ocp_admin_client.resources.get(api_version=Event.api_version, kind=Event.__name__)
-    response = event_resource.get(
-        namespace=namespace,
-        field_selector=f"reason={POPULATOR_THROTTLED_EVENT_REASON}",
-    )
-    throttled_sources_by_runtime_host: dict[str, list[tuple[str, datetime, datetime]]] = defaultdict(list)
-
-    # Correlate well-formed PVC Events to source hosts and their runtime-host message.
-    for event in response.items or []:
-        event_data = _resource_as_mapping(event)
-        if event_data is None:
+    pending_source_hosts: dict[str, tuple[str, str]] = {}
+    for pvc in pvcs:
+        status = pvc.instance.status
+        if not status or status.phase != PersistentVolumeClaim.Status.PENDING:
             continue
-        involved_object = _resource_as_mapping(event_data.get("involvedObject"))
-        if involved_object is None:
-            continue
-        involved_kind = involved_object.get("kind")
-        pvc_name = involved_object.get("name")
-        if (
-            isinstance(involved_kind, str)
-            and involved_kind == PersistentVolumeClaim.kind
-            and isinstance(pvc_name, str)
-            and pvc_name
-        ):
-            pvc = pvc_by_name.get(pvc_name)
-            if pvc is None:
-                continue
-            pvc_labels: dict[str, str] = pvc.instance.metadata.labels or {}
-            source_host = pvc_labels.get(SOURCE_HOST_LABEL)
-            message = event_data.get("message")
-            if not isinstance(source_host, str) or not source_host or not isinstance(message, str):
-                continue
-            host_match = re.search(r"available populator slot on host (\S+) \((\d+)/(\d+) in-flight\)", message)
-            event_time_range = _event_time_range(event_data)
-            if not host_match or not event_time_range:
-                continue
-
-            # Keep only events that report this test's configured limit as full.
-            active_count = int(host_match.group(2))
-            configured_limit = int(host_match.group(3))
-            if configured_limit == max_populator_inflight and active_count >= configured_limit:
-                throttled_sources_by_runtime_host[host_match.group(1)].append((source_host, *event_time_range))
-
-    return dict(throttled_sources_by_runtime_host)
+        source_host = (pvc.instance.metadata.labels or {}).get(SOURCE_HOST_LABEL)
+        pvc_uid = pvc.instance.metadata.uid
+        if source_host and pvc_uid:
+            pending_source_hosts[pvc.name] = (source_host, pvc_uid)
+    return pending_source_hosts
 
 
-def _cross_source_host_contention_observed(
+def _get_populator_throttling_events_and_pvcs(
     ocp_admin_client: DynamicClient,
     namespace: str,
     migration_uid: str,
-    max_populator_inflight: int,
-    worker_intervals_by_pod: dict[str, _ObservedPopulateWorkerInterval],
-) -> bool:
-    """Check whether a throttling Event's observation range overlaps another host's worker interval.
+) -> tuple[list[Any], list[PersistentVolumeClaim]]:
+    """Fetch throttling Events and migration PVCs before the Pod snapshot.
 
-    The populator controller emits a ``PopulatorThrottled`` event on a PVC when the
-    runtime-host budget is occupied. PVC ``sourceHost`` labels retain VM origin, while
-    populate Pod labels may represent the runtime host, so associate Pods and PVC events
-    through the Pod's ``pvcName`` label and compare their observed time intervals.
+    Skip the PVC list request when there are no throttling Events to verify.
 
     Args:
-        ocp_admin_client (DynamicClient): OpenShift admin client for API queries.
-        namespace (str): Namespace containing the migration's PVCs and populate Pods.
-        migration_uid (str): Migration UID used to select the migration's resources.
-        max_populator_inflight (int): Configured per-host populator concurrency limit.
-        worker_intervals_by_pod (dict[str, _ObservedPopulateWorkerInterval]): Mutable cache of
-            worker intervals observed during previous status polls.
+        ocp_admin_client (DynamicClient): OpenShift admin client.
+        namespace (str): Namespace containing the migration's resources.
+        migration_uid (str): Migration UID used to select its PVCs.
 
     Returns:
-        bool: True when a throttling Event's observation range from a different source host
-            overlaps a worker interval on the same runtime host.
+        tuple[list[Any], list[PersistentVolumeClaim]]: Matching Events and migration PVCs.
     """
-    # Load this migration's PVCs so each populate Pod and throttling Event can be tied to its VM's source host.
+    event_resource = ocp_admin_client.resources.get(api_version=Event.api_version, kind=Event.__name__)
+    events = (
+        event_resource.get(
+            namespace=namespace,
+            field_selector=f"reason={POPULATOR_THROTTLED_EVENT_REASON}",
+        ).items
+        or []
+    )
+    if not events:
+        return [], []
+
     pvcs = PersistentVolumeClaim.get(
         client=ocp_admin_client,
         namespace=namespace,
         label_selector=f"migration={migration_uid}",
     )
-    pvc_by_name = {pvc.name: pvc for pvc in pvcs}
-    if not pvc_by_name:
-        return False
+    return events, pvcs
 
-    # Record running and completed worker intervals; retain observations if Pods disappear between status polls.
-    observed_at = datetime.now(timezone.utc)
-    seen_pod_uids: set[str] = set()
-    for pod in _find_populate_pods(
-        ocp_admin_client=ocp_admin_client,
-        namespace=namespace,
-        migration_uid=migration_uid,
-        require_pods=False,
-    ):
+
+def _running_populate_worker_starts(
+    populate_pods: list[Pod],
+    pvc_by_name: dict[str, PersistentVolumeClaim],
+    dedicated_runtime_host: str,
+) -> list[tuple[str, datetime]]:
+    """Get source hosts and start times for workers running on one runtime host.
+
+    Args:
+        populate_pods (list[Pod]): Populate pods already fetched for this migration poll.
+        pvc_by_name (dict[str, PersistentVolumeClaim]): Migration PVCs keyed by name.
+        dedicated_runtime_host (str): Runtime host whose workers are relevant.
+
+    Returns:
+        list[tuple[str, datetime]]: Source host and worker start time for each matching worker.
+    """
+    worker_starts: list[tuple[str, datetime]] = []
+    for pod in populate_pods:
+        status = pod.instance.status
+        if not status or status.phase != Pod.Status.RUNNING:
+            continue
+
         labels: dict[str, str] = pod.instance.metadata.labels or {}
-        pvc = pvc_by_name.get(labels.get(PVC_NAME_LABEL, ""))
+        pvc_name = labels.get(PVC_NAME_LABEL, "")
+        pvc = pvc_by_name.get(pvc_name)
         if pvc is None:
             continue
-        pvc_labels: dict[str, str] = pvc.instance.metadata.labels or {}
-        source_host = pvc_labels.get(SOURCE_HOST_LABEL)
+
+        containers = (pod.instance.spec.containers or []) if pod.instance.spec else []
+        worker_names = {container.name for container in containers if _migration_host_from_args(container.args or [])}
+        source_host = (pvc.instance.metadata.labels or {}).get(SOURCE_HOST_LABEL)
         runtime_host = _runtime_host_from_pod_metadata(labels, _container_args_from_pod(pod))
-        worker_time_range = _populate_worker_time_range(pod)
-        if not source_host or not runtime_host or not worker_time_range:
+        if not worker_names or not source_host or runtime_host != dedicated_runtime_host:
             continue
 
-        pod_uid = pod.instance.metadata.uid or pod.name
-        seen_pod_uids.add(pod_uid)
-        started_at, finished_at = worker_time_range
-        worker_intervals_by_pod[pod_uid] = {
-            "runtime_host": runtime_host,
-            "source_host": source_host,
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "last_observed_running_at": observed_at if finished_at is None else finished_at,
+        for container_status in status.containerStatuses or []:
+            if (
+                container_status.name not in worker_names
+                or not container_status.state
+                or not container_status.state.running
+            ):
+                continue
+            worker_started_at = _as_utc_datetime(container_status.state.running.startedAt)
+            if worker_started_at:
+                worker_starts.append((source_host, worker_started_at))
+    return worker_starts
+
+
+def _has_cross_source_populator_throttling_event(
+    events: list[Any],
+    pending_source_hosts: dict[str, tuple[str, str]],
+    worker_starts: list[tuple[str, datetime]],
+    dedicated_runtime_host: str,
+) -> bool:
+    """Match a structured throttling Event with cross-source workers on one runtime host.
+
+    Args:
+        events (list[Any]): PopulatorThrottled Events fetched before the Pod snapshot.
+        pending_source_hosts (dict[str, tuple[str, str]]): Pending PVC name mapped to
+            source host and PVC UID.
+        worker_starts (list[tuple[str, datetime]]): Running worker source hosts and start times.
+        dedicated_runtime_host (str): The configured dedicated runtime host for both sources.
+
+    Returns:
+        bool: True when a matching Event was observed while another source host's worker ran.
+    """
+    for event in events:
+        if event.get("reason") != POPULATOR_THROTTLED_EVENT_REASON:
+            continue
+
+        involved_object = event.get("involvedObject") or {}
+        if involved_object.get("kind") != PersistentVolumeClaim.kind:
+            continue
+
+        pvc_name = involved_object.get("name")
+        pending_pvc = pending_source_hosts.get(pvc_name) if isinstance(pvc_name, str) else None
+        if pending_pvc is None:
+            continue
+
+        throttled_source_host, pending_pvc_uid = pending_pvc
+        if involved_object.get("uid") != pending_pvc_uid:
+            continue
+
+        event_series = event.get("series") or {}
+        event_metadata = event.get("metadata") or {}
+        event_time = _as_utc_datetime(
+            event_series.get("lastObservedTime")
+            or event.get("lastTimestamp")
+            or event.get("eventTime")
+            or event.get("firstTimestamp")
+            or event_metadata.get("creationTimestamp")
+        )
+        if event_time is None:
+            continue
+
+        other_source_hosts = {
+            source_host
+            for source_host, worker_started_at in worker_starts
+            if source_host != throttled_source_host and event_time >= worker_started_at
         }
+        if other_source_hosts:
+            LOGGER.info(
+                f"Observed cross-source-host populator contention on dedicated runtime host "
+                f"'{dedicated_runtime_host}': source host '{throttled_source_host}' has a Pending PVC "
+                f"while a worker from source host(s) {sorted(other_source_hosts)} is running"
+            )
+            return True
+    return False
 
-    # Bound vanished running Pods to their last confirmed Running observation to avoid stale intervals.
-    for pod_uid, interval in worker_intervals_by_pod.items():
-        if pod_uid not in seen_pod_uids and interval["finished_at"] is None:
-            interval["finished_at"] = interval["last_observed_running_at"]
 
-    if not worker_intervals_by_pod:
+def _cross_source_host_contention_observed(
+    events: list[Any],
+    pvc_by_name: dict[str, PersistentVolumeClaim],
+    pending_source_hosts: dict[str, tuple[str, str]],
+    populate_pods: list[Pod],
+    dedicated_runtime_host: str,
+) -> bool:
+    """Check one migration poll for cross-source throttling on the dedicated host.
+
+    A structured PopulatorThrottled Event identifies a waiting PVC. Since the scenario configures
+    exactly one dedicated host, that PVC and another source host's worker target the same runtime
+    host when the worker metadata resolves to that host. Event and worker timestamps reject stale
+    evidence.
+
+    Args:
+        events (list[Any]): Throttling Events fetched before the current Pod snapshot.
+        pvc_by_name (dict[str, PersistentVolumeClaim]): Migration PVCs keyed by name.
+        pending_source_hosts (dict[str, tuple[str, str]]): Pending migration PVC source hosts and UIDs.
+        populate_pods (list[Pod]): Populate pods fetched after the Events for this migration poll.
+        dedicated_runtime_host (str): The sole configured dedicated host for this scenario.
+
+    Returns:
+        bool: True when a throttled Pending PVC and another source host's Running worker
+            are observed targeting the dedicated runtime host.
+    """
+    if not events or not pending_source_hosts:
         return False
 
-    # Compare event ranges with worker intervals on the same runtime host.
-    throttled_sources_by_runtime_host = _get_throttled_sources_by_runtime_host(
-        ocp_admin_client=ocp_admin_client,
-        namespace=namespace,
+    worker_starts = _running_populate_worker_starts(
+        populate_pods=populate_pods,
         pvc_by_name=pvc_by_name,
-        max_populator_inflight=max_populator_inflight,
+        dedicated_runtime_host=dedicated_runtime_host,
     )
-
-    # Contention is observed when an Event's reported range overlaps a worker interval.
-    for interval in worker_intervals_by_pod.values():
-        runtime_host = interval["runtime_host"]
-        worker_end = interval["finished_at"] or interval["last_observed_running_at"]
-        for throttled_source_host, event_start, event_end in throttled_sources_by_runtime_host.get(runtime_host, []):
-            if (
-                throttled_source_host != interval["source_host"]
-                and event_end >= interval["started_at"]
-                and event_start <= worker_end
-            ):
-                LOGGER.info(
-                    f"Observed cross-source-host populator contention on runtime host '{runtime_host}': "
-                    f"source host '{interval['source_host']}' had a worker interval overlapping the reported "
-                    f"throttling-event range from source host '{throttled_source_host}'"
-                )
-                return True
-    return False
+    return bool(worker_starts) and _has_cross_source_populator_throttling_event(
+        events=events,
+        pending_source_hosts=pending_source_hosts,
+        worker_starts=worker_starts,
+        dedicated_runtime_host=dedicated_runtime_host,
+    )
 
 
 class _PopulatorConcurrencyTracker:
@@ -1764,7 +1694,7 @@ class _PopulatorConcurrencyTracker:
         host_label: str = SOURCE_HOST_LABEL,
         include_pending: bool = True,
         use_runtime_host: bool = False,
-        require_cross_source_contention: bool = False,
+        contention_runtime_host: str | None = None,
     ) -> None:
         """Initialize tracker state for one migration execution.
 
@@ -1777,8 +1707,8 @@ class _PopulatorConcurrencyTracker:
             include_pending (bool): Whether Pending pods should be included in the count.
             use_runtime_host (bool): Resolve the execution host from runtime metadata instead of
                 reading only ``host_label``.
-            require_cross_source_contention (bool): Record whether a throttled PVC from a
-                different source host overlapped a worker interval on the same runtime host.
+            contention_runtime_host (str | None): Dedicated runtime host where the live
+                cross-source-host contention check is required, if any.
         """
         self._plan = plan
         self._ocp_admin_client = ocp_admin_client
@@ -1787,11 +1717,10 @@ class _PopulatorConcurrencyTracker:
         self._host_label = host_label
         self._include_pending = include_pending
         self._use_runtime_host = use_runtime_host
-        self._require_cross_source_contention = require_cross_source_contention
+        self._contention_runtime_host = contention_runtime_host
         self.cross_source_contention_observed = False
         self._migration_uid: str | None = None
         self._max_concurrent_by_host: dict[str, int] = defaultdict(int)
-        self._worker_intervals_by_pod: dict[str, _ObservedPopulateWorkerInterval] = {}
 
     def poll(self, _status: str) -> None:
         """Update peak concurrency counters for one migration status poll.
@@ -1805,19 +1734,37 @@ class _PopulatorConcurrencyTracker:
         if self._migration_uid is None:
             return
 
-        if self._require_cross_source_contention and not self.cross_source_contention_observed:
-            self.cross_source_contention_observed = _cross_source_host_contention_observed(
+        events: list[Any] = []
+        pvc_by_name: dict[str, PersistentVolumeClaim] = {}
+        pending_source_hosts: dict[str, tuple[str, str]] = {}
+        if self._contention_runtime_host is not None and not self.cross_source_contention_observed:
+            events, pvcs = _get_populator_throttling_events_and_pvcs(
                 ocp_admin_client=self._ocp_admin_client,
                 namespace=self._target_namespace,
                 migration_uid=self._migration_uid,
-                max_populator_inflight=self._max_populator_inflight,
-                worker_intervals_by_pod=self._worker_intervals_by_pod,
             )
+            if events:
+                pvc_by_name = {pvc.name: pvc for pvc in pvcs}
+                pending_source_hosts = _pending_pvc_source_hosts(pvcs=pvcs)
 
-        active_by_host = _count_active_populator_pods_by_host(
+        populate_pods = _find_populate_pods(
             ocp_admin_client=self._ocp_admin_client,
             namespace=self._target_namespace,
             migration_uid=self._migration_uid,
+            require_pods=False,
+        )
+
+        if self._contention_runtime_host is not None and not self.cross_source_contention_observed:
+            self.cross_source_contention_observed = _cross_source_host_contention_observed(
+                events=events,
+                pvc_by_name=pvc_by_name,
+                pending_source_hosts=pending_source_hosts,
+                populate_pods=populate_pods,
+                dedicated_runtime_host=self._contention_runtime_host,
+            )
+
+        active_by_host = _count_active_populator_pods_by_host(
+            populate_pods=populate_pods,
             host_label=self._host_label,
             include_pending=self._include_pending,
             use_runtime_host=self._use_runtime_host,
@@ -1929,7 +1876,7 @@ def execute_migration_monitoring_populator_inflight(
     host_label: str = SOURCE_HOST_LABEL,
     include_pending: bool = True,
     use_runtime_host: bool = False,
-    require_cross_source_contention: bool = False,
+    contention_runtime_host: str | None = None,
 ) -> dict[str, int]:
     """Execute a copy-offload migration while tracking peak populator concurrency per host.
 
@@ -1944,8 +1891,8 @@ def execute_migration_monitoring_populator_inflight(
         include_pending (bool): Whether Pending pods should be included in the observed count.
         use_runtime_host (bool): Resolve the execution host from runtime metadata instead of
             reading only ``host_label``.
-        require_cross_source_contention (bool): Require evidence that a throttled PVC from a
-            different source host overlapped a worker interval on the same runtime host.
+        contention_runtime_host (str | None): Require live contention evidence on this
+            dedicated runtime host when provided.
 
     Returns:
         dict[str, int]: Peak concurrent active populate pods observed per selected host label
@@ -1971,7 +1918,7 @@ def execute_migration_monitoring_populator_inflight(
         host_label=host_label,
         include_pending=include_pending,
         use_runtime_host=use_runtime_host,
-        require_cross_source_contention=require_cross_source_contention,
+        contention_runtime_host=contention_runtime_host,
     )
 
     # Create log capture callback for test_check_xcopy_used verification
@@ -2000,10 +1947,11 @@ def execute_migration_monitoring_populator_inflight(
         log_capture(status)
 
     wait_for_migration_complate(plan=plan, on_status_poll=combined_callback)
-    if require_cross_source_contention and not tracker.cross_source_contention_observed:
+    if contention_runtime_host is not None and not tracker.cross_source_contention_observed:
         raise ValueError(
-            "The migration completed without observing cross-source-host contention on a shared runtime host; "
-            "the MTV-4494 populator-limit regression was not exercised"
+            "The migration completed without observing a Pending PVC with a PopulatorThrottled event "
+            f"while a worker from another source host was running on dedicated host '{contention_runtime_host}'; "
+            "the MTV-4494 shared populator-limit regression was not exercised"
         )
     return tracker.results
 
