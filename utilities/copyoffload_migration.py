@@ -1447,11 +1447,11 @@ def _count_active_populator_pods_by_host(
     return dict(counts)
 
 
-def _as_utc_datetime(timestamp_value: Any) -> datetime | None:
+def _as_utc_datetime(timestamp_value: object) -> datetime | None:
     """Parse a Kubernetes timestamp as an aware UTC datetime.
 
     Args:
-        timestamp_value (Any): Datetime or ISO-8601 timestamp returned by the Kubernetes API.
+        timestamp_value (object): Dynamic API timestamp, expected to be a datetime or ISO-8601 string.
 
     Returns:
         datetime | None: The timestamp normalized to UTC, or None when it cannot be parsed.
@@ -1524,10 +1524,12 @@ def _get_populator_throttling_events_and_pvcs(
     if not events:
         return [], []
 
-    pvcs = PersistentVolumeClaim.get(
-        client=ocp_admin_client,
-        namespace=namespace,
-        label_selector=f"migration={migration_uid}",
+    pvcs = list(
+        PersistentVolumeClaim.get(
+            client=ocp_admin_client,
+            namespace=namespace,
+            label_selector=f"migration={migration_uid}",
+        )
     )
     return events, pvcs
 
@@ -1933,18 +1935,21 @@ def execute_migration_monitoring_populator_inflight(
     def combined_callback(status: str) -> None:
         """Run concurrency tracking and log capture for one migration status poll.
 
-        Isolates exceptions so failure in one callback doesn't prevent the other from running.
+        Captures logs first for cross-source contention, whose extra API reads could delay pod-log capture.
 
         Args:
             status (str): Current migration status from migration polling.
         """
+        if contention_runtime_host is not None:
+            log_capture(status)
+
         try:
             tracker.poll(status)
         except ApiException as tracker_err:
             LOGGER.warning(f"Populator concurrency tracking failed during poll: {tracker_err}")
 
-        # log_capture already isolates its own expected failure modes internally
-        log_capture(status)
+        if contention_runtime_host is None:
+            log_capture(status)
 
     wait_for_migration_complate(plan=plan, on_status_poll=combined_callback)
     if contention_runtime_host is not None and not tracker.cross_source_contention_observed:
@@ -2082,6 +2087,24 @@ def get_configured_dedicated_hosts(source_provider_data: dict[str, Any]) -> list
     return dedicated_hosts
 
 
+def _inventory_esxi_host_name(host: dict[str, Any]) -> str:
+    """Return a valid ESXi host name from a dynamic inventory record.
+
+    Args:
+        host (dict[str, Any]): Host record from the vSphere inventory API.
+
+    Returns:
+        str: Non-empty ESXi display name without surrounding whitespace.
+
+    Raises:
+        ValueError: If the inventory record has a missing or malformed name.
+    """
+    host_name = host.get("name")
+    if not isinstance(host_name, str) or not host_name.strip() or host_name != host_name.strip():
+        raise ValueError(f"ESXi host inventory entry has an invalid 'name' field: {host!r}")
+    return host_name
+
+
 def resolve_non_dedicated_esxi_host(
     source_provider_inventory: ForkliftInventory,
     source_provider_data: dict[str, Any],
@@ -2135,9 +2158,7 @@ def resolve_non_dedicated_esxi_host(
         if not host_id:
             raise ValueError(f"ESXi host entry missing 'id' field: {host!r}")
         if host_id not in dedicated_hosts:
-            host_name = host.get("name")
-            if not host_name:
-                raise ValueError(f"ESXi host '{host_id}' has no 'name' field: {host!r}")
+            host_name = _inventory_esxi_host_name(host)
             LOGGER.info(f"Pinning VMs to non-dedicated ESXi host '{host_name}' (id={host_id})")
             return host_name
 
@@ -2185,9 +2206,7 @@ def resolve_dedicated_esxi_host(
         raise ValueError(
             f"Expected one inventory entry for dedicated ESXi host '{dedicated_host_id}', found {len(matching_hosts)}"
         )
-    host_name = matching_hosts[0].get("name")
-    if not host_name:
-        raise ValueError(f"Dedicated ESXi host '{dedicated_host_id}' has no name in provider inventory")
+    host_name = _inventory_esxi_host_name(matching_hosts[0])
     LOGGER.info(f"Pinning first VM to dedicated ESXi host '{host_name}' (id={dedicated_host_id})")
     return host_name
 
