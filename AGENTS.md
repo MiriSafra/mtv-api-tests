@@ -937,6 +937,8 @@ class TestNameHere:
   `xfs_info` on the migrated VM to verify XFS v4 filesystem compatibility (validates `crc=0` in output).
   Uses `check_vm_command_output()` from `utilities/post_migration.py`.
   Requires `xfs_compatibility: True` in plan config and `xfs_check` config dict.
+- **7-step resume-conversion pattern**: storagemap -> networkmap -> plan -> migrate (expected conversion failure) -> verify_pvcs_preserved -> resume_migration -> check_vms
+  Resume-conversion tests use the `vsphere` marker and keep the ineligible-resume scenario in the warm test module.
 
 **Test method naming:** Base tests: `test_create_storagemap`, `test_create_networkmap`, `test_create_plan`,
 `test_migrate_vms`, `test_check_vms`. Shared-disk Linux tests: same through `test_migrate_vms`, then
@@ -953,6 +955,8 @@ LUKS tests: same through `test_migrate_vms`, then
 `test_verify_xfs_version`, `test_check_vms`. Plan-archive PVC cleanup tests: same through
 `test_migrate_vms` (expects `MigrationPlanExecError`), then `test_archive_and_delete_plan`,
 `test_verify_pvc_cleanup`.
+Resume-conversion tests: same through `test_migrate_vms`, then `test_verify_pvcs_preserved`,
+`test_resume_migration`, `test_check_vms`.
 
 **Fixture parameters:** Each test method requests only the fixtures it needs. The example shows typical patterns.
 

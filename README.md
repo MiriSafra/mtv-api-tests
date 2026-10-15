@@ -394,6 +394,13 @@ The Quick Start runs **tier0** tests (smoke tests). You can run other test categ
 | `hyperv` | Hyper-V provider-specific tests | Tests specific to Hyper-V provider |
 | `upgrade` | Migration across MTV operator upgrades | Validating upgrade compatibility |
 
+### Resume Conversion Tests
+
+`tests/warm/test_resume_conversion_warm_migration.py` covers vSphere warm
+migration recovery after conversion failure and rejection of a resume request
+without a prior migration failure. These tests require an MTV version supporting
+`resumeConversion` and `openshift-python-wrapper` version 11.0.142 or later.
+
 ### Copy-Offload Sanity Tests
 
 The `copyoffload_sanity` marker selects a curated subset of copy-offload tests that cover the core

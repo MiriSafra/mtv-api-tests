@@ -12,6 +12,16 @@ from utilities.naming import generate_name_with_uuid
 if TYPE_CHECKING:
     from libs.forklift_inventory import ForkliftInventory
 
+# Pytest marker identifying provider-specific test classes, keyed by source provider type.
+_PROVIDER_TEST_MARKERS: dict[str, str] = {
+    Provider.ProviderType.VSPHERE: "vsphere",
+    Provider.ProviderType.RHV: "rhv",
+    Provider.ProviderType.OPENSTACK: "openstack",
+    Provider.ProviderType.OPENSHIFT: "openshift",
+    Provider.ProviderType.HYPERV: "hyperv",
+    Provider.ProviderType.OVA: "ova",
+}
+
 
 def supports_add_nic(provider_type: str) -> bool:
     """Report whether a source provider type can add a NIC through the migration plan.
