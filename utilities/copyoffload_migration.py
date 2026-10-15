@@ -2100,10 +2100,10 @@ def _inventory_esxi_host_field(host: Mapping[str, object], field: Literal["id", 
     Raises:
         ValueError: If the inventory record has a missing or malformed field.
     """
-    value = host.get(field)
-    if not isinstance(value, str) or not value.strip() or value != value.strip():
+    field_value = host.get(field)
+    if not isinstance(field_value, str) or not field_value.strip() or field_value != field_value.strip():
         raise ValueError(f"ESXi host inventory entry has an invalid '{field}' field: {host!r}")
-    return value
+    return field_value
 
 
 def resolve_non_dedicated_esxi_host(
