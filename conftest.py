@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bdb
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import tempfile
 import uuid
 from collections.abc import Generator
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 from shutil import rmtree
 from typing import TYPE_CHECKING, Any
@@ -43,44 +45,64 @@ from exceptions.exceptions import (
     MtvOperatorNotInstalledError,
     RemoteClusterAndLocalCluterNamesError,
 )
-from utilities.copyoffload_constants import FORKLIFT_CONTROLLER_NAME
-from utilities.copyoffload_migration import apply_copyoffload_vm_name_override, resolve_non_dedicated_esxi_host
-from libs.base_provider import BaseProvider
+from libs.base_provider import _PROVIDER_TEST_MARKERS, BaseProvider, supports_add_nic
 from libs.forklift_inventory import ForkliftInventory, create_forklift_inventory
 from libs.providers.openshift import OCPProvider
+from libs.providers.rhv import OvirtProvider
 from libs.providers.vmware import VMWareProvider
 from utilities.constants import MTV_OPERATOR_NAME
+from utilities.copyoffload_constants import FORKLIFT_CONTROLLER_NAME
+from utilities.copyoffload_migration import (
+    apply_copyoffload_vm_name_override,
+    resolve_dedicated_esxi_host,
+    resolve_non_dedicated_esxi_host,
+)
+from utilities.debug import remote_debugger_enabled, remote_post_mortem
 from utilities.hooks import create_hook_if_configured
 from utilities.logger import separator, setup_logging
 from utilities.mtv_migration import get_vm_suffix, resolve_pvc_name_template
-from utilities.must_gather import run_must_gather
-from utilities.provider_inventory import (
-    validate_source_vms_exist,
-    wait_for_added_nics_in_forklift_inventory,
-    wait_for_cloned_vms_in_forklift_inventory,
+from utilities.must_gather import (
+    collect_class_must_gather,
+    collect_class_teardown_must_gather,
+    collect_must_gather_for_item,
+    collect_pending_class_must_gather_now,
+    flush_pending_class_must_gathers,
+    initialize_class_plan_context,
+    mark_class_pending_must_gather,
+    run_must_gather,
 )
 from utilities.naming import (
     generate_name_with_uuid,
     resolve_destination_vm_name,
     sanitize_kubernetes_name,
-    sanitize_test_name_for_path,
 )
+from utilities.provider_inventory import (
+    get_missing_source_vms,
+    raise_for_missing_source_vms,
+    wait_for_added_nics_in_forklift_inventory,
+    wait_for_cloned_vms_in_forklift_inventory,
+    wait_for_inventory_guest_networks,
+)
+from utilities.provider_latency import select_provider_from_pool, store_provider_selection
 from utilities.pytest_utils import (
     collect_created_resources,
     enrich_junit_xml,
     is_dry_run,
     prepare_base_path,
+    resolve_item_plan_config,
     session_teardown,
     setup_ai_analysis,
 )
 from utilities.resources import create_and_store_resource, get_or_create_namespace
 from utilities.ssh_utils import SSHConnectionManager
+from utilities.storage_canary import verify_destination_storage_provisioning
 from utilities.utils import (
     create_source_cnv_vms,
     create_source_provider,
     extract_vm_from_plan,
     generate_class_hash_prefix,
     get_cluster_client,
+    get_cluster_version,
     get_cluster_version_str,
     get_per_nic_networks,
     get_value_from_py_config,
@@ -99,6 +121,8 @@ RESULTS_PATH = Path("./.xdist_results/")
 RESULTS_PATH.mkdir(exist_ok=True)
 LOGGER = logging.getLogger(__name__)
 BASIC_LOGGER = logging.getLogger("basic")
+_STANDALONE_MUST_GATHER_ERROR = pytest.StashKey[Exception]()
+_CLASS_MUST_GATHER_ERROR = pytest.StashKey[Exception]()
 
 
 # Pytest start
@@ -157,6 +181,72 @@ def pytest_runtest_makereport(item, call):
         item.parent._previousfailed = item
 
 
+@pytest.fixture(scope="session")
+def selected_source_provider(request: pytest.FixtureRequest, ocp_admin_client: DynamicClient) -> str:
+    """Resolve the run's source provider, selecting the fastest pool member when requested.
+
+    Explicit `source_provider` config is returned unchanged - nothing is probed and
+    nothing changes. Otherwise the `source_provider_type` + `source_provider_version`
+    pool (with optional `source_provider_feature`) is probed once per run using the
+    session's admin client: in a single-process run the provider is selected inline,
+    and under xdist the first worker to hold the run-scoped file lock probes and
+    writes the selection while every other worker reads the same file, so all
+    workers run against the same provider.
+
+    Args:
+        request (pytest.FixtureRequest): Request supplying the providers JSON option.
+        ocp_admin_client (DynamicClient): Client used to run the probe pod.
+
+    Returns:
+        str: The explicitly configured or latency-selected source provider key.
+
+    Raises:
+        ValueError: When the pool is empty or has no reachable member.
+    """
+    if py_config.get("source_provider"):
+        return py_config["source_provider"]
+
+    select_from_pool = partial(
+        select_provider_from_pool,
+        client=ocp_admin_client,
+        providers_json_path=request.config.getoption("providers_json"),
+        provider_type=py_config["source_provider_type"],
+        provider_version=py_config.get("source_provider_version"),
+        required_feature=py_config.get("source_provider_feature"),
+    )
+    run_uid = os.environ.get("PYTEST_XDIST_TESTRUNUID")
+    if run_uid is None:
+        selection = select_from_pool()
+    else:
+        # The testrunuid scopes the file to this run, so parallel runs never share it.
+        # The first worker through the lock probes once; the rest read its selection.
+        # A failed selection is recorded too, so the failure happens once instead of
+        # once per worker, and workers see the original error instead of a lock timeout.
+        selection_path = Path(tempfile.gettempdir()) / f"pytest-provider-selection-{run_uid}.json"
+        # The lock timeout must cover one full probe cycle held by the first worker:
+        # namespace deploy + Active wait, up to PROBE_POD_START_TIMEOUT_SECONDS of pod
+        # start, PROBE_SCRIPT_TIMEOUT_SECONDS of exec, and the blocking namespace
+        # cleanup — 900s leaves margin over that worst case.
+        with filelock.FileLock(f"{selection_path}.lock", timeout=900):
+            if selection_path.exists():
+                selection = json.loads(selection_path.read_text())
+                if "error" in selection:
+                    raise ValueError(f"Provider selection failed on the first worker: {selection['error']}")
+            else:
+                try:
+                    selection = select_from_pool()
+                except (ValueError, TimeoutExpiredError) as selection_error:
+                    store_provider_selection(selection_path=selection_path, content={"error": str(selection_error)})
+                    raise
+                store_provider_selection(selection_path=selection_path, content=selection)
+    py_config["source_provider"] = selection["provider"]
+    if selection["rtt_ms"] is None:
+        LOGGER.info(f"Source provider for this run: {selection['provider']} (selected without probing)")
+    else:
+        LOGGER.info(f"Source provider for this run: {selection['provider']} ({selection['rtt_ms']:.1f} ms)")
+    return selection["provider"]
+
+
 def pytest_sessionstart(session):
     required_config = ("storage_class", "source_provider")
 
@@ -165,7 +255,21 @@ def pytest_sessionstart(session):
 
         missing_configs: list[str] = []
 
+        # Latency-based pool selection (issue #728): a provider-type pool key
+        # (version optional) replaces the explicit provider key. The selection itself
+        # runs later, in the selected_source_provider fixture, once per run.
+        pool_type = py_config.get("source_provider_type")
+        pool_version = py_config.get("source_provider_version")
+        if not py_config.get("source_provider") and pool_version and not pool_type:
+            pytest.exit(
+                reason="source_provider_version requires source_provider_type",
+                returncode=1,
+            )
+
         for _req in required_config:
+            if _req == "source_provider" and pool_type:
+                # Pool mode: the provider is resolved by the latency fixture.
+                continue
             if not py_config.get(_req):
                 missing_configs.append(_req)
 
@@ -204,6 +308,21 @@ def pytest_fixture_setup(fixturedef, request):
     LOGGER.info(f"Executing {fixturedef.scope} fixture: {fixturedef.argname}")
 
 
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_protocol(item: pytest.Item) -> Generator[None, None, None]:
+    """Initialize class-plan state before setup, including hooks that can skip or fail.
+
+    Args:
+        item (pytest.Item): Item whose setup/call/teardown protocol is starting.
+
+    Returns:
+        None: Hook wrapper — the yield passes control to the inner runtest protocol hooks.
+    """
+    if not is_dry_run(item.config) and not item.config.getoption("skip_data_collector"):
+        initialize_class_plan_context(item)
+    yield
+
+
 def pytest_runtest_setup(item):
     # Incremental test support - xfail if previous test in class failed
     if "incremental" in item.keywords:
@@ -219,8 +338,35 @@ def pytest_runtest_call(item):
     BASIC_LOGGER.info(f"{separator(symbol_='-', val='CALL')}")
 
 
-def pytest_runtest_teardown(item):
+@pytest.hookimpl(tryfirst=True, wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> Generator[None, object, object]:
+    """Gather at a class-plan boundary, always allowing pytest's fixture finalization.
+
+    Args:
+        item (pytest.Item): Item about to tear down.
+        nextitem (pytest.Item | None): Next worker item, or None when execution stops.
+
+    Returns:
+        object: The result of the inner pytest_runtest_teardown hooks, forwarded unchanged.
+    """
     BASIC_LOGGER.info(f"{separator(symbol_='-', val='TEARDOWN')}")
+    try:
+        collector_error = item.stash.get(_STANDALONE_MUST_GATHER_ERROR, None)
+        if collector_error is not None:
+            raise collector_error.with_traceback(collector_error.__traceback__)
+        if not is_dry_run(item.config) and not item.config.getoption("skip_data_collector"):
+            try:
+                collect_class_must_gather(item, nextitem)
+            except Exception as exp:
+                # Report the collector error once as this item's teardown error. The stash keeps
+                # pytest_exception_interact from retrying the same gather inside its hook (a second
+                # raise there becomes an INTERNALERROR); the identity stays pending for the
+                # session-end flush.
+                item.stash[_CLASS_MUST_GATHER_ERROR] = exp
+                raise
+    finally:
+        teardown_outcome = yield
+    return teardown_outcome
 
 
 def pytest_report_teststatus(report, config):
@@ -242,9 +388,26 @@ def pytest_report_teststatus(report, config):
             BASIC_LOGGER.info(f"\nTEST: {test_name} STATUS: \033[0;31mFAILED\033[0m")
 
 
-def pytest_sessionfinish(session, exitstatus):
+@pytest.hookimpl(tryfirst=True, wrapper=True)
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> Generator[None, object, object]:
+    """Flush diagnostics and finish cleanup without suppressing collector programming errors.
+
+    Diagnostics flush, resource inventory, and configured teardown run before the yield: the xdist
+    worker reports completion from its own sessionfinish wrapper, so cleanup placed after that
+    yield could be interrupted by worker shutdown mid-deletion. Work that needs other plugins'
+    sessionfinish output (JUnit enrichment, terminal summary) runs after the yield, even when an
+    inner session-finish hook raises. An inner-hook, cleanup, or post-yield failure is re-raised
+    after that processing, chained from the earliest earlier error so all of them stay visible.
+
+    Args:
+        session (pytest.Session): Worker-local session holding pending diagnostics and resources.
+        exitstatus (int): Pytest exit status before session cleanup.
+
+    Returns:
+        object: The result of the inner pytest_sessionfinish hooks, forwarded unchanged.
+    """
     if is_dry_run(session.config):
-        return
+        return (yield)
 
     BASIC_LOGGER.info(f"{separator(symbol_='-', val='SESSION FINISH')}")
 
@@ -252,34 +415,82 @@ def pytest_sessionfinish(session, exitstatus):
 
     _data_collector_path = Path(session.config.getoption("data_collector_path"))
 
-    if not session.config.getoption("skip_data_collector"):
-        collect_created_resources(session_store=_session_store, data_collector_path=_data_collector_path)
-
-    if session.config.getoption("skip_teardown"):
-        LOGGER.warning("User requested to skip teardown of resources")
-
-    else:
-        # TODO: Maybe we need to check session_teardown return and fail the run if any leftovers
+    # --- Pre-yield cleanup: must finish before the xdist worker reports completion ---
+    cleanup_error: Exception | None = None
+    inner_error: Exception | None = None
+    try:
+        # Each independent action runs even if an earlier one raises; errors stay chained.
         try:
-            session_teardown(session_store=_session_store)
-        except Exception as exp:
-            LOGGER.error(f"the following resources was left after tests are finished: {exp}")
             if not session.config.getoption("skip_data_collector"):
-                run_must_gather(data_collector_path=_data_collector_path)
-
-    shutil.rmtree(path=session.config.option.basetemp, ignore_errors=True)
-    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
-    reporter.summary_stats()
-
-    if session.config.getoption("analyze_with_ai"):
-        if exitstatus == 0:
-            LOGGER.info("No test failures (exit code %d), skipping AI analysis", exitstatus)
-
-        else:
+                flush_pending_class_must_gathers(session)
+        finally:
             try:
-                enrich_junit_xml(session)
-            except Exception:
-                LOGGER.exception("Failed to enrich JUnit XML, original preserved")
+                if not session.config.getoption("skip_data_collector"):
+                    collect_created_resources(session_store=_session_store, data_collector_path=_data_collector_path)
+            finally:
+                try:
+                    if session.config.getoption("skip_teardown"):
+                        LOGGER.warning("User requested to skip teardown of resources")
+                    else:
+                        try:
+                            session_teardown(session_store=_session_store)
+                        except Exception:
+                            LOGGER.exception("Resources remain after session teardown")
+                            if not session.config.getoption("skip_data_collector"):
+                                run_must_gather(data_collector_path=_data_collector_path)
+                            raise
+                finally:
+                    shutil.rmtree(path=session.config.option.basetemp, ignore_errors=True)
+    except Exception as exp:
+        cleanup_error = exp
+
+    # --- Inner session hooks: retain a raised exception so reporting still runs ---
+    session_outcome: object = None
+    try:
+        session_outcome = yield
+    except Exception as exp:
+        inner_error = exp
+
+    # --- Post-yield reporting: needs other plugins' session-finish output ---
+    try:
+        try:
+            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+            reporter.summary_stats()
+            selector_coverage_notes = _session_store.get("selector_coverage_not_run", [])
+            if selector_coverage_notes:
+                reporter.write_sep("=", "ConvertorNodeSelector coverage not exercised")
+                for note in selector_coverage_notes:
+                    reporter.write_line(note)
+        finally:
+            if session.config.getoption("analyze_with_ai"):
+                if exitstatus == 0:
+                    LOGGER.info(f"No test failures (exit code {exitstatus}), skipping AI analysis")
+                else:
+                    try:
+                        enrich_junit_xml(session)
+                    except Exception:
+                        LOGGER.exception("Failed to enrich JUnit XML, original preserved")
+                        raise
+    except Exception as post_yield_error:
+        # A post-yield failure must not swallow earlier errors: chain it from the earliest
+        # failure, linking the other earlier failure into the same chain so every traceback
+        # stays visible.
+        if cleanup_error is not None and inner_error is not None:
+            inner_error.__cause__ = cleanup_error
+            raise post_yield_error from inner_error
+        earlier_error = cleanup_error or inner_error
+        if earlier_error is not None:
+            raise post_yield_error from earlier_error
+        raise
+
+    # --- Error propagation: the earliest failure wins, later ones chain from it ---
+    if inner_error is not None:
+        if cleanup_error is not None:
+            raise inner_error from cleanup_error
+        raise inner_error
+    if cleanup_error is not None:
+        raise cleanup_error
+    return session_outcome
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -306,12 +517,19 @@ def pytest_collection_modifyitems(session, config, items):
     #        @pytest.mark.my_new_marker
     #        class TestMyFeature: ...
     # -------------------------------------------------------------------
+    # Resolve each item's plan config once: the skip loops and the later rename loop share
+    # the same resolution (parametrization fields or item.originalname).
+    resolved_plan_configs = [(item, resolve_item_plan_config(item)) for item in items]
     if not is_dry_run(config):
         providers_json_path = config.getoption("providers_json", default=None)
         providers = load_source_providers(providers_json_path=providers_json_path)
         # .get() with default is intentional: source_provider may not be configured (e.g., partial config),
-        # in which case provider-type gating is silently skipped.
-        source_provider_type = providers.get(py_config.get("source_provider", ""), {}).get("type")
+        # in which case provider-type gating is silently skipped. In pool mode the provider key is
+        # unresolved at collection time (the latency fixture runs later), so the pool's
+        # type key drives the gating instead.
+        source_provider_type = providers.get(py_config.get("source_provider", ""), {}).get("type") or py_config.get(
+            "source_provider_type"
+        )
 
         if source_provider_type:
             # Skip warm migration tests for providers that do not support warm migration.
@@ -327,11 +545,14 @@ def pytest_collection_modifyitems(session, config, items):
                     if "warm" in item.keywords:
                         item.add_marker(warm_skip)
 
-            # Skip vSphere-only tests for non-vSphere providers.
+            # Skip vSphere-marked tests unless they also declare the configured source
+            # provider, and skip vSphere-only feature tests, on non-vSphere runs.
             if source_provider_type != Provider.ProviderType.VSPHERE:
                 vsphere_only_skip = pytest.mark.skip(reason="Test is only applicable to vSphere source providers")
+                configured_provider_marker = _PROVIDER_TEST_MARKERS[source_provider_type]
                 for item in items:
-                    if any(
+                    is_vsphere_scoped = "vsphere" in item.keywords and configured_provider_marker not in item.keywords
+                    if is_vsphere_scoped or any(
                         kw in item.keywords for kw in ("copyoffload", "shared_disk", "deep_inspection", "aap", "luks")
                     ):
                         item.add_marker(vsphere_only_skip)
@@ -349,50 +570,170 @@ def pytest_collection_modifyitems(session, config, items):
                     if "ca_crt" in item.keywords:
                         item.add_marker(ca_cert_skip)
 
-    _session_store = get_fixture_store(session)
-    vms_for_current_session: set = set()
+            # Skip tests whose plan config requests `add_nic` on a non-vSphere provider.
+            # `add_nic` is a plan config flag, not a marker, so resolve each item's config.
+            if not supports_add_nic(source_provider_type):
+                add_nic_skip = pytest.mark.skip(
+                    reason=f"add_nic is vSphere-only; skipping for provider '{source_provider_type}'"
+                )
+                for item, test_config in resolved_plan_configs:
+                    if test_config is None:
+                        continue
+                    # `virtual_machines` is a required plan-config field: direct access fails the
+                    # collection run with a clear KeyError instead of a later fixture error.
+                    if any(vm.get("add_nic") for vm in test_config["virtual_machines"]):
+                        item.add_marker(add_nic_skip)
 
-    for item in items:
-        item.name = f"{item.name}-{py_config.get('source_provider')}-{py_config.get('storage_class')}"
+    # In pool mode the provider is unresolved at collection time; the pool type labels the items.
+    provider_label = py_config.get("source_provider") or py_config.get("source_provider_type")
 
-        # Get test config from parametrization or tests_params
-        test_config = None
-        if hasattr(item, "callspec"):
-            # Class-based tests use class_plan_config
-            test_config = item.callspec.params.get("class_plan_config")
-            if test_config is None:
-                # Function-based tests use plan
-                test_config = item.callspec.params.get("plan")
+    for item, _ in resolved_plan_configs:
+        item.name = f"{item.name}-{provider_label}-{py_config.get('storage_class')}"
 
-        if test_config is None:
-            # Fallback to looking up by test name (for non-parametrized tests)
-            test_config = py_config["tests_params"].get(item.originalname)
 
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Collect the base VM entries needed by the tests selected for this run.
+
+    Runs after all deselection (``-k``, ``-m``, path selection, ``--ignore``), so only VMs
+    of tests that will actually execute are collected. Items skipped at collection time
+    (provider gating) never execute fixtures, so their VMs are not needed. Each entry keeps
+    the ``clone`` flag so the existence snapshot can apply copy-offload name overrides.
+
+    Args:
+        session (pytest.Session): Pytest session holding the final selected items.
+    """
+    # Entry shape is {name: str, clone: bool}, built from free-form `tests_params` VM data whose
+    # values are heterogeneous (hence Any, like all plan-config data).
+    vms_for_current_session: list[dict[str, Any]] = []
+    for item in session.items:
+        if item.get_closest_marker("skip"):
+            continue
+        test_config = resolve_item_plan_config(item=item)
         if test_config and "virtual_machines" in test_config:
-            for _vm in test_config["virtual_machines"]:
-                vms_for_current_session.add(_vm["name"])
+            for vm in test_config["virtual_machines"]:
+                vms_for_current_session.append({"name": vm["name"], "clone": vm.get("clone", False)})
 
-    _session_store["vms_for_current_session"] = vms_for_current_session
+    get_fixture_store(session)["vms_for_current_session"] = vms_for_current_session
+    # Logged in every mode, including `--collect-only`: the run command decides the needed VMs.
+    LOGGER.info(
+        f"Base VMS names for current session:\n {'\n'.join(sorted({vm['name'] for vm in vms_for_current_session}))}"
+    )
 
-    if not is_dry_run(session.config):
-        LOGGER.info(f"Base VMS names for current session:\n {'\n'.join(vms_for_current_session)}")
+
+def _handle_failure_must_gather(node: pytest.Item, call: pytest.CallInfo[BaseException]) -> None:
+    """Collect or defer a must-gather for a failing test item.
+
+    Standalone tests gather immediately, once per worker-qualified identity. Their setup/call
+    collector errors propagate to the caller, which stashes them on the item for teardown.
+    Class setup/call failures are marked pending for the class-plan boundary; when the remote
+    debugger is enabled the owed gather runs immediately against the still-alive class Plan so
+    diagnostics precede the blocking post-mortem session. Class teardown failures gather through
+    the boundary-aware teardown path.
+
+    Args:
+        node (pytest.Item): The test item reporting the exception.
+        call (pytest.CallInfo[BaseException]): The call info of the failing phase.
+
+    Raises:
+        Exception: Whatever the attempted collection raises, for the caller to defer or re-raise.
+
+    Returns:
+        None: The helper only records or collects diagnostics.
+    """
+    node_cls: type | None = getattr(node, "cls", None)
+    if node_cls is None:
+        collected: set[str] = getattr(node.session, "_must_gather_collected_tests", set())
+        worker: str = getattr(node.config, "workerinput", {}).get("workerid", "master")
+        identity = f"{node.nodeid}::worker={worker}"
+        collector_error = node.stash.get(_STANDALONE_MUST_GATHER_ERROR, None)
+        if call.when == "teardown" and collector_error is not None:
+            del node.stash[_STANDALONE_MUST_GATHER_ERROR]
+            return
+        if identity not in collected and collect_must_gather_for_item(node, identity, plan_obj=None):
+            collected.add(identity)
+            setattr(node.session, "_must_gather_collected_tests", collected)
+        return
+
+    if call.when == "teardown":
+        class_collector_error = node.stash.get(_CLASS_MUST_GATHER_ERROR, None)
+        if class_collector_error is not None:
+            # The teardown wrapper already reported this collector error; retrying the gather here
+            # would raise inside the hook and abort the worker with an INTERNALERROR. The identity
+            # stays pending for the session-end flush.
+            del node.stash[_CLASS_MUST_GATHER_ERROR]
+            return
+        collect_class_teardown_must_gather(node)
+        return
+
+    mark_class_pending_must_gather(node)
+    if remote_debugger_enabled():
+        # The post-mortem debugger blocks the process until a client detaches, so the owed gather
+        # runs now, against the still-alive class Plan, instead of waiting for the class-plan
+        # boundary. Success marks the identity collected and the boundary skips it; a failed
+        # attempt stays pending for the boundary retry and the session-end flush.
+        collect_pending_class_must_gather_now(node)
 
 
 def pytest_exception_interact(node, call, report):
+    """Defer or collect a must-gather for a failing test, then open the remote post-mortem debugger.
+
+    Setup/call failures record the failing item by class-plan identity. The tryfirst teardown hook
+    binds Plan context at the nextitem boundary before default fixture finalization for all retries.
+    With no plan, it binds None and takes a full gather. Standalone tests gather immediately, once on success.
+    Collection-phase failures from collectors carry no test context and are left to pytest's own
+    reporting; the hook returns without gathering so a collection error stays a collection error.
+    Unexpected standalone setup/call collector errors are retained on the item until fixture finalization.
+    Earlier method teardown failures are deferred while the same class-plan continues. Boundary
+    finalizer failures arrive after cleanup and gather only if no successful gather already exists.
+
+    Args:
+        node (pytest.Item): The test item reporting the exception.
+        call (pytest.CallInfo[BaseException]): The call info of the failing phase.
+        report (pytest.TestReport): The report of the failing phase.
+
+    Returns:
+        None: The hook only records or collects diagnostics.
+    """
     if is_dry_run(node.session.config):
         return
 
-    if not node.session.config.getoption("skip_data_collector"):
-        _data_collector_path = Path(
-            f"{node.session.config.getoption('data_collector_path')}/{sanitize_test_name_for_path(node.name)}"
-        )
-        plan = None
-        if hasattr(node, "cls") and node.cls and hasattr(node.cls, "plan_resource"):
-            plan_obj = node.cls.plan_resource
-            if plan_obj:
-                plan = {"name": plan_obj.name, "namespace": plan_obj.namespace}
+    if call.when == "collect":
+        # Collection failures from collectors (a Module that fails to import, or a Class collector
+        # whose collection failed) have no test context; pytest reports them itself. This check runs
+        # before the class/standalone split because a pytest.Class collector reports `cls` as set.
+        # Attempting a gather here would re-raise inside this hook and turn a reportable collection
+        # error into an INTERNALERROR.
+        return
 
-        run_must_gather(data_collector_path=_data_collector_path, plan=plan)
+    if not node.session.config.getoption("skip_data_collector"):
+        try:
+            _handle_failure_must_gather(node=node, call=call)
+        except Exception as exp:
+            if getattr(node, "cls", None) is None and call.when in ("setup", "call"):
+                # Retain a standalone collector error on this item so setup/call reporting can
+                # reach fixture teardown; the teardown wrapper re-raises it as the item's error.
+                node.stash[_STANDALONE_MUST_GATHER_ERROR] = exp
+            else:
+                raise
+
+    # Remote post-mortem debugger (MTV_REMOTE_PDB). Reached by every non-dry-run, non-collect
+    # failure regardless of --skip-data-collector, after must-gather handling so diagnostics
+    # precede the blocking debugger session: standalone gathers already ran, and class gathers
+    # ran immediately above when the debugger is enabled (otherwise they are deferred to the
+    # class-plan boundary). Skipped when --pdb is active so the local terminal debugger takes
+    # precedence, and skipped for BdbQuit so quitting a code breakpoint fails that test without
+    # opening another listener. A debugger quit ends the test session, matching pytest's native
+    # --pdb behavior. usepdb has a default because -p no:pdb removes the option.
+    if (
+        remote_debugger_enabled()
+        and not node.config.getoption("usepdb", default=False)
+        and call.excinfo is not None
+        and not isinstance(call.excinfo.value, bdb.BdbQuit)
+    ):
+        try:
+            remote_post_mortem(exception=call.excinfo.value)
+        except bdb.BdbQuit:
+            pytest.exit("Quitting remote debugger")
 
 
 # https://smarie.github.io/python-pytest-harvest/#pytest-x-dist
@@ -440,9 +781,19 @@ def pytest_harvest_xdist_cleanup():
 
 @pytest.fixture(scope="session", autouse=True)
 def autouse_fixtures(
-    source_provider_data, nfs_storage_profile, base_resource_name, forklift_pods_state, virtctl_binary
+    selected_source_provider,
+    source_provider_data,
+    nfs_storage_profile,
+    storage_canary,
+    base_resource_name,
+    forklift_pods_state,
+    virtctl_binary,
 ):
-    # source_provider_data called here to fail fast in provider not found in the providers list from config
+    # selected_source_provider runs first so pool-mode runs resolve their
+    # provider before anything consumes it. source_provider_data is called here to
+    # fail fast if the provider is not found in the providers list from config.
+    # storage_canary (which creates target_namespace) runs before any class-scoped
+    # fixture so broken destination storage fails the session before migrations run.
     yield
 
 
@@ -490,6 +841,36 @@ def target_namespace(fixture_store, session_uuid, ocp_admin_client):
     )
     namespace.wait_for_status(status=namespace.Status.ACTIVE)
     yield namespace.name
+
+
+@pytest.fixture(scope="session")
+def storage_canary(
+    ocp_admin_client: DynamicClient,
+    target_namespace: str,
+    session_uuid: str,
+) -> None:
+    """Fail fast when destination storage provisioning is permanently failing.
+
+    Creates a small canary PVC in the target namespace using the run's configured
+    storage class, before any migration runs. Healthy storage binds it in seconds;
+    a canary that is still Pending after the bind timeout fails the session.
+    WaitForFirstConsumer storage classes are skipped (a bare canary PVC cannot
+    bind without a consumer).
+
+    Args:
+        ocp_admin_client (DynamicClient): OpenShift admin client for the target cluster.
+        target_namespace (str): Target namespace for the canary PVC.
+        session_uuid (str): Session UUID, used for the canary PVC name.
+
+    Raises:
+        StorageProvisioningError: If the destination storage class cannot provision volumes.
+        ValueError: If the configured storage class does not exist on the cluster.
+    """
+    verify_destination_storage_provisioning(
+        client=ocp_admin_client,
+        namespace=target_namespace,
+        session_uuid=session_uuid,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -547,6 +928,26 @@ def ocp_admin_client():
             raise RemoteClusterAndLocalCluterNamesError("Remote cluster must be the same as local cluster.")
 
     yield _client
+
+
+@pytest.fixture(scope="session")
+def target_ocp_version(ocp_admin_client: DynamicClient) -> str:
+    """Target (destination) OpenShift cluster version as "major.minor".
+
+    Derived from the cluster the run targets, so generated VM names always
+    match the actual target cluster version.
+
+    Args:
+        ocp_admin_client (DynamicClient): OpenShift admin client for the target cluster.
+
+    Returns:
+        str: Cluster version formatted as "major.minor" (e.g. "4.22").
+
+    Raises:
+        ValueError: If the cluster version cannot be determined or parsed.
+    """
+    version = get_cluster_version(client=ocp_admin_client)
+    return f"{version.major}.{version.minor}"
 
 
 @pytest.fixture(scope="session")
@@ -696,6 +1097,7 @@ def destination_provider(session_uuid, ocp_admin_client, target_namespace, fixtu
 
 @pytest.fixture(scope="session")
 def source_provider_data(
+    selected_source_provider: str,
     source_providers: dict[str, dict[str, Any]],
     fixture_store: dict[str, Any],
     request: pytest.FixtureRequest,
@@ -703,6 +1105,8 @@ def source_provider_data(
     """Resolve source provider configuration from the loaded providers data.
 
     Args:
+        selected_source_provider (str): The explicit or latency-selected provider
+            key; requested directly so selection always runs before this fixture.
         source_providers (dict[str, dict[str, Any]]): All provider configurations loaded from providers JSON file.
         fixture_store (dict[str, Any]): Session fixture store for teardown tracking.
         request (pytest.FixtureRequest): Pytest request object to access CLI options.
@@ -719,7 +1123,7 @@ def source_provider_data(
     if not source_providers:
         raise MissingProvidersFileError(path=providers_path)
 
-    requested_provider = py_config["source_provider"]
+    requested_provider = selected_source_provider
     if requested_provider not in source_providers:
         raise ValueError(
             f"Source provider '{requested_provider}' not found in '{providers_path}'. "
@@ -996,30 +1400,104 @@ def class_plan_config(request: pytest.FixtureRequest) -> dict[str, Any]:
     return request.param
 
 
+@pytest.fixture(scope="session")
+def source_vms_existence(
+    fixture_store: dict[str, Any],
+    selected_source_provider: str,
+    source_provider: BaseProvider,
+    source_provider_inventory: ForkliftInventory,
+) -> dict[str, bool]:
+    """Snapshot which run-needed VMs exist in the source provider inventory, once per session.
+
+    The Forklift inventory is what MTV actually migrates, so it is the source of truth for
+    VM existence. The snapshot is logged (found summary plus one ERROR line per missing VM),
+    stored in the session store, and returned for reuse by test classes. The OpenShift source
+    is skipped because its VMs are created at runtime. Dry runs never execute fixtures, so
+    the provider is never queried for ``--collect-only``.
+
+    Args:
+        fixture_store (dict[str, Any]): Session fixture store.
+        selected_source_provider (str): Configured name of the source provider.
+        source_provider (BaseProvider): Source provider instance.
+        source_provider_inventory (ForkliftInventory): Forklift inventory of the source provider.
+
+    Returns:
+        dict[str, bool]: VM name to existence in the provider inventory; empty when skipped.
+    """
+    if source_provider.type in (Provider.ProviderType.OPENSHIFT,):
+        fixture_store["source_vms_existence"] = {}
+        LOGGER.info(
+            f"Source provider '{selected_source_provider}' (type {source_provider.type}) creates "
+            "VMs at runtime; skipping VM existence snapshot"
+        )
+        return {}
+
+    # Copy-offload overrides replace placeholder names after collection: apply the same
+    # override so the snapshot checks the effective names the classes actually use.
+    virtual_machines = [dict(vm) for vm in fixture_store["vms_for_current_session"]]
+    apply_copyoffload_vm_name_override(virtual_machines=virtual_machines, source_provider=source_provider)
+    vm_names = sorted({vm["name"] for vm in virtual_machines})
+
+    # RHV clones from templates, which the Forklift inventory does not list (see
+    # get_vm_or_template_networks): template existence is verified on the provider itself.
+    check_scope = (
+        f"on source provider '{selected_source_provider}' [{source_provider.host}] "
+        f"(type {source_provider.type}; templates are not listed in the inventory)"
+        if isinstance(source_provider, OvirtProvider)
+        else f"in the inventory of source provider '{selected_source_provider}' "
+        f"[{source_provider.host}] (type {source_provider.type})"
+    )
+    LOGGER.info(f"Checking existence of {len(vm_names)} needed VMs {check_scope}")
+    missing = get_missing_source_vms(
+        source_provider=source_provider,
+        source_provider_inventory=source_provider_inventory,
+        vm_names=vm_names,
+    )
+    vm_existence: dict[str, bool] = {name: name not in missing for name in vm_names}
+    fixture_store["source_vms_existence"] = vm_existence
+
+    LOGGER.info(
+        f"Source VM existence {check_scope}: found: {sorted(name for name, exists in vm_existence.items() if exists)}"
+    )
+    for name in missing:
+        LOGGER.error(f"VM '{name}' needed by the current run was not found {check_scope}")
+    return vm_existence
+
+
 @pytest.fixture(scope="class")
 def validated_source_vms(
     class_plan_config: dict[str, Any],
-    source_provider: Any,
+    selected_source_provider: str,
+    source_provider: BaseProvider,
+    source_vms_existence: dict[str, bool],
 ) -> None:
-    """Validate that source VMs/templates exist on the provider before any test setup.
+    """Validate that the class's source VMs exist in the provider inventory before any test setup.
 
-    Runs once per test class as early as possible to fail fast before cloning,
-    namespace creation, or other expensive setup.
+    Uses the session-level existence snapshot, which already covers copy-offload effective
+    names. Runs once per test class as early as possible to fail fast before cloning,
+    namespace creation, or other expensive setup. The OpenShift source is skipped because
+    its VMs are created at runtime.
 
     Args:
         class_plan_config (dict[str, Any]): Plan configuration from parametrization.
-        source_provider: Source provider instance.
+        selected_source_provider (str): Configured name of the source provider.
+        source_provider (BaseProvider): Source provider instance.
+        source_vms_existence (dict[str, bool]): Session VM existence snapshot.
 
     Raises:
-        VmNotFoundError: If one or more VMs/templates are not found.
+        VmNotFoundError: If one or more VMs are not found.
     """
-    if source_provider.type not in (Provider.ProviderType.OVA, Provider.ProviderType.OPENSHIFT):
-        virtual_machines = [dict(vm) for vm in class_plan_config["virtual_machines"]]
-        apply_copyoffload_vm_name_override(virtual_machines=virtual_machines, source_provider=source_provider)
-        validate_source_vms_exist(
-            source_provider=source_provider,
-            vm_names=[vm["name"] for vm in virtual_machines],
-        )
+    if source_provider.type in (Provider.ProviderType.OPENSHIFT,):
+        return
+
+    virtual_machines = [dict(vm) for vm in class_plan_config["virtual_machines"]]
+    apply_copyoffload_vm_name_override(virtual_machines=virtual_machines, source_provider=source_provider)
+    missing = [vm["name"] for vm in virtual_machines if not source_vms_existence.get(vm["name"])]
+    raise_for_missing_source_vms(
+        source_provider=source_provider,
+        provider_name=selected_source_provider,
+        missing=missing,
+    )
 
 
 @pytest.fixture(scope="class")
@@ -1106,9 +1584,19 @@ def prepared_plan(
     if source_provider.type != Provider.ProviderType.OVA:
         openshift_source_provider: bool = source_provider.type == Provider.ProviderType.OPENSHIFT
 
-        vm_name_suffix = get_vm_suffix(warm_migration=warm_migration)
+        # Resolved lazily via request so OVA plans (which skip VM-name suffix generation)
+        # never parse the cluster version.
+        vm_name_suffix = get_vm_suffix(
+            warm_migration=warm_migration,
+            ocp_version=request.getfixturevalue("target_ocp_version"),
+        )
 
         if openshift_source_provider:
+            # OCPProvider.get_vm_by_name resolves VMs only within this namespace:
+            # concurrent sessions create identically-named VMs in their own
+            # source namespaces.
+            source_provider.source_vms_namespace = source_vms_namespace
+
             # Generate unique network name for class-based tests
             hash_prefix = generate_class_hash_prefix(request.node.nodeid, session_uuid=fixture_store["session_uuid"])
             multus_network_name = f"cb-{hash_prefix}"
@@ -1149,10 +1637,10 @@ def prepared_plan(
                 "does not implement relink_shared_disks"
             )
 
+        # The non-vSphere provider case is gated at collection time in
+        # pytest_collection_modifyitems (pytest.skip must not be used in fixtures).
         has_add_nic_config = any(vm.get("add_nic") for vm in virtual_machines)
         if has_add_nic_config:
-            if not isinstance(source_provider, VMWareProvider):
-                pytest.skip(f"add_nic is vSphere-only; skipping for provider '{source_provider.type}'")
             for vm in virtual_machines:
                 if vm.get("add_nic"):
                     if "add_nic_start_connected" not in vm:
@@ -1170,7 +1658,7 @@ def prepared_plan(
                 f"disable_drs_for_vms requires a VMware clone provider, got '{type(clone_provider).__name__}'"
             )
 
-        if plan.get("preserve_static_ips"):
+        if plan.get("preserve_static_ips", False):
             for vm in virtual_machines:
                 if vm.get("source_vm_power") != "on":
                     raise ValueError(
@@ -1183,11 +1671,20 @@ def prepared_plan(
         cloned_vm_names: list[str] = []
         first_vm_esxi_host: str | None = None
         non_dedicated_host_name: str | None = None
+        dedicated_host_name: str | None = None
         # VM name -> expected total NIC count after add_nic; used to wait for a fresh inventory
         # that includes the added NIC before NetworkMap creation.
         added_nic_expected_counts: dict[str, int] = {}
 
         skip_clone = plan.get("skip_clone", False)
+
+        if plan.get("pin_first_vm_to_dedicated_host", False) and plan.get("clone_to_same_host", False):
+            subsequent_vms_without_target = [vm for vm in virtual_machines[1:] if not vm.get("target_esxi_host")]
+            if subsequent_vms_without_target:
+                raise ValueError(
+                    "pin_first_vm_to_dedicated_host with clone_to_same_host requires an explicit "
+                    "target_esxi_host for each subsequent VM"
+                )
 
         if skip_clone:
             if not source_provider.supports_skip_clone():
@@ -1195,7 +1692,12 @@ def prepared_plan(
                     f"skip_clone=True is not supported for provider type '{source_provider.type}'; "
                     "VMs must be cloned from templates."
                 )
-            skip_clone_incompatible = ["disable_drs_for_vms", "clone_to_same_host"]
+            skip_clone_incompatible = [
+                "disable_drs_for_vms",
+                "clone_to_same_host",
+                "pin_to_non_dedicated_host",
+                "pin_first_vm_to_dedicated_host",
+            ]
             if source_provider.type != Provider.ProviderType.HYPERV:
                 skip_clone_incompatible.append("preserve_static_ips")
             conflicting = [flag for flag in skip_clone_incompatible if plan.get(flag)]
@@ -1231,7 +1733,7 @@ def prepared_plan(
                     elif source_vm_power == "off":
                         source_provider.stop_vm(provider_vm_api)
 
-                if plan.get("preserve_static_ips"):
+                if plan.get("preserve_static_ips", False):
                     source_vm_details = source_provider.vm_dict(
                         provider_vm_api=provider_vm_api,
                         name=vm["name"],
@@ -1241,16 +1743,27 @@ def prepared_plan(
                     plan["source_vms_data"][vm["name"]] = source_vm_details
 
         if not skip_clone:
-            for vm in virtual_machines:
+            for vm_index, vm in enumerate(virtual_machines):
                 clone_options = {**vm, "enable_ctk": warm_migration}
+
+                if plan.get("pin_first_vm_to_dedicated_host", False) and vm_index == 0:
+                    if "target_esxi_host" in clone_options:
+                        raise ValueError(
+                            "pin_first_vm_to_dedicated_host conflicts with the first VM's target_esxi_host"
+                        )
+                    if dedicated_host_name is None:
+                        dedicated_host_name = resolve_dedicated_esxi_host(
+                            source_provider_inventory=source_provider_inventory,
+                            source_provider_data=source_provider_data,
+                        )
+                    clone_options["target_esxi_host"] = dedicated_host_name
 
                 # Pin VM2+ to same ESXi host as VM1 (required for per-host inflight throttling).
                 # Uses setdefault to respect any explicit per-VM target_esxi_host override.
                 if plan.get("clone_to_same_host", False) and first_vm_esxi_host:
                     clone_options.setdefault("target_esxi_host", first_vm_esxi_host)
 
-                # Pin every VM to an ESXi host outside the configured dedicated hosts, so
-                # dedicated-host verification can never coincide with a VM's own host (MTV-6136).
+                # Pin VMs without an explicit host target outside the dedicated hosts.
                 if plan.get("pin_to_non_dedicated_host", False):
                     if non_dedicated_host_name is None:
                         non_dedicated_host_name = resolve_non_dedicated_esxi_host(
@@ -1310,6 +1823,7 @@ def prepared_plan(
                     vm_name_suffix=vm_name_suffix,
                     session_uuid=fixture_store["session_uuid"],
                     clone_options=vm,
+                    source=True,
                 )
                 vm["name"] = source_vm_details["name"]
                 cloned_vm_names.append(vm["name"])
@@ -1350,7 +1864,7 @@ def prepared_plan(
                     except ValueError:
                         raise
                     except (GuestCommandError, vim.fault.VimFault, TimeoutExpiredError, OSError) as e:
-                        if plan.get("preserve_static_ips"):
+                        if plan.get("preserve_static_ips", False):
                             raise ValueError(
                                 f"Failed to detect IP origins via Guest Operations for VM {vm['name']}: {e}. "
                                 "IP origin detection is required when preserve_static_ips is enabled."
@@ -1360,7 +1874,7 @@ def prepared_plan(
                             "Static IP verification may not work for this VM."
                         )
 
-                    if plan.get("preserve_static_ips"):
+                    if plan.get("preserve_static_ips", False):
                         detect_guest_nic_names(
                             source_provider=source_provider,
                             vm=provider_vm_api,
@@ -1398,6 +1912,13 @@ def prepared_plan(
                     source_vm_names=original_source_vm_names,
                     cloned_vms=cloned_vm_objects,
                 )
+
+        if plan.get("preserve_static_ips", False) and source_provider.type == Provider.ProviderType.HYPERV:
+            wait_for_inventory_guest_networks(
+                source_provider_inventory=source_provider_inventory,
+                vm_names=[vm["name"] for vm in virtual_machines],
+                source_vms_data=plan["source_vms_data"],
+            )
     else:
         # OVA VMs aren't cloned — add unique targetName to prevent destination VM name conflicts
         # across parallel test sessions. The source VM name stays unchanged (must match OVA file).

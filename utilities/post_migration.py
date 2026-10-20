@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING, Any
 import go_template
 import jc
 import pytest
+from kubernetes.dynamic.exceptions import NotFoundError
 from ocp_resources.datavolume import DataVolume
+from ocp_resources.forklift_controller import ForkliftController
 from ocp_resources.network_map import NetworkMap
 from ocp_resources.plan import Plan
 from ocp_resources.provider import Provider
@@ -34,6 +36,7 @@ from utilities.utils import get_cluster_version, get_value_from_py_config, rhv_p
 from utilities.vmware_guest_operations import DATA_INTEGRITY_FILE
 
 if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
     from libs.providers.openshift import OCPProvider
 
 LOGGER = get_logger(name=__name__)
@@ -52,6 +55,12 @@ _NESTED_VIRT_DISABLED_FEATURES: list[dict[str, str]] = [
     {"name": "vmx", "policy": "disable"},
     {"name": "svm", "policy": "disable"},
 ]
+
+# Well-known name of the ForkliftController CR created by the MTV operator
+_FORKLIFT_CONTROLLER_NAME = "forklift-controller"
+
+# Session-level cache for is_multus_network_name_always_qualified(); tests never modify this flag.
+_multus_network_name_always_qualified_cache: bool | None = None
 
 
 def get_ssh_credentials_from_provider_config(
@@ -317,6 +326,22 @@ def verify_luks_encryption(
     LOGGER.info(f"LUKS encryption verified on VM {vm_name}: {len(luks_devices)} encrypted device(s) found")
 
 
+def _normalize_windows_command_output(output: str) -> str:
+    """Normalize Windows SSH command output for jc parsing.
+
+    The Windows OpenSSH exec channel may deliver UTF-16-mangled text (BOM and NUL
+    bytes) or CRLF line endings, which makes jc fail to recognize the output as
+    Windows ipconfig ("command output from this OS (linux) is not supported").
+
+    Args:
+        output: Raw command output string
+
+    Returns:
+        Normalized string: BOM and NUL bytes stripped, line endings unified to LF
+    """
+    return output.lstrip("\ufeff").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _parse_windows_network_config(ipconfig_output: str) -> dict[str, dict[str, Any]]:
     """
     Parse Windows ipconfig /all output to extract network interface information.
@@ -329,7 +354,7 @@ def _parse_windows_network_config(ipconfig_output: str) -> dict[str, dict[str, A
         Dictionary mapping interface names to their configuration
     """
     # Parse using jc library
-    parsed = jc.parse("ipconfig", ipconfig_output)
+    parsed = jc.parse("ipconfig", _normalize_windows_command_output(ipconfig_output))
 
     interfaces: dict[str, dict[str, Any]] = {}
 
@@ -433,6 +458,44 @@ def _extract_static_interfaces(source_vm_data: dict[str, Any]) -> list[dict[str,
                 }
                 static_interfaces.append(static_interface)
     return static_interfaces
+
+
+def _is_pod_mapped_static_interface(
+    # dict values are heterogeneous runtime provider data (bools, IP strings, nested
+    # network dicts) — the file-wide dict[str, Any] convention for external data.
+    static_interface: dict[str, Any],
+    destination_vm: dict[str, Any],
+    network_map_resource: NetworkMap,
+) -> bool:
+    """Check whether a static-IP interface landed on pod networking after migration.
+
+    The product does not preserve static IPs on pod-mapped interfaces (the Plan reports
+    the NetMapPreservingIPsOnPodNetwork warning), so those interfaces must be excluded
+    from static-IP verification.
+
+    When the interface's source network maps to a single destination the map alone is
+    decisive. When it maps to several destinations (per-NIC mapping can send one source
+    network to both pod and Multus), the actual binding is resolved from the destination
+    VM's NIC with the same MAC — the same resolution check_network relies on, because
+    Forklift assigns NICs to destinations at migration time.
+
+    Args:
+        static_interface: Flattened static-IP interface entry from _extract_static_interfaces
+        destination_vm: Destination VM data whose NICs carry the landed network names
+        network_map_resource: NetworkMap resource resolving source networks to destinations
+
+    Returns:
+        True if the interface is attached to the pod network on the destination VM
+    """
+    destinations = get_all_destinations(network_map_resource, static_interface)
+    if destinations == ["pod"]:
+        return True
+    if "pod" in destinations:
+        destination_nic = get_nic_by_mac(
+            nics=destination_vm["network_interfaces"], mac_address=static_interface["macAddress"]
+        )
+        return destination_nic["network"] == "pod"
+    return False
 
 
 def _verify_subnet_mask(interface_name: str, expected_subnet: str, matching_interface: dict[str, Any]) -> None:
@@ -612,6 +675,8 @@ def check_static_ip_preservation(
     vm_ssh_connections: SSHConnectionManager,
     source_vm_data: dict[str, Any],
     source_provider_data: dict[str, Any],
+    network_map_resource: NetworkMap,
+    destination_vm: dict[str, Any],
     timeout: int = 660,
     retry_delay: int = 30,
 ) -> None:
@@ -625,6 +690,10 @@ def check_static_ip_preservation(
         vm_ssh_connections: SSH connections fixture manager
         source_vm_data: Source VM data collected during plan setup
         source_provider_data: Provider configuration from .providers.json
+        network_map_resource: NetworkMap resolving source networks to destinations; static IPs
+            on pod-mapped interfaces are excluded from verification (not preserved by the product)
+        destination_vm: Destination VM data; resolves per-NIC destination binding by MAC when a
+            source network maps to several destinations (per-NIC mapping)
         timeout: Total timeout in seconds for network configuration retrieval (default: 660)
         retry_delay: Delay in seconds between retry attempts (default: 30)
 
@@ -649,6 +718,27 @@ def check_static_ip_preservation(
             f"preserve_static_ips is enabled but no static IP interfaces found for VM {vm_name}. "
             "Ensure the source VM is powered on so guest tools can report IP origin information."
         )
+
+    pod_mapped_interfaces = [
+        interface
+        for interface in static_interfaces
+        if _is_pod_mapped_static_interface(
+            static_interface=interface,
+            destination_vm=destination_vm,
+            network_map_resource=network_map_resource,
+        )
+    ]
+    if pod_mapped_interfaces:
+        for interface in pod_mapped_interfaces:
+            LOGGER.info(
+                f"Interface {interface['name']} ({interface['ip_address']}) excluded from static IP "
+                "verification: pod-network mapped, static IPs are not preserved on pod network"
+            )
+        static_interfaces = [interface for interface in static_interfaces if interface not in pod_mapped_interfaces]
+
+    if not static_interfaces:
+        LOGGER.info(f"All static IP interfaces for VM {vm_name} are pod-network mapped, nothing to verify")
+        return
 
     LOGGER.info(f"Found {len(static_interfaces)} static IP interfaces to verify")
 
@@ -1799,6 +1889,86 @@ def verify_rdm_disk_bus_types(
         )
 
 
+def is_multus_network_name_always_qualified(client: "DynamicClient") -> bool:
+    """Return whether ForkliftController forces qualified Multus networkName values.
+
+    Reads (and caches) the ``controller_multus_network_name_always_qualified`` flag;
+    tests never modify it.
+
+    Args:
+        client: DynamicClient connected to the cluster running MTV.
+
+    Returns:
+        True only when the flag is set to "true".
+
+    Raises:
+        ValueError: If the ForkliftController resource is not found.
+    """
+    global _multus_network_name_always_qualified_cache
+    if _multus_network_name_always_qualified_cache is None:
+        forklift_controller = ForkliftController(
+            client=client,
+            name=_FORKLIFT_CONTROLLER_NAME,
+            namespace=py_config["mtv_namespace"],
+        )
+        try:
+            controller_instance = forklift_controller.instance
+        except NotFoundError as err:
+            raise ValueError(
+                f"ForkliftController '{_FORKLIFT_CONTROLLER_NAME}' not found in namespace '{py_config['mtv_namespace']}'"
+            ) from err
+        always_qualified_value = getattr(
+            controller_instance.spec, "controller_multus_network_name_always_qualified", None
+        )
+        _multus_network_name_always_qualified_cache = str(always_qualified_value).lower() == "true"
+    return _multus_network_name_always_qualified_cache
+
+
+def check_vm_multus_network_name_form(
+    destination_vm: dict[str, Any],
+    network_map_resource: NetworkMap,
+    vm_namespace: str,
+) -> None:
+    """Verify the form of Multus networkName values in the migrated VM spec.
+
+    Each networkName must be the bare NAD name when the NAD is in the VM's namespace,
+    ``<namespace>/<name>`` otherwise, or always when the controller flag is set.
+    NIC-to-NAD identity is check_network's job.
+
+    Args:
+        destination_vm: Destination VM info dictionary containing provider_vm_api.
+        network_map_resource: NetworkMap whose multus destinations define the expectation.
+        vm_namespace: Namespace of the migrated VM.
+
+    Raises:
+        AssertionError: If a networkName is not a correctly-spelled mapped destination.
+        ValueError: If the ForkliftController resource is not found.
+    """
+    mapped_multus_nads: set[tuple[str, str]] = {
+        (map_item.destination.namespace or vm_namespace, map_item.destination.name)
+        for map_item in network_map_resource.instance.spec.map
+        if map_item.destination.type == "multus"
+    }
+    if not mapped_multus_nads:
+        return
+
+    always_qualified = is_multus_network_name_always_qualified(client=destination_vm["provider_vm_api"].client)
+    expected_forms = {
+        f"{namespace}/{name}" if namespace != vm_namespace or always_qualified else name
+        for namespace, name in mapped_multus_nads
+    }
+    actual_forms = {
+        network["multus"]["networkName"]
+        for network in destination_vm["provider_vm_api"].instance.spec.template.spec.networks or []
+        if network.get("multus")
+    }
+
+    assert actual_forms <= expected_forms, (
+        f"VM '{destination_vm['name']}': unexpected Multus networkName forms "
+        f"{sorted(actual_forms - expected_forms)}, allowed forms {sorted(expected_forms)}"
+    )
+
+
 def check_vms(
     plan: dict[str, Any],
     source_provider: BaseProvider,
@@ -1806,7 +1976,8 @@ def check_vms(
     network_map_resource: NetworkMap,
     storage_map_resource: StorageMap,
     source_provider_data: dict[str, Any],
-    source_vms_namespace: str,
+    # Source namespaces apply only to OpenShift; other providers ignore None.
+    source_vms_namespace: str | None,
     source_provider_inventory: ForkliftInventory | None = None,
     vm_ssh_connections: SSHConnectionManager | None = None,
     labeled_worker_node: dict[str, Any] | None = None,
@@ -1867,6 +2038,17 @@ def check_vms(
         except Exception as exp:
             res[vm_name].append(f"check_vms_power_state - {str(exp)}")
 
+        # OpenStack and OCP-source adapters always write the qualified "<namespace>/<name>" form
+        if source_provider.type not in (Provider.ProviderType.OPENSTACK, Provider.ProviderType.OPENSHIFT):
+            try:
+                check_vm_multus_network_name_form(
+                    destination_vm=destination_vm,
+                    network_map_resource=network_map_resource,
+                    vm_namespace=vm_namespace,
+                )
+            except (AssertionError, ValueError) as exp:
+                res[vm_name].append(f"check_vm_multus_network_name_form - {str(exp)}")
+
         if vm_guest_agent:
             try:
                 check_guest_agent(destination_vm=destination_vm)
@@ -1903,6 +2085,8 @@ def check_vms(
                         vm_ssh_connections=vm_ssh_connections,
                         source_vm_data=source_vm_data,
                         source_provider_data=source_provider_data,
+                        network_map_resource=network_map_resource,
+                        destination_vm=destination_vm,
                     )
                 except Exception as exp:
                     res[vm_name].append(f"check_static_ip_preservation - {str(exp)}")

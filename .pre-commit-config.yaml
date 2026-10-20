@@ -41,7 +41,7 @@ repos:
         exclude: ^docs/
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.9
+    rev: v0.17.1
     hooks:
       - id: ruff
       - id: ruff-format
@@ -53,7 +53,7 @@ repos:
         exclude: ^docs/
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v2.3.1
+    rev: v2.4.0
     hooks:
       - id: mypy
         additional_dependencies:
@@ -117,3 +117,14 @@ repos:
         entry: scripts/hooks/check_no_runtimeerror.py
         language: python
         types: [python]
+      - id: check-test-plan-docstring-schema
+        name: test classes must have a schema-conforming test plan docstring
+        entry: scripts/hooks/check_test_plan_docstring_schema.py
+        language: python
+        files: ^tests/
+        types: [python]
+      - id: check-agents-md-budget
+        name: AGENTS.md line budget (shrink-only)
+        entry: scripts/hooks/check_agents_md_budget.py
+        language: python
+        files: ^AGENTS\.md$

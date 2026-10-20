@@ -1,12 +1,13 @@
 # Runtime Configuration
 
-`mtv-api-tests` uses `pytest-testconfig` for suite settings and plain pytest flags for per-run behavior. In practice, you keep shared defaults in `tests/tests_config/config.py`, keep provider definitions in `.providers.json`, and pass environment-specific values such as `source_provider` and `storage_class` with `--tc=key:value`.
+`mtv-api-tests` uses `pytest-testconfig` for suite settings and plain pytest flags for per-run behavior. In practice, you keep shared defaults in `tests/tests_config/config.py`,
+keep provider definitions in `.providers.json`, and pass environment-specific values such as `source_provider` and `storage_class` with `--tc=key:value`.
 
 Most users only need to remember three things:
 
 1. `pytest.ini` already loads the default runtime config file for you.
 2. A normal test run requires `source_provider` and `storage_class`.
-3. The repo adds several custom pytest flags for cleanup, artifact collection, logging, and AI analysis.
+3. The repo adds custom pytest flags for cleanup, artifact collection, logging, provider-file selection, and AI analysis.
 
 ## How Configuration Is Loaded
 
@@ -25,7 +26,6 @@ addopts =
   --junit-xml=junit-report.xml
   --show-progress
   --strict-markers
-  --jira
   --dist=loadscope
 ```
 
@@ -37,36 +37,100 @@ What this means in day-to-day use:
 - The suite enables strict marker validation and xdist `loadscope` distribution.
 - Pytest's built-in logging plugin is disabled, and the suite configures its own logger.
 
-> **Note:** The default `addopts` also enable `--jira`. If you use JIRA-linked tests, `jira.cfg.example` shows the expected file format.
+> **Note:** JIRA integration is installed but opt-in. `pytest-jira` is a project dependency, and it registers `--jira` with a default of `False`. `--jira` is **not** part of
+> `addopts`. Add it yourself when you want JIRA-linked markers to drive test behavior; `jira.cfg.example` shows the expected `jira.cfg` format.
 
 ## Required Runtime Overrides
 
 For a normal run, the suite expects two runtime values even though they are not defined in the default config file:
 
 | Key | Required | Purpose |
-|---|---|---|
-| `source_provider` | Yes | Selects the source provider entry from `.providers.json` |
+| --- | --- | --- |
+| `source_provider` | Yes (or a pool, see below) | Selects the source provider entry from `.providers.json` |
+| `source_provider_type` | Pool alternative | Identifies the candidate pool for latency-based selection (required for pool mode) |
+| `source_provider_version` | Optional | Narrows the pool to an exact version; omitted, every version of the type competes |
+| `source_provider_feature` | Optional | Feature gate for the pool (`copyoffload`): copy-offload-capable providers are excluded without it and included with it |
 | `storage_class` | Yes | Sets the target OpenShift storage class for migration |
-| `cluster_host` | Optional | Passed into cluster client creation when supplied |
-| `cluster_username` | Optional | Passed into cluster client creation when supplied |
-| `cluster_password` | Optional | Passed into cluster client creation when supplied |
-| `target_ocp_version` | Optional | Used only for generated VM suffix naming |
+| `cluster_host` | Optional | Cluster API URL. Falls back to the `CLUSTER_HOST` environment variable |
+| `cluster_username` | Optional | Cluster user. Falls back to the `CLUSTER_USERNAME` environment variable |
+| `cluster_password` | Optional | Cluster password. Falls back to the `CLUSTER_PASSWORD` environment variable |
 
-The repository's own copy-offload job example uses `--tc=` overrides like this:
+If either required key is missing, the session aborts with `pytest.exit(...)` and return code `1` before any fixture runs.
+
+Cluster credentials resolve from the environment, in this order: the `--tc` value first, then the environment variable. `CLUSTER_VERIFY_SSL` takes
+precedence over `insecure_verify_skip` for OpenShift API SSL verification, and its semantics are inverted: `CLUSTER_VERIFY_SSL=true` means `insecure_verify_skip=False`.
+
+> **Note:** `cluster_host`, `cluster_username` and `cluster_password` have **no built-in default**. All three resolved values must be nonblank unless all three keys are absent
+> from both pytest config and the environment. When all three are absent, `get_cluster_client()` authenticates from the ambient kubeconfig — the path a direct `pytest` run
+> takes when a kubeconfig is available to the test process. `mtv-api-tests run` takes that path only when no OpenShift provider is selected from `.providers.json`: the CLI
+> checks for an existing `oc` token (`oc whoami -t`) only then, and with an OpenShift provider entry present — as in the example configuration — it instead uses that provider's
+> `host`, `username`, and `password`. When any of the three keys is provided but resolves to an absent, empty, or whitespace-only value, the run fails fast with a `ValueError`
+> naming each such value, for example
+> `ValueError("Missing cluster credentials: set 'cluster_username' in pytest config or CLUSTER_USERNAME")`. That happens as the `ocp_admin_client` fixture requests the
+> client, before any migration work, and the message says which variable to set.
+
+The repository's OpenShift Job template in `README.md` uses `--tc=` overrides like this:
 
 ```bash
-uv run pytest -m copyoffload \
+uv run pytest -m "[TEST_MARKERS]" \
   -v \
   ${CLUSTER_HOST:+--tc=cluster_host:${CLUSTER_HOST}} \
   ${CLUSTER_USERNAME:+--tc=cluster_username:${CLUSTER_USERNAME}} \
   ${CLUSTER_PASSWORD:+--tc=cluster_password:${CLUSTER_PASSWORD}} \
-  --tc=source_provider:vsphere-8.0.3.00400 \
-  --tc=storage_class:my-block-storageclass
+  --tc=source_provider:[SOURCE_PROVIDER] \
+  --tc=storage_class:[STORAGE_CLASS]
 ```
 
-> **Warning:** `source_provider` is not the provider type. It must match a key in `.providers.json` exactly.
+> **Warning:** `source_provider` is not the provider type. It must match a top-level key in `.providers.json` exactly.
 
-The provider definitions themselves are loaded from `.providers.json` in the repository root. If that file is missing, the suite cannot resolve the requested provider.
+## Latency-Based Provider Selection
+
+`source_provider` can be resolved by latency instead of being pinned explicitly. Pass a pool instead of a key:
+
+```bash
+--tc=source_provider_type:vsphere --tc=source_provider_version:8.0.1   # exact version
+--tc=source_provider_type:vsphere                                     # every version of the type
+```
+
+A feature key (`--tc=source_provider_feature:copyoffload`) flips pool membership: copy-offload-capable providers —
+entries with a `copyoffload` section — are excluded from the pool by default and included only when the key is
+passed. The session-scoped `selected_source_provider` fixture — requested first by the
+autouse fixture, before anything consumes the provider — derives the candidate pool from `.providers.json`
+(entries matching the type, and the version when passed, gated by the feature key — `copyoffload` providers only
+with the key, excluded without it). **OpenShift pools are never probed**: `create_source_provider` rewrites
+OpenShift sources to the local cluster host, so their configured endpoints are unused — the lowest provider key
+is selected deterministically. A pool with a single member — or whose members all share one probe endpoint,
+e.g. two OVA entries on the same NFS server — is selected instantly without probing: no probe pod is created and
+the lowest provider key wins. Otherwise the fixture launches one probe pod on the cluster and measures TCP-connect
+RTT to every **unique** candidate endpoint (providers sharing a `host:port` are measured once and share the
+measurement). Each endpoint's host comes from `fqdn` when set, else from `api_url` (a URL authority or an NFS
+export path — OVA entries carry an empty `fqdn` and an NFS `api_url`), else from the OpenShift `host` field; the
+port comes from an explicit port in `api_url` when it carries one (e.g. OpenStack 13000), otherwise the type's API
+port — OVA NFS 2049, Hyper-V 5986, everything else 443. OVA endpoints are probed on the NFS port (2049) because
+that is the data path Forklift's populator mounts. Selection is the lowest RTT with the lowest provider key as the
+deterministic tiebreak — median of three connects.
+In a single-process run the pool is probed inline; under xdist the first worker to hold a run-scoped file lock
+(`PYTEST_XDIST_TESTRUNUID`-keyed, so parallel runs never share it) probes and writes the selection while every other
+worker reads the same file. The chosen provider and its RTT are logged.
+
+Precedence and failure modes:
+
+- Explicit `--tc=source_provider:<key>` always wins: nothing is probed and nothing changes.
+- The pool form requires the type key; version is optional and `source_provider_version` without
+  `source_provider_type` aborts the session with `pytest.exit(...)`.
+- Neither an explicit provider nor a pool aborts with the missing-config error, as before.
+- An empty pool (no type match, or no provider passes the feature gate) aborts the session — never a skip.
+- An entry with no resolvable endpoint host (empty `fqdn`, `api_url`, and `host`) raises a `ValueError` naming the
+type — it is never probed against an empty host (OpenShift entries are exempt: they are never probed at all).
+- Unreachable candidates are excluded from selection; a fully unreachable pool aborts the session.
+- In pool mode the provider is unknown at collection time, so collection-time provider gating uses the pool's
+  `source_provider_type` and item names carry the type instead of the provider key.
+
+For copy-offload (XCOPY) plans the bulk disk copy runs array-side (storage array / ESXi hosts, including
+`dedicated_migration_hosts`) and does not traverse the cluster-to-provider path: the probe measures the vCenter API
+path only, so selection stays valid for copy-offload pools but the runtime win applies to cold/warm (NBD)
+migrations. Pool members are expected to be true clones of each other (same VM inventory, same capabilities); the
+feature key enforces copy-offload capability, VM inventory equivalence is the operator's responsibility.
 
 ## Global `pytest-testconfig` Values
 
@@ -91,7 +155,7 @@ plan_wait_timeout: int = 3600
 ### Actively used global values
 
 | Key | Default | What it controls |
-|---|---|---|
+| --- | --- | --- |
 | `insecure_verify_skip` | `"true"` | OpenShift API SSL verification. The cluster client is created with `verify_ssl=not insecure_verify_skip`. |
 | `source_provider_insecure_skip_verify` | `"false"` | Source-provider SSL verification and the Provider secret's `insecureSkipVerify` value. |
 | `target_namespace_prefix` | `"auto"` | Base text used when generating the target namespace name for migrated resources. |
@@ -106,56 +170,32 @@ plan_wait_timeout: int = 3600
 A repository-wide search shows these keys are defined in `tests/tests_config/config.py` but are not referenced by the rest of the codebase today:
 
 | Key | Default |
-|---|---|
+| --- | --- |
 | `number_of_vms` | `1` |
 | `check_vms_signals` | `True` |
 | `vm_name_search_pattern` | `""` |
 
-> **Warning:** For boolean-style CLI overrides such as `insecure_verify_skip` and `source_provider_insecure_skip_verify`, use lowercase string values like `true` and `false`. The default config file stores them as strings, and some code paths handle them that way.
+> **Warning:** For boolean-style CLI overrides such as `insecure_verify_skip` and `source_provider_insecure_skip_verify`, use lowercase string values like `true` and `false`.
+> The default config file stores them as strings, and some code paths handle them that way.
 
 ## Named Test Plans In `tests_params`
 
-The same config file also contains `tests_params`, which is the catalog of named migration scenarios used by the test classes. These are not suite-wide defaults; they are per-scenario plan definitions.
+The same config file also contains `tests_params`, which is the catalog of named migration scenarios used by the test classes. These are not suite-wide defaults; they are
+per-scenario plan definitions.
 
-A real example from `tests/tests_config/config.py`:
+A minimal real entry from `tests/tests_config/config.py`:
 
 ```python
-"test_warm_migration_comprehensive": {
+"test_sanity_cold_mtv_migration": {
     "virtual_machines": [
-        {
-            "name": "mtv-win2022-ip-3disks",
-            "source_vm_power": "on",
-            "guest_agent": True,
-        },
+        {"name": "mtv-tests-rhel8", "guest_agent": True, "add_nic": True, "add_nic_start_connected": False},
     ],
-    "warm_migration": True,
-    "target_power_state": "on",
-    "preserve_static_ips": True,
-    "vm_target_namespace": "custom-vm-namespace",
-    "multus_namespace": "default",  # Cross-namespace NAD access
-    "pvc_name_template": '{{ .FileName | trimSuffix ".vmdk" | replace "_" "-" }}-{{.DiskIndex}}',
-    "pvc_name_template_use_generate_name": True,
-    "target_labels": {
-        "mtv-comprehensive-test": None,  # None = auto-generate with session_uuid
-        "static-label": "static-value",
-    },
-    "target_affinity": {
-        "podAffinity": {
-            "preferredDuringSchedulingIgnoredDuringExecution": [
-                {
-                    "podAffinityTerm": {
-                        "labelSelector": {"matchLabels": {"app": "comprehensive-test"}},
-                        "topologyKey": "kubernetes.io/hostname",
-                    },
-                    "weight": 75,
-                }
-            ]
-        }
-    },
+    "warm_migration": False,
+    "per_nic_network_map": True,
 },
 ```
 
-Those named plans are referenced directly by the tests. For example:
+Those named plans are referenced directly by the tests through `class_plan_config` with `indirect=True`:
 
 ```python
 @pytest.mark.parametrize(
@@ -170,24 +210,37 @@ Those named plans are referenced directly by the tests. For example:
 )
 ```
 
-Common `tests_params` keys you will see in this repository include:
-
-- `virtual_machines` for the VM list and per-VM options such as `name`, `source_vm_power`, `guest_agent`, `clone`, and `disk_type`.
-- `warm_migration` and `copyoffload` for the main migration mode.
-- `target_power_state`, `preserve_static_ips`, `vm_target_namespace`, `multus_namespace`, `pvc_name_template`, `target_labels`, and `target_affinity` for plan behavior.
-- `pre_hook`, `post_hook`, and `expected_migration_result` for hook-driven scenarios.
-- `guest_agent_timeout` for scenarios that need a longer wait after migration.
+[Test Plan Configuration](test-plan-configuration.html) documents every per-VM key and plan-level flag the code supports, with the real names.
 
 ## Custom Pytest Options
 
-The repository adds four user-facing runtime features on top of standard pytest options: artifact collection, teardown control, extra logging, and AI analysis.
+The repository adds six user-facing pytest options on top of the standard pytest set:
+
+| Option | Group |
+| --- | --- |
+| `--providers-json <path>` | Providers |
+| `--skip-data-collector` | DataCollector |
+| `--data-collector-path <path>` | DataCollector |
+| `--skip-teardown` | Teardown |
+| `--openshift-python-wrapper-log-debug` | Openshift Python Wrapper |
+| `--analyze-with-ai` | Analyze with AI |
+
+### Provider file selection
+
+Resolution order when the suite loads provider definitions:
+
+1. `--providers-json` CLI value.
+2. `PROVIDERS_JSON_PATH` environment variable.
+3. `.providers.json` in the current working directory.
+
+A missing path raises `FileNotFoundError`, and an empty or non-mapping file fails fast. See [Provider Config File](provider-config-file.html).
 
 ### Data collection
 
 By default, the suite collects runtime artifacts for failed runs.
 
 - The base directory defaults to `.data-collector`.
-- On test failure, the suite attempts to run `oc adm must-gather` into a per-test subdirectory under that path.
+- Class setup/call failures queue `oc adm must-gather` until the pre-finalizer class-plan boundary, attempting at most one successful gather per class-plan instance per worker. Operational class-plan failures remain pending for session-finish retry; artifacts are not guaranteed if retry fails. Standalone tests attempt collection per failing phase until one succeeds, but failed attempts are not queued for session-finish retry. Subdirectories use percent-encoded node identities, class parameter indices where applicable, and worker IDs.
 - At session finish, it writes a `resources.json` file with tracked resources.
 - If session teardown fails, it attempts an additional must-gather into the base collector directory.
 
@@ -253,29 +306,43 @@ Enable it with:
 
 When enabled, the code does the following:
 
+- Disables itself in dry-run mode (`--collect-only`, `--setup-plan`).
 - Calls `load_dotenv()`, so a local `.env` file can supply the settings.
-- Checks `JJI_SERVER_URL`.
-- Uses default values for provider and model if you did not set them.
-- After a failed run, reads the JUnit XML file and posts the raw XML to `${JJI_SERVER_URL}/analyze-failures`.
+- Requires `ROOTCOZ_SERVER_URL`; if unset, it logs a warning and turns the feature off.
+- After a failed run, reads the JUnit XML file and posts the raw XML to `${ROOTCOZ_SERVER_URL}/analyze-failures`.
 - If enrichment succeeds, writes the enriched XML back to the same file.
 
 Environment variables used by this feature:
 
 | Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `JJI_SERVER_URL` | Yes | None | URL of the analysis service |
-| `JJI_AI_PROVIDER` | No | `claude` | AI provider name sent to the service |
-| `JJI_AI_MODEL` | No | `claude-opus-4-6[1m]` | AI model name sent to the service |
-| `JJI_TIMEOUT` | No | `600` | Request timeout in seconds |
+| --- | --- | --- | --- |
+| `ROOTCOZ_SERVER_URL` | Yes | None | Base URL of the analysis service |
+| `ROOTCOZ_TIMEOUT` | No | `600` | Request timeout in seconds. Invalid values fall back to `600` |
+| `ROOTCOZ_AI_PROVIDER` | No | None | AI provider name sent to the service. When unset, the service applies its own default |
+| `ROOTCOZ_AI_MODEL` | No | None | AI model name sent to the service. When unset, the service applies its own default |
+
+> **Note:** pytest does not hard-code a provider or model default. Those defaults live in `.rootcoz/settings.json`, which is owned by the rootcoz service.
+
+Request payload:
+
+```python
+payload: dict[str, str] = {"raw_xml": raw_xml}
+if ai_provider := os.environ.get("ROOTCOZ_AI_PROVIDER"):
+    payload["ai_provider"] = ai_provider
+if ai_model := os.environ.get("ROOTCOZ_AI_MODEL"):
+    payload["ai_model"] = ai_model
+```
 
 Important behavior to know:
 
 - Successful runs skip AI enrichment.
 - `--collect-only` and `--setup-plan` disable AI analysis automatically.
-- If the JUnit XML file is missing, enrichment is skipped.
+- If the JUnit XML path is unset or the file is missing, enrichment is skipped.
+- If enrichment fails, the original JUnit XML is preserved.
 - The default JUnit XML path is already configured as `junit-report.xml` in `pytest.ini`.
 
-> **Warning:** `--analyze-with-ai` sends the raw JUnit XML content to an external HTTP service. Review what your report contains before enabling this in shared or external environments.
+> **Warning:** `--analyze-with-ai` sends the raw JUnit XML content to an external HTTP service. Review what your report contains before enabling this in shared or external
+> environments.
 
 > **Note:** If enrichment succeeds, the original JUnit XML file is overwritten in place with the enriched version.
 
@@ -315,4 +382,5 @@ In dry-run mode:
 - AI analysis is disabled.
 - Session-finish teardown and JUnit enrichment do not run.
 
-> **Tip:** If you start the published container image without overriding its command, it only performs test collection. To run real tests, supply your own `uv run pytest ...` command.
+> **Tip:** If you start the published container image without overriding its command, it only performs test collection. To run real tests, supply your own `uv run pytest ...`
+> command.

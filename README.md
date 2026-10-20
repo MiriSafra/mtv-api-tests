@@ -5,6 +5,18 @@ RHV, OpenStack, and OVA using Migration Toolkit for Virtualization (MTV).
 
 **[Full Documentation](https://redhatqe.github.io/mtv-api-tests/)** | [Copy-Offload Guide](guides/copyoffload/how-to-run-copyoffload-tests.md)
 
+The documentation site in [`docs/`](docs) is generated with
+[pi-docsite](https://pypi.org/project/pi-docsite/): edit `docs/*.md`, keep the sidebar
+order in `docs/nav.json`, then rebuild the generated files with
+
+```bash
+uvx pi-docsite --docs-dir docs \
+  --tagline "Pytest-based integration suite for validating Migration Toolkit for Virtualization migrations into OpenShift Virtualization."
+```
+
+Never edit the generated `*.html`, `assets/`, `search-index.json`, `llms.txt` or
+`llms-full.txt` by hand. See [AGENTS.md](AGENTS.md#documentation-site-must).
+
 ---
 
 ## Prerequisites
@@ -192,6 +204,24 @@ cp .providers.json.example .providers.json
 
 See `.providers.json.example` for complete templates of all supported providers.
 
+**Hyper-V `management_type`:** Optional. `"cluster"` for a Failover Cluster, `"standalone"` for a single host.
+The value is passed through to `spec.settings.managementType` on the MTV Provider CR. If the key is omitted,
+the suite does not set the field and MTV uses standalone.
+
+**Hyper-V two-phase transfer:** `TestColdMigrationComprehensive` passes Plan `pre_copy_source_disks` (spec
+`preCopySourceDisks`) when the source provider is Hyper-V. The Hyper-V Provider CR is created with
+`smb_max_channels` from `tests/tests_config/config.py` (default `4`, spec `settings.smbMaxChannels`) when any
+plan config sets `pre_copy_source_disks: True`. Other Hyper-V tests keep MTV defaults (`preCopySourceDisks`
+unset; `smbMaxChannels` omitted unless that plan flag is present).
+
+**Hyper-V `preserve_static_ips`:** Before creating the Plan, the suite waits until Forklift inventory has
+`guestNetworks` entries matching every static IPv4 address reported in the saved source VM data
+(host KVP is not sufficient on cluster). Any required gateway must appear on the matching entry, not on
+an unrelated NIC. The existing IPv4/gateway readiness check also remains: a gateway is required when the
+source reports one or its network metadata is incomplete. The gateway requirement is waived only when
+every source NIC has IP entries that explicitly report no gateway; missing metadata is not treated as
+gatewayless. Timeout scales with `HYPERV_REFRESH_INTERVAL` (default ~700s).
+
 > **Schema & IDE support:** `providers_schema.json` documents which fields are required vs optional
 > per provider type. Add `"$schema"` as the first key in your `.providers.json` for IDE autocomplete:
 >
@@ -258,6 +288,95 @@ podman run --rm \
 - `YOUR-STORAGE-CLASS` → Your storage class from step 4
 - `vsphere-8.0.1` → Provider key from your `.providers.json` (e.g., `vsphere-8.0.1`, `ovirt-4.4.9`)
 
+**Cluster credentials**: each of `cluster_host`, `cluster_username`, and `cluster_password` is resolved from the
+pytest config value first (`--tc=cluster_host:...`) and then from the matching `CLUSTER_HOST`, `CLUSTER_USERNAME`,
+or `CLUSTER_PASSWORD` environment variable. Runs that provide any of the three must provide all three as nonblank
+values; partial, empty, or whitespace-only sets fail fast with a named error such as
+`Missing cluster credentials: set 'cluster_username' in pytest config or CLUSTER_USERNAME`. Omitting all three is
+valid only for ambient authentication from a kubeconfig available to the test process. `mtv-api-tests run` reaches that
+path only when no OpenShift provider is selected from `.providers.json` — the CLI checks for an existing `oc` token only
+then and does not pass a standalone token to the client. See
+[runtime configuration](docs/runtime-configuration.html) for details.
+
+**VM naming**: the OpenShift version segment of generated source VM names is read from the target cluster
+automatically — do not pass `--tc=target_ocp_version`.
+
+---
+
+## Remote Debugging
+
+Set `MTV_REMOTE_PDB=1` to enable a remote [pdb](https://docs.python.org/3/library/pdb.html) debugger reachable over a socket,
+for interactive debugging of test runs by humans or AI agents. Without the variable, debugging is completely disabled
+and the helpers below are no-ops.
+
+Run with `-s` so the listening message is not swallowed by pytest output capture, and use a single worker (`-n 0`)
+when debugging — parallel xdist workers listen on distinct ports (`4444 +` worker index), but a debugger session per
+worker is rarely what you want.
+
+### Trigger 1 — breakpoint in code
+
+Temporarily insert a call where you want to stop (remove it when done):
+
+```python
+from utilities.debug import remote_breakpoint
+
+remote_breakpoint()
+```
+
+Run the test; the process blocks at the call and waits for a debugger connection.
+
+### Trigger 2 — post-mortem on failure
+
+With `MTV_REMOTE_PDB=1` set, any test failure automatically opens a remote post-mortem session on the failing
+traceback (no `--pdb` needed). If you pass `--pdb`, the local terminal debugger takes precedence.
+
+### Attaching
+
+```bash
+# host and port come from the run's "RemotePdb session open at <host>:<port>" line
+# (defaults: 127.0.0.1 4444; see the REMOTE_PDB_HOST / REMOTE_PDB_PORT overrides below)
+nc <host> <port>        # or: rlwrap nc <host> <port> / telnet <host> <port>
+```
+
+Send `c` to continue the run. `q` — or dropping the connection — quits the debugger: at a code
+breakpoint the current test fails with `BdbQuit` and the run continues; at a failure post-mortem the whole
+test session exits (matching pytest's native `--pdb` quit behavior).
+
+The debugger binds to `127.0.0.1` only — it is never exposed on the cluster network. To debug a run inside an
+OpenShift Job pod, the pod must run with `MTV_REMOTE_PDB=1` — the Job manifest generated by the CLI (see
+[Running as OpenShift Job](#running-as-openshift-job)) does not set it, so add it to the container `env`
+(or prefix the pytest command in the manifest with `MTV_REMOTE_PDB=1`) before creating the Job. Then forward
+the port:
+
+`oc port-forward` must stay alive while the client connects — run it in the background (or a
+separate terminal) as shown, and stop it when the session ends:
+
+```bash
+port=4444  # replace with the numeric listener port from the run's "RemotePdb session open at" line
+oc port-forward -n "$job_namespace" "pod/$pod_name" "$port:$port" &
+forward_pid=$!
+nc localhost "$port"
+kill "$forward_pid"
+```
+
+`$job_namespace` is the generated UUID-suffixed namespace shown by the CLI at manifest generation
+(and present in the manifest) — `oc port-forward` without `-n` searches only your current namespace
+and will not find the pod.
+
+Host and port can be overridden with `REMOTE_PDB_HOST` / `REMOTE_PDB_PORT`. The host must resolve to a
+loopback address — non-loopback values are rejected with a `ValueError`, so the debugger can never be
+exposed on the cluster network.
+
+### AI agents
+
+The repo ships an agent skill for driving debugger sessions — see [`skills/`](skills/). It is not
+auto-discovered: symlink it into your agent harness's skills directory manually (see
+`skills/README.md`), and restart the session so the harness picks it up.
+
+> **Note:** while a debugger session is attached, the test process is frozen but the cluster keeps moving —
+> migrations and reconciliation continue server-side. Use the debugger for inspection; avoid long pauses inside
+> migration polling loops.
+
 ---
 
 ## Running Different Test Categories
@@ -276,6 +395,13 @@ The Quick Start runs **tier0** tests (smoke tests). You can run other test categ
 | `vsphere` | VMware vSphere provider-specific tests | Tests specific to vSphere provider |
 | `hyperv` | Hyper-V provider-specific tests | Tests specific to Hyper-V provider |
 | `upgrade` | Migration across MTV operator upgrades | Validating upgrade compatibility |
+
+### Resume Conversion Tests
+
+`tests/warm/test_resume_conversion_warm_migration.py` covers vSphere warm
+migration recovery after conversion failure and rejection of a resume request
+without a prior migration failure. These tests require an MTV version supporting
+`resumeConversion` and `openshift-python-wrapper` version 11.0.142 or later.
 
 ### Copy-Offload Sanity Tests
 
@@ -565,6 +691,97 @@ uv run mtv-api-tests run --mode job --job-yaml /path/to/mtv-api-tests-manifests.
 
 Use `uv run mtv-api-tests generate --help` or `uv run mtv-api-tests run --help` to see all available flags.
 
+### Coverage Search
+
+`uv run mtv-api-tests coverage <keywords>` answers **"is scenario X covered by a test class?"**
+by searching test-class plan docstrings (see `test_plan_schema.md`). It parses the docstrings
+on demand with AST — no test modules are imported and no index is stored — so the docstrings
+are the single source of truth.
+
+When a scenario or regression comes in, the workflow is: search what covers it → copy the
+pytest node ID from the output → check the CI status of that test instead of running it manually.
+
+```bash
+# Search keywords (case-insensitive, partial match; quoting and multiple
+# arguments are equivalent - all words are ANDed)
+uv run mtv-api-tests coverage "static IP"
+
+# Multiple keywords are ANDed
+uv run mtv-api-tests coverage warm resume
+
+# List classes whose docstring is missing or does not follow the schema yet
+uv run mtv-api-tests coverage --missing-plans
+
+# JSON output for scripting
+uv run mtv-api-tests coverage --json "shared disk"
+```
+
+Each match shows the class name, one-sentence scenario summary, pytest markers, `file:line`,
+the pytest node ID that runs exactly that class, and the matching docstring line. Keywords match across
+the whole docstring, the class name, and the markers (`shared disk` matches the `shared_disk`
+marker); matches in classes whose docstring does not follow the schema yet are still listed,
+marked with a note. **No matches exits 0** with a "not covered" message, so scripts can chain
+on output rather than on exit codes.
+
+### Latency-Based Provider Selection
+
+Instead of pinning `--tc=source_provider:<key>`, a run can identify a **candidate pool** by type —
+version optional — and let the suite pick the fastest member from the cluster's point of view:
+
+```bash
+--tc=source_provider_type:vsphere --tc=source_provider_version:8.0.1   # exact version
+--tc=source_provider_type:vsphere                                     # every version of the type
+```
+
+A feature key (`copyoffload`) flips pool membership: copy-offload-capable providers — entries
+with a `copyoffload` section — are **excluded** from the pool by default and included **only** when
+the key is passed:
+
+```bash
+--tc=source_provider_type:vsphere --tc=source_provider_version:8.0.1 --tc=source_provider_feature:copyoffload
+```
+
+Selection happens once per run, in the session-scoped `selected_source_provider` fixture
+(requested first by the autouse fixture, before anything consumes the provider). A pool with a single
+member — or whose members all share one probe endpoint (e.g. two OVA entries on the same NFS server)
+— is selected instantly without probing; no probe pod is created. Otherwise, in a single-process
+run the pool is probed inline; under xdist the first worker to hold a run-scoped file lock probes and
+writes the selection while every other worker reads the same file, so all workers run against the
+same provider. Probing measures every **unique** endpoint once (providers sharing a `host:port`
+share the measurement); each endpoint's host comes from `fqdn`, else from `api_url` (URL or NFS
+export path), else from the OpenShift `host` field, and the port from `api_url` when it carries one,
+else the type's API port (OVA NFS 2049, Hyper-V 5986, otherwise 443). The chosen provider and its
+measured RTT are logged.
+
+Rules:
+
+- Explicit `--tc=source_provider:<key>` always wins: nothing is probed and nothing changes.
+- The pool form requires the type key; version is optional and `source_provider_version` without
+  `source_provider_type` aborts the session with `pytest.exit(...)`.
+- Neither an explicit provider nor a pool aborts with the missing-config error, exactly as before.
+- Candidates are the `.providers.json` entries matching the requested type (and version, when
+  passed), gated by the feature key (`copyoffload` providers only with the key, excluded without
+  it); an empty pool aborts the session with a clear error — never a skip.
+- A single-candidate or single-endpoint pool is selected without probing; otherwise the winner is
+  the lowest-RTT endpoint with the lowest provider key as the deterministic tiebreak.
+- OpenShift pools are never probed: `create_source_provider` rewrites OpenShift sources to the
+  local cluster host, so their configured endpoints are unused and the lowest provider key wins
+  deterministically.
+- Unreachable candidates are excluded; a fully unreachable pool aborts the session.
+- In pool mode the provider is unknown at collection time, so collection-time provider gating uses the
+  pool's `source_provider_type` and test item names carry the type instead of the provider key.
+
+> **Note:** for copy-offload (XCOPY) plans the bulk disk copy executes array-side (storage array / ESXi
+> hosts, including `dedicated_migration_hosts`) and does not traverse the cluster-to-provider path. The
+> probe measures the vCenter API path, which copy-offload runs still use for inventory and controller
+> operations — selection stays valid for copy-offload pools, but the runtime win applies to cold/warm
+> (NBD) migrations only.
+
+> **Warning:** pool selection assumes every member of the pool is a true clone — same VM inventory
+> (names, guest agent, disk layouts) and same capabilities. The feature key enforces copy-offload
+> capability; VM inventory equivalence is the operator's responsibility because it is not
+> machine-checkable. Test configs pin VM names, so a pool of non-interchangeable providers breaks tests.
+
 ---
 
 ## Copy-Offload: Accelerated Migrations (Advanced)
@@ -579,11 +796,26 @@ troubleshooting, see:
 
 📖 **[Copy-Offload Testing Guide](guides/copyoffload/how-to-run-copyoffload-tests.md)**
 
-> **Note:** `TestCopyoffloadPopulatorThrottlingMigration` (MTV-696) mutates cluster-wide
-> `ForkliftController` populator settings. Do not run it in parallel with other copy-offload tests on the
-> same cluster — the test temporarily sets `controller_max_populator_inflight` (and the populator
-> deployment `MAX_POPULATOR_INFLIGHT` env) to **2**, which caps in-flight populate pods cluster-wide for
-> every other migration running at the same time.
+> **Note:** `TestCopyoffloadPopulatorThrottlingMigration` (MTV-696) and
+> `TestCopyoffloadDedicatedMigrationHost` set both the ForkliftController
+> `controller_max_populator_inflight` and populator deployment `MAX_POPULATOR_INFLIGHT` to **2**.
+> `TestCopyoffloadDedicatedHostSharedPopulatorLimit` (MTV-4494) sets both to **1** and sets the
+> VM in-flight limit to **2**. The fixtures restore the prior values afterward.
+> Do not run them alongside other MTV migrations or copy-offload tests on the same cluster. The original
+> dedicated-host test pins both source VMs away from configured dedicated hosts and retains
+> multi-host coverage. The shared-limit scenario requires exactly one configured dedicated
+> ESXi host and at least one other ESXi host; it places one source VM on each and checks that
+> their active populate pods stay within the shared runtime-host populator limit. The assertion checks
+> the peak observed Pending/Running-pod count during migration; it does not require a specific
+> count of `PopulatorThrottled` events. It requires one migration poll to observe a Pending
+> PVC with a structured `PopulatorThrottled` event, alongside a Running worker from the other
+> source host on the sole configured dedicated host. The Event's involved PVC is matched by
+> name and UID; the PVC's `sourceHost` label identifies its source, and the worker's runtime
+> metadata identifies the dedicated host. The Event's latest timestamp must be at or after that
+> worker started. The poll reuses its populate-Pod snapshot for concurrency counting and only
+> lists PVCs when throttling Events exist. Runtime-host grouping
+> prefers `throttleHost` when present and otherwise uses the worker's `--migration-host`
+> argument. Current Forklift builds may reuse the populate Pod's `sourceHost` label for the runtime host.
 
 For array-specific Secret keys not covered by built-in vendor fields, use `storage_secret_extra` in the
 `copyoffload` section of `.providers.json` (or `COPYOFFLOAD_STORAGE_SECRET_EXTRA`); see the guide.
@@ -1010,6 +1242,24 @@ oc describe plan <plan-name> -n openshift-mtv
 ```
 
 ### Collect Debug Information
+
+Automatic failure collection attempts at most one successful must-gather per class-plan instance per worker,
+using a percent-encoded class node ID, class parameter indices and worker ID under `.data-collector/`.
+It binds the current Plan or explicit None at the class-plan boundary before default fixture finalization,
+including early exits, and retains that context for retries. Standalone tests gather immediately.
+Known operational class-plan collection failures remain pending for the session-finish retry; artifacts are not guaranteed if it fails.
+Standalone tests gather immediately on the first failing phase; an operational failure is retried only when another
+phase of the same test also fails. Collector exceptions during setup or call are stashed on the item, cleared at teardown
+and not retried there. Standalone failures are not queued for session-finish retry.
+Unexpected standalone setup/call collector errors are retained on the item until pytest fixture finalization.
+The session-finish hook runs the pending-gather flush, resource inventory writing and configured cleanup before the inner
+session hooks yield, so xdist worker shutdown cannot interrupt them; the summary and enabled AI enrichment run after those
+hooks, and errors are re-raised at the end with earlier errors chained.
+Invalid image metadata and other configuration/programming errors propagate instead of returning `False`. A pending class-plan gather
+remains queued and may raise again when retried at a later boundary or session finish.
+Inventory, configured teardown, temporary-directory removal, summary and enabled AI enrichment are attempted independently;
+cleanup errors propagate with earlier errors chained. See
+[diagnostic collection](docs/troubleshooting-and-diagnostics.html) for timing and teardown limitations.
 
 ```bash
 oc adm must-gather --image=quay.io/kubev2v/forklift-must-gather:latest --dest-dir=/tmp/mtv-logs

@@ -1,4 +1,6 @@
+import os
 import time
+from typing import Any
 
 from ocp_resources.provider import Provider
 from ocp_resources.resource import ResourceEditor
@@ -9,10 +11,7 @@ from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 from exceptions.exceptions import VmNotFoundError
 from libs.base_provider import BaseProvider
 from libs.forklift_inventory import ForkliftInventory
-from libs.providers.hyperv import HyperVProvider
-from libs.providers.openstack import OpenStackProvider
 from libs.providers.rhv import OvirtProvider
-from libs.providers.vmware import VMWareProvider
 
 LOGGER = get_logger(__name__)
 
@@ -20,6 +19,123 @@ _INVENTORY_REFRESH_READY_TIMEOUT = 180
 # Timeout for inventory MACs to converge with the live provider (see _wait_for_inventory_mac_convergence).
 _MAC_CONVERGENCE_TIMEOUT = 60
 _MAC_CONVERGENCE_SLEEP = 5
+
+
+def wait_for_inventory_guest_networks(
+    source_provider_inventory: ForkliftInventory,
+    vm_names: list[str],
+    source_vms_data: dict[str, dict[str, Any]],
+) -> None:
+    """Wait for inventory IPv4 readiness and the saved source static addresses.
+
+    Require a gateway if the saved source snapshot reports one or has incomplete
+    network metadata. Waive it only when interfaces and their IP entries are all
+    present and every IP entry explicitly reports a falsy gateway. Also require
+    each saved static IPv4 address on its matching inventory entry, with a gateway
+    when that source IP entry reports one or omits the gateway key. This check does
+    not establish source snapshot freshness.
+
+    Args:
+        source_provider_inventory (ForkliftInventory): Source provider inventory.
+        vm_names (list[str]): VM names to poll.
+        source_vms_data (dict[str, dict[str, Any]]): Saved normalized provider VM
+            snapshots keyed by VM name (plan["source_vms_data"]), containing
+            heterogeneous provider fields. Incomplete network metadata keeps the
+            gateway requirement; explicit gatewayless metadata waives it.
+
+    Raises:
+        TimeoutExpiredError: If a VM lacks a baseline inventory IPv4 entry, an
+            expected static address, or a gateway on an entry that requires one,
+            after the timeout.
+        ValueError: If HYPERV_REFRESH_INTERVAL is not a positive integer.
+    """
+    interval_raw = os.environ.get("HYPERV_REFRESH_INTERVAL", "10")
+    try:
+        interval = int(interval_raw)
+    except ValueError:
+        raise ValueError(f"HYPERV_REFRESH_INTERVAL must be a positive integer, got '{interval_raw}'") from None
+    if interval <= 0:
+        raise ValueError(f"HYPERV_REFRESH_INTERVAL must be a positive integer, got {interval}")
+    timeout = 10 * (interval + 30) + 300
+
+    def _ready() -> bool:
+        """Check baseline readiness and each expected static address.
+
+        Returns:
+            bool: Whether every VM satisfies both inventory readiness checks.
+        """
+        for name in vm_names:
+            try:
+                networks = source_provider_inventory.get_vm(name=name).get("guestNetworks") or []
+            except ValueError:
+                return False
+            source_vm_data = source_vms_data[name]
+            require_gateway = _source_vm_requires_gateway(source_vm_data=source_vm_data)
+            if not any(
+                isinstance(entry, dict)
+                and entry.get("ip")
+                and ":" not in str(entry["ip"])
+                and (entry.get("gateway") or not require_gateway)
+                for entry in networks
+            ):
+                return False
+            if not all(
+                any(
+                    isinstance(entry, dict)
+                    and entry.get("ip") == ip_config["ip_address"]
+                    and (entry.get("gateway") or not _source_ip_requires_gateway(ip_config=ip_config))
+                    for entry in networks
+                )
+                for interface in source_vm_data.get("network_interfaces") or []
+                for ip_config in interface.get("ip_addresses") or []
+                if ip_config.get("is_static_ip") is True
+            ):
+                return False
+        return True
+
+    for ready in TimeoutSampler(wait_timeout=timeout, sleep=10, func=_ready):
+        if ready:
+            return
+
+
+def _source_ip_requires_gateway(ip_config: dict[str, Any]) -> bool:
+    """Require an inventory gateway unless the source IP explicitly has none.
+
+    Args:
+        ip_config (dict[str, Any]): Normalized source IP metadata containing
+            heterogeneous external provider values.
+
+    Returns:
+        bool: True when the gateway key is omitted or its value is truthy.
+    """
+    return "gateway" not in ip_config or bool(ip_config["gateway"])
+
+
+def _source_vm_requires_gateway(source_vm_data: dict[str, Any]) -> bool:
+    """Keep the inventory gateway requirement unless the source is explicitly gatewayless.
+
+    Missing or empty interfaces or IP entries, omitted gateway keys, and truthy
+    gateways all require an inventory gateway.
+
+    Args:
+        source_vm_data (dict[str, Any]): Saved normalized provider VM snapshot
+            (plan["source_vms_data"] entry), containing heterogeneous provider fields.
+
+    Returns:
+        bool: False only for non-empty source interfaces whose IP entries are all
+            present and explicitly report falsy gateways; True otherwise.
+    """
+    interfaces: list[dict[str, Any]] = source_vm_data.get("network_interfaces") or []
+    if not interfaces:
+        return True
+    for interface in interfaces:
+        ip_addresses: list[dict[str, Any]] = interface.get("ip_addresses") or []
+        if not ip_addresses:
+            return True
+        for ip_config in ip_addresses:
+            if _source_ip_requires_gateway(ip_config=ip_config):
+                return True
+    return False
 
 
 def force_inventory_refresh(provider: Provider) -> None:
@@ -206,41 +322,53 @@ def wait_for_cloned_vms_in_forklift_inventory(
             )
 
 
-def validate_source_vms_exist(source_provider: BaseProvider, vm_names: list[str]) -> None:
-    """Validate that all source VMs/templates exist on the provider before cloning.
+def get_missing_source_vms(
+    source_provider: BaseProvider,
+    source_provider_inventory: ForkliftInventory,
+    vm_names: list[str],
+) -> list[str]:
+    """Return the names from ``vm_names`` that MTV cannot resolve on the source provider.
 
-    For RHV, validates template names (RHV clones from templates, not VMs).
-    For VMware, OpenStack, and Hyper-V, validates VM names.
+    The Forklift inventory is what MTV actually migrates, so VM names are checked against
+    its ``vms`` listing (one request, local membership check). RHV is the exception: RHV
+    sources clone from templates, which the inventory does not list (see
+    ``get_vm_or_template_networks``), so template names are verified on the provider.
 
     Args:
-        source_provider: Source provider instance (VMware, RHV, OpenStack, or Hyper-V).
-        vm_names: VM or template names to check on the source provider.
+        source_provider (BaseProvider): Source provider instance.
+        source_provider_inventory (ForkliftInventory): Forklift inventory of the source provider.
+        vm_names (list[str]): VM names to check.
 
-    Raises:
-        VmNotFoundError: If one or more VMs/templates are not found on the source provider.
+    Returns:
+        list[str]: Names MTV cannot resolve on the source provider.
     """
-    missing: list[str] = []
-
     if isinstance(source_provider, OvirtProvider):
+        missing: list[str] = []
         for name in vm_names:
             try:
                 source_provider.get_template_by_name(name=name)
             except OvirtNotFoundError:
                 missing.append(name)
-        entity_type = "templates"
-    elif isinstance(source_provider, (VMWareProvider, OpenStackProvider, HyperVProvider)):
-        for name in vm_names:
-            try:
-                source_provider.get_vm_by_name(query=name)
-            except VmNotFoundError:
-                missing.append(name)
-        entity_type = "VMs"
-    else:
-        raise TypeError(f"Unsupported provider type for VM validation: {type(source_provider).__name__}")
+        return missing
 
+    inventory_vm_names = set(source_provider_inventory.vms_names)
+    return [name for name in vm_names if name not in inventory_vm_names]
+
+
+def raise_for_missing_source_vms(source_provider: BaseProvider, provider_name: str, missing: list[str]) -> None:
+    """Raise ``VmNotFoundError`` listing source VMs missing from the source provider.
+
+    Args:
+        source_provider (BaseProvider): Source provider instance used for type and host context.
+        provider_name (str): Configured name of the source provider (e.g. ``vsphere-8.0.1``).
+        missing (list[str]): Missing VM names.
+
+    Raises:
+        VmNotFoundError: If ``missing`` is not empty.
+    """
     if missing:
         raise VmNotFoundError(
-            f"Source {entity_type} not found on {source_provider.type} provider [{source_provider.host}]: "
-            f"{', '.join(missing)}. "
-            f"Verify names in the test config match {entity_type} on the source provider."
+            f"Source VMs not found on source provider '{provider_name}' "
+            f"[{source_provider.host}] ({source_provider.type}): {', '.join(missing)}. "
+            f"Verify names in the test config match VMs on the source provider."
         )

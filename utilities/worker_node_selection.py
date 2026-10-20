@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ocp_utilities.monitoring import Prometheus
 
 LOGGER = get_logger(__name__)
+_WORKER_ROLE_LABEL = "node-role.kubernetes.io/worker"
 
 
 def get_worker_nodes(ocp_client: DynamicClient) -> list[str]:
@@ -25,10 +26,60 @@ def get_worker_nodes(ocp_client: DynamicClient) -> list[str]:
     Raises:
         Exception: If Node.get() encounters client or API errors from OpenShift DynamicClient.
     """
+    return [node.name for node in get_worker_node_resources(ocp_client=ocp_client)]
+
+
+def get_node_labels(node: Node) -> dict[str, str]:
+    """Return labels from a Node's Kubernetes metadata.
+
+    Args:
+        node (Node): Node resource to read.
+
+    Returns:
+        dict[str, str]: Node labels, or an empty dictionary when none are set.
+    """
+    return dict(node.instance.get("metadata", {}).get("labels") or {})
+
+
+def get_worker_node_resources(ocp_client: DynamicClient, nodes: list[Node] | None = None) -> list[Node]:
+    """Get worker Node resources from the cluster.
+
+    Args:
+        ocp_client (DynamicClient): OpenShift DynamicClient instance.
+        nodes (list[Node] | None): Previously listed Nodes, avoiding a second API request when provided.
+
+    Returns:
+        list[Node]: Worker Node resources.
+    """
+    all_nodes = nodes if nodes is not None else Node.get(client=ocp_client)
+    return [node for node in all_nodes if _WORKER_ROLE_LABEL in get_node_labels(node=node)]
+
+
+def get_ready_schedulable_worker_nodes(
+    ocp_client: DynamicClient,
+    nodes: list[Node] | None = None,
+) -> list[Node]:
+    """Get Ready, schedulable workers without blocking taints.
+
+    Args:
+        ocp_client (DynamicClient): OpenShift client used to list Nodes when not supplied.
+        nodes (list[Node] | None): Previously listed Nodes, avoiding a second API request when provided.
+
+    Returns:
+        list[Node]: Ready workers that are not cordoned and have no NoSchedule or NoExecute taints.
+    """
     return [
-        node.name
-        for node in Node.get(client=ocp_client)
-        if node.labels and "node-role.kubernetes.io/worker" in node.labels.keys()
+        node
+        for node in get_worker_node_resources(ocp_client=ocp_client, nodes=nodes)
+        if any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in node.instance.get("status", {}).get("conditions") or []
+        )
+        and not node.instance.get("spec", {}).get("unschedulable", False)
+        and not any(
+            taint.get("effect") in {"NoSchedule", "NoExecute"}
+            for taint in node.instance.get("spec", {}).get("taints") or []
+        )
     ]
 
 

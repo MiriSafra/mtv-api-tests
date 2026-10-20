@@ -1,445 +1,407 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
+from time import monotonic
 from typing import TYPE_CHECKING, Any
 
-from ocp_resources.config_map import ConfigMap
+from ocp_resources.migration import Migration
 from ocp_resources.node import Node
-from ocp_resources.pod import Pod
 from ocp_resources.plan import Plan
+from ocp_resources.pod import Pod
 from ocp_resources.resource import ResourceEditor
-from ocp_resources.utils.constants import TIMEOUT_1MINUTE, TIMEOUT_5SEC
+from ocp_resources.utils.constants import TIMEOUT_10MINUTES, TIMEOUT_2MINUTES, TIMEOUT_5SEC
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from utilities.mtv_migration import wait_for_migration_complate
-from utilities.worker_node_selection import select_node_by_available_memory
+from utilities.worker_node_selection import (
+    get_node_labels,
+    get_ready_schedulable_worker_nodes,
+    select_node_by_available_memory,
+)
 
 if TYPE_CHECKING:
     from kubernetes.dynamic import DynamicClient
 
 _IMPORTER_POD_LABEL_SELECTOR = "app=containerized-data-importer,cdi.kubevirt.io=importer"
-_VDDK_CONFIG_MAP_LABEL_SELECTOR = "plan-name={plan_name},plan-namespace={plan_namespace},use=vddk-conf,resource=vddk-config"
 _CONVERSION_POD_LABEL_SELECTOR = "forklift.app=virt-v2v,plan-name={plan_name},plan-namespace={plan_namespace}"
+_DISK_TRANSFER_STEP_NAME = "DiskTransfer"
+_POD_SCHEDULED_CONDITION_TYPE = "PodScheduled"
+_UNSCHEDULABLE_REASON = "Unschedulable"
+_FALSE_CONDITION_STATUS = "False"
 
 
-def get_importer_pods(client: DynamicClient, namespace: str) -> list[Pod]:
+def get_importer_pods(client: DynamicClient, namespace: str, migration_uid: str) -> list[Pod]:
     """List CDI importer pods in a migration's target namespace.
 
     Args:
         client (DynamicClient): OpenShift client.
-        namespace (str): Destination namespace containing the importer pods.
+        namespace (str): Destination namespace containing importer pods.
+        migration_uid (str): UID of the Migration owning the importer pods.
 
     Returns:
         list[Pod]: CDI importer pods found in the namespace.
     """
-    return list(Pod.get(client=client, namespace=namespace, label_selector=_IMPORTER_POD_LABEL_SELECTOR))
-
-
-def get_vddk_config_maps(plan: Plan) -> list[ConfigMap]:
-    """List VDDK configuration ConfigMaps owned by a Plan.
-
-    Args:
-        plan (Plan): Migration Plan whose VDDK ConfigMaps should be listed.
-
-    Returns:
-        list[ConfigMap]: Matching ConfigMaps in the Plan's target namespace.
-    """
-    target_namespace = plan.instance.get("spec", {}).get("targetNamespace")
-    label_selector = _VDDK_CONFIG_MAP_LABEL_SELECTOR.format(plan_name=plan.name, plan_namespace=plan.namespace)
     return list(
-        ConfigMap.get(
-            client=plan.client,
-            namespace=target_namespace,
-            label_selector=label_selector,
+        Pod.get(
+            client=client,
+            namespace=namespace,
+            label_selector=f"{_IMPORTER_POD_LABEL_SELECTOR},migration={migration_uid}",
         )
     )
 
 
-def get_conversion_pods(plan: Plan) -> list[Pod]:
-    """List virt-v2v conversion pods owned by a Plan.
+def _get_pod_scheduling_details(pods: list[Pod]) -> list[dict[str, Any]]:
+    """Collect scheduler-relevant Pod fields for failure diagnostics.
 
     Args:
-        plan (Plan): Migration Plan whose conversion pods should be listed.
+        pods (list[Pod]): Pods whose scheduling state should be reported.
 
     Returns:
-        list[Pod]: Matching conversion pods in the Plan's target namespace.
+        list[dict[str, Any]]: Pod selectors, constraints, and PodScheduled conditions.
     """
-    target_namespace = plan.instance.get("spec", {}).get("targetNamespace")
-    label_selector = _CONVERSION_POD_LABEL_SELECTOR.format(plan_name=plan.name, plan_namespace=plan.namespace)
-    return list(Pod.get(client=plan.client, namespace=target_namespace, label_selector=label_selector))
+    pod_details = []
+    for pod in pods:
+        pod_instance = pod.instance
+        pod_spec = pod_instance.get("spec", {})
+        pod_status = pod_instance.get("status", {})
+        pod_details.append({
+            "name": pod.name,
+            "phase": pod_status.get("phase"),
+            "nodeName": pod_spec.get("nodeName"),
+            "nodeSelector": pod_spec.get("nodeSelector"),
+            "affinity": pod_spec.get("affinity"),
+            "tolerations": pod_spec.get("tolerations"),
+            "podScheduledCondition": next(
+                (
+                    condition
+                    for condition in pod_status.get("conditions") or []
+                    if condition.get("type") == _POD_SCHEDULED_CONDITION_TYPE
+                ),
+                None,
+            ),
+        })
+    return pod_details
 
 
 def wait_for_importer_pods_pending(
-    client: DynamicClient,
-    namespace: str,
-    timeout: int = TIMEOUT_1MINUTE,
+    plan: Plan,
+    migration_uid: str,
+    selector: dict[str, str],
+    timeout: int = TIMEOUT_10MINUTES,
 ) -> list[Pod]:
-    """Wait for CDI importer pods to become unschedulable while their selector has no match.
+    """Wait until all DiskTransfer importer pods are stably unschedulable.
 
     Args:
-        client (DynamicClient): OpenShift client.
-        namespace (str): Destination namespace containing the importer pods.
-        timeout (int): Maximum wait time in seconds.
+        plan (Plan): Warm Plan whose DiskTransfer tasks are being migrated.
+        migration_uid (str): UID of the Migration identifying its importer pods.
+        selector (dict[str, str]): Plan ConvertorNodeSelector expected on each importer pod.
+        timeout (int): Maximum wait time in seconds, including preflight inspection.
 
     Returns:
-        list[Pod]: Importer pods pending with an Unschedulable PodScheduled condition.
+        list[Pod]: All DiskTransfer importer pods Pending with PodScheduled=Unschedulable.
 
     Raises:
-        AssertionError: If no importer pod reaches the expected pending state before timeout.
+        AssertionError: If importer pods do not inherit the selector and become unschedulable before timeout.
     """
-    pending_pods: list[Pod] | None = None
+    namespace = plan.instance.spec.targetNamespace
+    previous_pod_names: set[str] = set()
+    expected_importer_count = 0
 
     def _all_importer_pods_unschedulable() -> list[Pod]:
-        """Return current importer pods only when all are Pending and unschedulable.
+        """Return every DiskTransfer importer pod after two stable unschedulable samples.
 
         Returns:
-            list[Pod]: All current importer pods, or an empty list until all are unschedulable.
+            list[Pod]: All importer pods when their count matches DiskTransfer tasks and their
+                names are stable across polls; otherwise an empty list.
+
+        Raises:
+            AssertionError: If a pod lacks the Plan selector or schedules before recovery.
         """
-        importer_pods = get_importer_pods(client=client, namespace=namespace)
-        if importer_pods and all(_is_unschedulable(pod) for pod in importer_pods):
+        nonlocal previous_pod_names, expected_importer_count
+        importer_pods = get_importer_pods(
+            client=plan.client,
+            namespace=namespace,
+            migration_uid=migration_uid,
+        )
+        plan_status = plan.instance.status
+        migration_status = plan_status.migration if plan_status else None
+        expected_importer_count = sum(
+            len(step.tasks or [])
+            for vm_status in ((migration_status.vms or []) if migration_status else [])
+            for step in vm_status.pipeline or []
+            if step.name == _DISK_TRANSFER_STEP_NAME
+        )
+        current_pod_names = {pod.name for pod in importer_pods}
+        pod_instances = [(pod, pod.instance) for pod in importer_pods]
+        for pod, pod_instance in pod_instances:
+            pod_spec = pod_instance.get("spec", {})
+            pod_selector = pod_spec.get("nodeSelector") or {}
+            assert all(pod_selector.get(key) == value for key, value in selector.items()), (
+                f"Importer pod '{pod.name}' does not contain Plan selector {selector}: {pod_selector}"
+            )
+            pod_status = pod_instance.get("status", {})
+            assert not pod_spec.get("nodeName") and pod_status.get("phase") == Pod.Status.PENDING, (
+                f"Importer pod '{pod.name}' scheduled before the test labeled a matching worker; "
+                f"observed status: {pod_status}"
+            )
+
+        if (
+            expected_importer_count > 0
+            and len(importer_pods) == expected_importer_count
+            and current_pod_names == previous_pod_names
+            and all(_is_unschedulable(status=pod_instance.get("status", {})) for _, pod_instance in pod_instances)
+        ):
             return importer_pods
+        previous_pod_names = current_pod_names
         return []
 
+    def _timeout_message() -> str:
+        """Build diagnostics from importer pods observed when polling times out.
+
+        Returns:
+            str: Expected task count and importer Pod scheduling details.
+        """
+        importer_pods = get_importer_pods(
+            client=plan.client,
+            namespace=namespace,
+            migration_uid=migration_uid,
+        )
+        return (
+            f"Expected {expected_importer_count} CDI importer pod(s) for DiskTransfer tasks in Migration "
+            f"'{migration_uid}', but they did not all reach Pending with PodScheduled=Unschedulable within "
+            f"{timeout}s; observed: {_get_pod_scheduling_details(pods=importer_pods)}"
+        )
+
     try:
-        for sample in TimeoutSampler(
+        for importer_pods in TimeoutSampler(
             wait_timeout=timeout,
             sleep=TIMEOUT_5SEC,
             func=_all_importer_pods_unschedulable,
         ):
-            if sample:
-                pending_pods = sample
-                break
+            if importer_pods:
+                return importer_pods
     except TimeoutExpiredError as err:
-        current_pods = get_importer_pods(client=client, namespace=namespace)
-        observed = [
-            {
-                "name": pod.name,
-                "phase": pod.instance.get("status", {}).get("phase"),
-                "nodeName": pod.instance.get("status", {}).get("nodeName"),
-            }
-            for pod in current_pods
-        ]
-        raise AssertionError(
-            f"Not all current CDI importer pods reached Pending with PodScheduled=Unschedulable "
-            f"in namespace '{namespace}'. Observed importer pods: {observed}"
-        ) from err
+        raise AssertionError(_timeout_message()) from err
 
-    if pending_pods is None:
-        raise AssertionError(f"Importer pod polling ended without a result in namespace '{namespace}'")
-    return pending_pods
-
-
-def wait_for_vddk_config_map(plan: Plan, timeout: int = TIMEOUT_1MINUTE) -> ConfigMap:
-    """Wait for the VDDK ConfigMap associated with a Plan.
-
-    Args:
-        plan (Plan): Migration Plan whose VDDK ConfigMap should be found.
-        timeout (int): Maximum wait time in seconds.
-
-    Returns:
-        ConfigMap: The Plan's VDDK ConfigMap.
-
-    Raises:
-        AssertionError: If the ConfigMap is not created before timeout.
-    """
-    config_map: ConfigMap | None = None
-    try:
-        for sample in TimeoutSampler(
-            wait_timeout=timeout,
-            sleep=TIMEOUT_5SEC,
-            func=lambda: get_vddk_config_maps(plan=plan),
-        ):
-            if sample:
-                config_map = sample[0]
-                break
-    except TimeoutExpiredError as err:
-        raise AssertionError(f"VDDK ConfigMap for Plan '{plan.name}' was not created") from err
-
-    if config_map is None:
-        raise AssertionError(f"VDDK ConfigMap polling for Plan '{plan.name}' ended without a result")
-    return config_map
-
-
-def wait_for_vddk_config_maps_cleanup(plan: Plan, timeout: int = TIMEOUT_1MINUTE) -> None:
-    """Wait until Forklift removes all VDDK ConfigMaps owned by a Plan.
-
-    Args:
-        plan (Plan): Completed Migration Plan.
-        timeout (int): Maximum wait time in seconds.
-
-    Raises:
-        AssertionError: If a VDDK ConfigMap remains after timeout.
-    """
-    config_maps: list[ConfigMap] | None = None
-    try:
-        for sample in TimeoutSampler(
-            wait_timeout=timeout,
-            sleep=TIMEOUT_5SEC,
-            func=lambda: get_vddk_config_maps(plan=plan),
-        ):
-            if not sample:
-                config_maps = sample
-                break
-    except TimeoutExpiredError as err:
-        config_maps = get_vddk_config_maps(plan=plan)
-        raise AssertionError(
-            f"VDDK ConfigMap(s) {[config_map.name for config_map in config_maps]} remain after Plan '{plan.name}' completed"
-        ) from err
-
-    if config_maps is None:
-        raise AssertionError(f"VDDK ConfigMap cleanup polling for Plan '{plan.name}' ended without a result")
-
-
-def create_warm_migration_scheduling_callback(
-    plan: Plan,
-    client: DynamicClient,
-    importer_namespace: str,
-    importer_placements: list[dict[str, Any]],
-    conversion_placements: list[dict[str, Any]],
-    di_callback: Callable[[str], None] | None,
-) -> Callable[[str], None]:
-    """Create a migration callback that records importer and virt-v2v placement.
-
-    Args:
-        plan (Plan): Warm migration Plan being observed.
-        client (DynamicClient): OpenShift client used to list CDI importer pods.
-        importer_namespace (str): Namespace containing importer pods.
-        importer_placements (list[dict[str, Any]]): Destination for importer placement records.
-        conversion_placements (list[dict[str, Any]]): Destination for virt-v2v placement records.
-        di_callback (Callable[[str], None] | None): Optional deep-inspection status callback.
-
-    Returns:
-        Callable[[str], None]: Callback compatible with migration status polling.
-    """
-
-    def _observe_scheduling(status: str) -> None:
-        """Record pod placement and forward migration status to deep inspection.
-
-        Args:
-            status (str): Current migration status from the Plan.
-        """
-        _record_pod_placements(
-            pods=get_importer_pods(client=client, namespace=importer_namespace),
-            placements=importer_placements,
-        )
-        _record_pod_placements(
-            pods=get_conversion_pods(plan=plan),
-            placements=conversion_placements,
-        )
-        if di_callback is not None:
-            di_callback(status)
-
-    return _observe_scheduling
-
-
-def run_default_scheduling_migration(
-    plan: Plan,
-    importer_placements: list[dict[str, Any]],
-    on_status_poll: Callable[[str], None],
-) -> None:
-    """Wait for a default warm migration and confirm CDI importer scheduling and VDDK cleanup.
-
-    Args:
-        plan (Plan): Ready warm migration Plan without ConvertorNodeSelector.
-        importer_placements (list[dict[str, Any]]): Importer pod placements recorded during migration polling.
-        on_status_poll (Callable[[str], None]): Callback that captures pod placement and DI results.
-    """
-
-    def _observe_default_scheduling(status: str) -> None:
-        _assert_default_vddk_config_map(plan=plan)
-        on_status_poll(status)
-
-    wait_for_migration_complate(plan=plan, on_status_poll=_observe_default_scheduling)
-    assert importer_placements, "No scheduled CDI importer pod was observed during the default warm migration"
-    wait_for_vddk_config_maps_cleanup(plan=plan)
+    raise AssertionError(_timeout_message())
 
 
 def run_selector_recovery_migration(
     plan: Plan,
-    client: DynamicClient,
-    importer_namespace: str,
+    migration: Migration,
     selector: dict[str, str],
-    candidate_worker_nodes: list[Node],
-    importer_placements: list[dict[str, Any]],
-    conversion_placements: list[dict[str, Any]],
-    on_status_poll: Callable[[str], None],
+    candidate_worker_node_names: list[str],
+    di_callback: Callable[[str], None] | None,
 ) -> None:
-    """Resolve an unsatisfied selector, complete the warm migration, and verify pod placement.
+    """Recover a warm migration after its CDI importer pods fail scheduling.
 
     Args:
-        plan (Plan): Ready warm migration Plan with ConvertorNodeSelector.
-        client (DynamicClient): OpenShift client used for importer and worker operations.
-        importer_namespace (str): Namespace containing the destination VM and importer pods.
-        selector (dict[str, str]): Plan selector absent from cluster nodes at migration start.
-        candidate_worker_nodes (list[Node]): Ready, schedulable workers for recovery placement.
-        importer_placements (list[dict[str, Any]]): Destination for importer pod placement records.
-        conversion_placements (list[dict[str, Any]]): Destination for virt-v2v placement records.
-        on_status_poll (Callable[[str], None]): Callback that captures pod placement and DI results.
-    """
-    config_map = wait_for_vddk_config_map(plan=plan)
-    config_map_data = config_map.instance.get("data", {})
-    assert "vddk-node-selector" in config_map_data, (
-        f"VDDK ConfigMap '{config_map.name}' is missing vddk-node-selector"
-    )
-    assert json.loads(config_map_data["vddk-node-selector"]) == selector
+        plan (Plan): Warm Plan configured with ConvertorNodeSelector.
+        migration (Migration): Migration resource created for the Plan.
+        selector (dict[str, str]): Plan's ConvertorNodeSelector.
+        candidate_worker_node_names (list[str]): Names of Ready, schedulable workers found during preflight.
+        di_callback (Callable[[str], None] | None): Optional callback for deep-inspection capture.
 
-    pending_importer_pods = wait_for_importer_pods_pending(client=client, namespace=importer_namespace)
+    Raises:
+        AssertionError: If importer pods do not pend, the selector does not propagate, or pods use another node.
+    """
+    importer_namespace = plan.instance.spec.targetNamespace
+    migration_uid = migration.instance.metadata.uid
+    importer_placements: set[str] = set()
+    conversion_placements: set[str] = set()
+    pending_importer_pods = wait_for_importer_pods_pending(
+        plan=plan,
+        migration_uid=migration_uid,
+        selector=selector,
+    )
     worker_node = _select_compatible_worker_node(
-        client=client,
-        candidate_worker_nodes=candidate_worker_nodes,
+        client=plan.client,
+        candidate_worker_node_names=candidate_worker_node_names,
         importer_pods=pending_importer_pods,
         selector=selector,
     )
+    initially_pending_names = {pod.name for pod in pending_importer_pods}
+    label_applied_at = monotonic()
     with ResourceEditor(patches={worker_node: {"metadata": {"labels": selector}}}):
-        wait_for_migration_complate(plan=plan, on_status_poll=on_status_poll)
 
-    _assert_selector_on_placements(
-        placements=importer_placements,
-        selector=selector,
-        expected_node=worker_node.name,
+        def _observe_recovery(status: str) -> None:
+            """Record placements and fail promptly if a pod violates the expected selector.
+
+            Args:
+                status (str): Current migration status.
+
+            Raises:
+                AssertionError: If a scheduled pod violates the Plan selector or selected worker.
+            """
+            importer_pods = get_importer_pods(
+                client=plan.client,
+                namespace=importer_namespace,
+                migration_uid=migration_uid,
+            )
+            _record_pod_placements(
+                pods=importer_pods,
+                observed_pod_names=importer_placements,
+                selector=selector,
+                expected_node=worker_node.name,
+                pod_type="CDI importer",
+            )
+            if not initially_pending_names <= importer_placements:
+                assert monotonic() - label_applied_at < TIMEOUT_2MINUTES, (
+                    f"Initially pending CDI importer pod(s) {sorted(initially_pending_names)} did not schedule "
+                    f"within {TIMEOUT_2MINUTES}s after labeling worker '{worker_node.name}' with selector "
+                    f"{selector}; observed: {_get_pod_scheduling_details(pods=importer_pods)}"
+                )
+
+            conversion_pods = Pod.get(
+                client=plan.client,
+                namespace=plan.instance.spec.targetNamespace,
+                label_selector=_CONVERSION_POD_LABEL_SELECTOR.format(
+                    plan_name=plan.name,
+                    plan_namespace=plan.namespace,
+                ),
+            )
+            _record_pod_placements(
+                pods=list(conversion_pods),
+                observed_pod_names=conversion_placements,
+                selector=selector,
+                expected_node=worker_node.name,
+                pod_type="virt-v2v conversion",
+            )
+            if di_callback is not None:
+                di_callback(status)
+
+        wait_for_migration_complate(plan=plan, on_status_poll=_observe_recovery)
+
+    _assert_observed_pod_names(
+        observed_pod_names=importer_placements,
         pod_type="CDI importer",
-        expected_pod_names={pod.name for pod in pending_importer_pods},
+        expected_pod_names=initially_pending_names,
     )
-    _assert_selector_on_placements(
-        placements=conversion_placements,
-        selector=selector,
-        expected_node=worker_node.name,
+    _assert_observed_pod_names(
+        observed_pod_names=conversion_placements,
         pod_type="virt-v2v conversion",
     )
-    wait_for_vddk_config_maps_cleanup(plan=plan)
 
 
-def _record_pod_placements(pods: list[Pod], placements: list[dict[str, Any]]) -> None:
-    """Add each newly observed scheduled pod to a placement collection.
+def _record_pod_placements(
+    pods: list[Pod],
+    observed_pod_names: set[str],
+    selector: dict[str, str],
+    expected_node: str,
+    pod_type: str,
+) -> None:
+    """Validate and record each newly scheduled pod.
 
     Args:
-        pods (list[Pod]): Pods whose scheduling state should be recorded.
-        placements (list[dict[str, Any]]): Placement records collected during migration polling.
+        pods (list[Pod]): Pods to inspect.
+        observed_pod_names (set[str]): Names already validated during migration polling.
+        selector (dict[str, str]): Plan ConvertorNodeSelector.
+        expected_node (str): Worker node selected for this migration.
+        pod_type (str): Human-readable pod type for assertion messages.
+
+    Raises:
+        AssertionError: If a scheduled pod violates the Plan selector or selected worker.
     """
-    recorded_pod_names = {placement["pod_name"] for placement in placements}
     for pod in pods:
         pod_instance = pod.instance
-        node_name = pod_instance.get("status", {}).get("nodeName")
-        if node_name and pod.name not in recorded_pod_names:
-            placements.append(
-                {
-                    "pod_name": pod.name,
-                    "node_name": node_name,
-                    "node_selector": pod_instance.get("spec", {}).get("nodeSelector", {}),
-                }
-            )
-            recorded_pod_names.add(pod.name)
+        node_name = pod_instance.get("spec", {}).get("nodeName")
+        if not node_name or pod.name in observed_pod_names:
+            continue
+
+        assert node_name == expected_node, (
+            f"{pod_type.capitalize()} pod '{pod.name}' ran on '{node_name}', expected '{expected_node}'"
+        )
+        pod_selector = pod_instance.get("spec", {}).get("nodeSelector") or {}
+        assert all(pod_selector.get(key) == value for key, value in selector.items()), (
+            f"{pod_type.capitalize()} pod '{pod.name}' did not inherit Plan selector {selector}"
+        )
+        observed_pod_names.add(pod.name)
+
+
+def _assert_observed_pod_names(
+    observed_pod_names: set[str],
+    pod_type: str,
+    expected_pod_names: set[str] | None = None,
+) -> None:
+    """Assert that expected Pod placements were observed during migration polling.
+
+    Args:
+        observed_pod_names (set[str]): Pod names observed with validated placement.
+        pod_type (str): Human-readable pod type for assertion messages.
+        expected_pod_names (set[str] | None): Pod names that must be observed, if specified.
+
+    Raises:
+        AssertionError: If no placement or any expected placement was not observed.
+    """
+    assert observed_pod_names, f"No {pod_type} pod placement was observed"
+    if expected_pod_names is not None:
+        assert expected_pod_names <= observed_pod_names, (
+            f"Did not observe every initially pending {pod_type} pod after recovery. "
+            f"Missing: {sorted(expected_pod_names - observed_pod_names)}; observed: {sorted(observed_pod_names)}"
+        )
 
 
 def _select_compatible_worker_node(
     client: DynamicClient,
-    candidate_worker_nodes: list[Node],
+    candidate_worker_node_names: list[str],
     importer_pods: list[Pod],
     selector: dict[str, str],
 ) -> Node:
-    """Choose a worker matching CDI nodeSelector entries other than the Plan selector.
+    """Choose an eligible worker that satisfies CDI's other node selectors.
 
     Args:
-        client (DynamicClient): OpenShift client used for worker memory selection.
-        candidate_worker_nodes (list[Node]): Ready, schedulable workers from the fixture.
-        importer_pods (list[Pod]): Pending importer pods whose merged selectors must be honored.
-        selector (dict[str, str]): Plan selector to exclude when matching existing node labels.
+        client (DynamicClient): OpenShift client used for memory-based worker selection.
+        candidate_worker_node_names (list[str]): Worker names eligible during preflight.
+        importer_pods (list[Pod]): Pending importer pods whose selectors must be honored.
+        selector (dict[str, str]): ConvertorNodeSelector to exclude when checking existing pod selectors.
 
     Returns:
-        Node: Selected worker node to label for importer scheduling recovery.
+        Node: Worker node compatible with every importer pod.
 
     Raises:
-        AssertionError: If no candidate worker satisfies CDI's other nodeSelector entries.
+        AssertionError: If no candidate worker satisfies CDI's other node selectors.
     """
     required_selectors: list[dict[str, str]] = []
     for pod in importer_pods:
-        pod_selector = pod.instance.get("spec", {}).get("nodeSelector", {})
-        assert all(pod_selector.get(key) == value for key, value in selector.items()), (
-            f"Importer pod '{pod.name}' does not contain the Plan selector: {pod_selector}"
-        )
+        pod_selector = pod.instance.get("spec", {}).get("nodeSelector") or {}
         required_selectors.append({key: value for key, value in pod_selector.items() if key not in selector})
 
-    compatible_worker_nodes = [
+    worker_name_set = set(candidate_worker_node_names)
+    current_candidate_nodes = [
+        node for node in get_ready_schedulable_worker_nodes(ocp_client=client) if node.name in worker_name_set
+    ]
+    compatible_workers = [
         node
-        for node in candidate_worker_nodes
+        for node in current_candidate_nodes
         if all(
-            all((node.labels or {}).get(key) == value for key, value in required_selector.items())
+            all(get_node_labels(node=node).get(key) == value for key, value in required_selector.items())
             for required_selector in required_selectors
         )
     ]
-    assert compatible_worker_nodes, (
+    assert compatible_workers, (
         "No Ready, schedulable worker satisfies the CDI importer nodeSelector entries other than "
         f"ConvertorNodeSelector. Required selectors: {required_selectors}; "
-        f"candidate workers: {[node.name for node in candidate_worker_nodes]}"
+        f"candidate workers: {[node.name for node in current_candidate_nodes]}"
     )
     selected_node_name = select_node_by_available_memory(
         ocp_admin_client=client,
-        worker_nodes=[node.name for node in compatible_worker_nodes],
+        worker_nodes=[node.name for node in compatible_workers],
     )
-    return next(node for node in compatible_worker_nodes if node.name == selected_node_name)
+    return next(node for node in compatible_workers if node.name == selected_node_name)
 
 
-def _assert_default_vddk_config_map(plan: Plan) -> None:
-    """Verify default warm migration ConfigMaps omit the custom selector key.
-
-    Args:
-        plan (Plan): Warm migration Plan created without ConvertorNodeSelector.
-    """
-    for config_map in get_vddk_config_maps(plan=plan):
-        assert "vddk-node-selector" not in config_map.instance.get("data", {}), (
-            f"Default warm Plan unexpectedly added vddk-node-selector to ConfigMap '{config_map.name}'"
-        )
-
-
-def _assert_selector_on_placements(
-    placements: list[dict[str, Any]],
-    selector: dict[str, str],
-    expected_node: str,
-    pod_type: str,
-    expected_pod_names: set[str] | None = None,
-) -> None:
-    """Verify observed pods inherited the Plan selector and ran on the selected worker.
+def _is_unschedulable(status: dict[str, Any]) -> bool:
+    """Check whether an importer pod is Pending because the scheduler cannot place it.
 
     Args:
-        placements (list[dict[str, Any]]): Pod placement records captured during migration.
-        selector (dict[str, str]): Plan convertorNodeSelector.
-        expected_node (str): Worker node labeled to satisfy the selector.
-        pod_type (str): Human-readable pod type for assertion messages.
-        expected_pod_names (set[str] | None): Required pod names that must be observed. Defaults to None.
-
-    Raises:
-        AssertionError: If no pod placement was captured or a pod violated the selector.
-    """
-    assert placements, f"No {pod_type} pod placement was observed"
-    if expected_pod_names is not None:
-        observed_pod_names = {placement["pod_name"] for placement in placements}
-        assert expected_pod_names.issubset(observed_pod_names), (
-            f"Did not observe every initially pending {pod_type} pod after recovery. "
-            f"Missing: {sorted(expected_pod_names - observed_pod_names)}; observed: {sorted(observed_pod_names)}"
-        )
-    for placement in placements:
-        assert placement["node_name"] == expected_node, (
-            f"{pod_type.capitalize()} pod '{placement['pod_name']}' ran on '{placement['node_name']}', "
-            f"expected '{expected_node}'"
-        )
-        assert all(placement["node_selector"].get(key) == value for key, value in selector.items()), (
-            f"{pod_type.capitalize()} pod '{placement['pod_name']}' did not inherit the Plan selector"
-        )
-
-
-def _is_unschedulable(pod: Pod) -> bool:
-    """Check whether a pod is Pending because the scheduler cannot place it.
-
-    Args:
-        pod (Pod): CDI importer pod to inspect.
+        status (dict[str, Any]): Current Pod status.
 
     Returns:
-        bool: Whether the pod has a PodScheduled=Unschedulable condition.
+        bool: Whether the pod has PodScheduled=False with reason Unschedulable.
     """
-    pod_instance = pod.instance
-    status = pod_instance.get("status", {})
     return status.get("phase") == Pod.Status.PENDING and any(
-        condition.get("type") == "PodScheduled" and condition.get("reason") == "Unschedulable"
-        for condition in status.get("conditions", [])
+        condition.get("type") == _POD_SCHEDULED_CONDITION_TYPE
+        and condition.get("status") == _FALSE_CONDITION_STATUS
+        and condition.get("reason") == _UNSCHEDULABLE_REASON
+        for condition in status.get("conditions") or []
     )

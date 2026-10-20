@@ -1,3 +1,5 @@
+from typing import TYPE_CHECKING, Any
+
 import pytest
 from ocp_resources.network_map import NetworkMap
 from ocp_resources.plan import Plan
@@ -8,6 +10,7 @@ from pytest_testconfig import py_config
 from utilities.deep_inspection import DI_RESULTS_KEY, create_di_capture_callback
 from utilities.migration_utils import get_cutover_value
 from utilities.mtv_migration import (
+    create_migration_resource,
     create_plan_resource,
     execute_migration,
     get_network_migration_map,
@@ -15,6 +18,16 @@ from utilities.mtv_migration import (
 )
 from utilities.post_migration import check_vms
 from utilities.utils import get_value_from_py_config, populate_vm_ids
+from utilities.warm_migration_scheduling import (
+    run_selector_recovery_migration,
+)
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+
+    from libs.base_provider import BaseProvider
+    from libs.forklift_inventory import ForkliftInventory
+    from libs.providers.openshift import OCPProvider
 
 
 @pytest.mark.vsphere
@@ -25,21 +38,55 @@ from utilities.utils import get_value_from_py_config, populate_vm_ids
 @pytest.mark.incremental
 @pytest.mark.parametrize(
     "class_plan_config",
-    [
-        pytest.param(
-            py_config["tests_params"]["test_sanity_warm_mtv_migration"],
-        )
-    ],
+    [pytest.param(py_config["tests_params"]["test_sanity_warm_mtv_migration"])],
     indirect=True,
-    ids=["rhel8"],
+    ids=["rhel8 warm sanity"],
 )
 @pytest.mark.usefixtures("precopy_interval_forkliftcontroller", "cleanup_migrated_vms")
 class TestSanityWarmMtvMigration:
-    """Warm migration sanity test."""
+    """Warm-migrate a running RHEL 8 VM and verify guest networking, inspection, and selector scheduling.
+
+    Purpose/Regression:
+        Verify the existing warm migration behavior, including static IP preservation and vSphere Deep Inspection,
+        while exercising ConvertorNodeSelector for vSphere importer and conversion pods.
+        There is no induced migration failure; the selector temporarily prevents scheduling until a matching worker
+        is labeled.
+
+    Prerequisites:
+        Register and connect a vSphere or RHV source provider and an OpenShift destination with MTV, accessible
+        storage, and destination networks. Use a disposable, powered-on RHEL 8 VM with a guest agent, disks that
+        support incremental warm copies, and at least one statically configured NIC mapped to a Multus network. For
+        vSphere, enable changed-block tracking and use MTV 5.0.0 for selector coverage. When a Ready, schedulable
+        worker is unavailable, the test warns and continues with default scheduling. Warm Deep Inspection must be
+        available for vSphere.
+
+    Test plan:
+        1. Prepare the VM and confirm it appears in source inventory. Create storage and network mappings, placing
+           the static-IP NIC on Multus, and confirm the maps are ready.
+        2. Create a warm Plan with static IP preservation enabled. On vSphere, when a schedulable worker is
+           available, set a unique ConvertorNodeSelector that matches no worker; confirm the Plan is Ready and
+           contains it. If no worker is available, confirm the warning and create the Plan without the selector.
+        3. Start the Migration and request cutover. With selector coverage, confirm CDI importer pods are Pending
+           with PodScheduled=Unschedulable, label a compatible worker, and confirm importer and virt-v2v conversion
+           pods schedule on it. Without selector coverage, run with default scheduling. Confirm migration succeeds.
+        4. Before cleanup, verify the migrated VM is powered on and reachable, its static IP, subnet, and gateway are
+           preserved, and (for vSphere) its NIC name and captured warm Deep Inspection results are preserved.
+        5. Remove the temporary worker label, migrated VM, Plan, StorageMap, and NetworkMap, and confirm the
+           migration artifacts and temporary label are gone.
+
+    Expected result:
+        The warm migration completes through cutover. On vSphere, static network configuration, NIC name, and
+        complete Deep Inspection results are preserved. When selector coverage runs, ConvertorNodeSelector behavior
+        is verified. If no eligible worker is found, a warning is logged and the migration proceeds with default
+        scheduling; any resulting migration failure remains visible in its status. RHV uses default scheduling.
+        Inspect the Migration status, destination guest network configuration, pod scheduling
+        conditions, and Plan-created DeepInspection results if a check fails.
+    """
 
     storage_map: StorageMap
     network_map: NetworkMap
     plan_resource: Plan
+    convertor_worker_nodes: list[str] | None
 
     def test_create_storagemap(
         self,
@@ -124,14 +171,15 @@ class TestSanityWarmMtvMigration:
 
     def test_create_plan(
         self,
-        prepared_plan,
-        fixture_store,
-        ocp_admin_client,
-        source_provider,
-        destination_provider,
-        target_namespace,
-        source_provider_inventory,
-    ):
+        prepared_plan: dict[str, Any],
+        fixture_store: dict[str, Any],
+        ocp_admin_client: "DynamicClient",
+        source_provider: "BaseProvider",
+        destination_provider: "OCPProvider",
+        target_namespace: str,
+        source_provider_inventory: "ForkliftInventory",
+        convertor_node_selector: dict[str, str] | None,
+    ) -> None:
         """Create MTV Plan CR resource.
 
         Args:
@@ -139,15 +187,16 @@ class TestSanityWarmMtvMigration:
             fixture_store (dict[str, Any]): Fixture store for resource tracking.
             ocp_admin_client (DynamicClient): OpenShift admin client.
             source_provider (BaseProvider): Source provider instance.
-            destination_provider (BaseProvider): Destination provider instance.
-            target_namespace (Namespace): Target namespace for migration.
+            destination_provider (OCPProvider): Destination provider instance.
+            target_namespace (str): Target namespace for migration.
             source_provider_inventory (ForkliftInventory): Source provider inventory.
+            convertor_node_selector (dict[str, str] | None): Selector for conversion and importer pods, if configured.
 
         Returns:
             None
 
         Raises:
-            AssertionError: If Plan creation fails.
+            AssertionError: If Plan creation or selector serialization fails.
         """
         populate_vm_ids(plan=prepared_plan, inventory=source_provider_inventory)
 
@@ -162,23 +211,35 @@ class TestSanityWarmMtvMigration:
             target_namespace=target_namespace,
             warm_migration=prepared_plan.get("warm_migration", False),
             preserve_static_ips=prepared_plan.get("preserve_static_ips", False),
+            vm_target_namespace=prepared_plan["_vm_target_namespace"],
+            convertor_node_selector=convertor_node_selector,
         )
         assert self.plan_resource, "Plan creation failed"
+        plan_spec: dict[str, Any] = self.plan_resource.instance.to_dict()["spec"]
+        if convertor_node_selector is None:
+            assert "convertorNodeSelector" not in plan_spec, "Default Plan unexpectedly contains convertorNodeSelector"
+        else:
+            assert plan_spec.get("convertorNodeSelector") == convertor_node_selector, (
+                f"Plan convertorNodeSelector is {plan_spec.get('convertorNodeSelector')}, "
+                f"expected {convertor_node_selector}"
+            )
 
     def test_migrate_vms(
         self,
-        fixture_store,
-        ocp_admin_client,
-        target_namespace,
-        source_provider,
-    ):
-        """Execute warm migration with cutover.
+        fixture_store: dict[str, Any],
+        ocp_admin_client: "DynamicClient",
+        target_namespace: str,
+        source_provider: "BaseProvider",
+        convertor_node_selector: dict[str, str] | None,
+    ) -> None:
+        """Execute warm migration with default scheduling or selector recovery.
 
         Args:
             fixture_store (dict[str, Any]): Fixture store for resource tracking.
             ocp_admin_client (DynamicClient): OpenShift admin client.
             target_namespace (Namespace): Target namespace for migration.
             source_provider (BaseProvider): Source provider, used to gate DI capture to vSphere.
+            convertor_node_selector (dict[str, str] | None): Plan selector for the vSphere recovery scenario.
 
         Returns:
             None
@@ -188,13 +249,32 @@ class TestSanityWarmMtvMigration:
             if source_provider.type == Provider.ProviderType.VSPHERE
             else None
         )
-        execute_migration(
+        cut_over = get_cutover_value()
+        if convertor_node_selector is None:
+            execute_migration(
+                ocp_admin_client=ocp_admin_client,
+                fixture_store=fixture_store,
+                plan=self.plan_resource,
+                target_namespace=target_namespace,
+                cut_over=cut_over,
+                on_status_poll=di_callback,
+            )
+            return
+
+        assert self.convertor_worker_nodes, "Selector recovery fixture did not provide any eligible workers"
+        migration = create_migration_resource(
             ocp_admin_client=ocp_admin_client,
             fixture_store=fixture_store,
             plan=self.plan_resource,
             target_namespace=target_namespace,
-            cut_over=get_cutover_value(),
-            on_status_poll=di_callback,
+            cut_over=cut_over,
+        )
+        run_selector_recovery_migration(
+            plan=self.plan_resource,
+            migration=migration,
+            selector=convertor_node_selector,
+            candidate_worker_node_names=self.convertor_worker_nodes,
+            di_callback=di_callback,
         )
 
     def test_check_vms(
@@ -256,7 +336,44 @@ class TestSanityWarmMtvMigration:
 )
 @pytest.mark.usefixtures("precopy_interval_forkliftcontroller", "cleanup_migrated_vms")
 class TestMtvMigrationWarm2disks2nics:
-    """Warm migration test with 2 disks and 2 NICs."""
+    """Warm-migrate a running VM with two disks and two NICs and verify both survive cutover (MTV-200).
+
+    Purpose/Regression:
+        Warm migration must handle a VM with multiple disks and multiple
+        network interfaces: both disks must be copied incrementally and
+        finalized at cutover, and both NICs must appear on the migrated VM
+        per the NetworkMap (MTV-200). There is no induced failure.
+
+    Prerequisites:
+        Register and connect a source provider (vSphere or RHV) and an
+        OpenShift destination with MTV installed, with accessible destination
+        storage and network (including a destination network for the second
+        NIC). Use a disposable, powered-on RHEL VM with two disks, two NICs,
+        and guest-agent access, with disks whose changes can be captured
+        incrementally. Have permission to create maps and a Plan in a target
+        namespace and to adjust the controller's pre-copy interval.
+
+    Test plan:
+        1. Prepare the disposable powered-on VM with its two disks and two
+           NICs and wait until it appears in Forklift inventory.
+        2. Create a StorageMap for both disks and a NetworkMap that maps
+           both NICs to destination networks. Confirm both are created.
+        3. Create a warm Plan for the VM. Check the Plan's Ready condition
+           is True.
+        4. Run the warm migration with a cutover time and check it reaches
+           Succeeded.
+        5. Validate the migrated VM: power state, guest-agent presence,
+           connectivity, and CPU, memory, network (both NICs), and storage
+           (both disks) equivalence with the source. After the checks,
+           delete the migrated VM; the maps and Plan are removed with the
+           run.
+
+    Expected result:
+        The warm migration completes through cutover with both disks and
+        both NICs present and equivalent on the migrated VM. On failure,
+        inspect the migration CR status for the failed stage and the
+        migrated VM's disk attachments and network interfaces.
+    """
 
     storage_map: StorageMap
     network_map: NetworkMap
@@ -478,7 +595,47 @@ class TestMtvMigrationWarm2disks2nics:
 @pytest.mark.skipif(not get_value_from_py_config("remote_ocp_cluster"), reason="No remote OCP cluster provided")
 @pytest.mark.usefixtures("precopy_interval_forkliftcontroller", "cleanup_migrated_vms")
 class TestWarmRemoteOcp:
-    """Warm remote OCP migration test."""
+    """Warm-migrate a running VM to a separate remote OpenShift cluster and verify the result.
+
+    Purpose/Regression:
+        Warm migration where the destination is a different, remote
+        OpenShift cluster than the one running MTV: the incremental copies
+        and cutover must run against the remote destination and the migrated
+        VM must validate there. Preflight Deep Inspection is disabled for
+        this scenario. There is no induced failure.
+
+    Prerequisites:
+        Two OpenShift clusters: one running MTV (with the source provider
+        and migration resources) and a remote destination cluster with
+        accessible storage and network, registered with MTV and mutually
+        reachable. Register and connect a source provider (e.g. vSphere).
+        Use a disposable, powered-on Linux VM with guest-agent access and
+        disks whose changes can be captured incrementally. Have permission
+        to create maps and a Plan on the MTV cluster and the target
+        namespace on the remote cluster.
+
+    Test plan:
+        1. Prepare the disposable powered-on VM and wait until it appears
+           in Forklift inventory.
+        2. Create a StorageMap for the VM's disks and a NetworkMap for its
+           network, targeting the remote OpenShift destination. Confirm both
+           are created.
+        3. Create a warm Plan for the VM with preflight inspection
+           disabled. Check the Plan's Ready condition is True.
+        4. Run the warm migration with a cutover time and check it reaches
+           Succeeded.
+        5. Validate the migrated VM on the remote cluster: power state,
+           guest-agent presence, connectivity, and CPU, memory, network,
+           and storage equivalence with the source. After the checks, delete
+           the migrated VM; the maps and Plan are removed with the run.
+
+    Expected result:
+        The warm migration to the remote cluster completes through cutover
+        and the migrated VM validates. On failure, inspect the migration CR
+        status for the failed stage (pre-copy or cutover), the remote
+        provider resource's conditions on the MTV cluster, and the migrated
+        VM's spec and events in the remote target namespace.
+    """
 
     storage_map: StorageMap
     network_map: NetworkMap

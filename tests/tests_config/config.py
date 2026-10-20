@@ -13,6 +13,7 @@ remote_ocp_cluster: str = ""
 snapshots_interval: int = 2
 mins_before_cutover: int = 5
 plan_wait_timeout: int = 3600
+smb_max_channels: int = 4  # Hyper-V Provider spec.settings.smbMaxChannels when pre_copy_source_disks is enabled
 tests_params: dict = {
     "test_sanity_warm_mtv_migration": {
         "virtual_machines": [
@@ -24,29 +25,7 @@ tests_params: dict = {
         ],
         "warm_migration": True,
         "preserve_static_ips": True,
-    },
-    "test_warm_convertor_node_selector_pending": {
-        "virtual_machines": [
-            {
-                "name": "mtv-tests-rhel8",
-                "source_vm_power": "on",
-                "guest_agent": True,
-            },
-        ],
-        "warm_migration": True,
-        "vm_target_namespace": f"mtv-vms-warm-selector-pending-{uuid.uuid4().hex[:6]}",
         "convertor_node_selector": {"mtv-warm-test": None},
-    },
-    "test_warm_convertor_node_selector_default": {
-        "virtual_machines": [
-            {
-                "name": "mtv-tests-rhel8",
-                "source_vm_power": "on",
-                "guest_agent": True,
-            },
-        ],
-        "warm_migration": True,
-        "vm_target_namespace": f"mtv-vms-warm-selector-default-{uuid.uuid4().hex[:6]}",
     },
     "test_mtv_migration_warm_2disks2nics": {
         "virtual_machines": [
@@ -465,6 +444,39 @@ tests_params: dict = {
         "pin_to_non_dedicated_host": True,
         "inventory_timeout": 600,
     },
+    "test_copyoffload_dedicated_host_shared_populator_limit_migration": {
+        "virtual_machines": [
+            {
+                "name": "xcopy-template-test",
+                "guest_agent": True,
+                "clone": True,
+                "disk_type": "thin",
+                "add_disks": [
+                    {"size_gb": 10, "disk_mode": "persistent", "provision_type": "thin"},
+                    {"size_gb": 10, "disk_mode": "persistent", "provision_type": "thin"},
+                ],
+            },
+            {
+                "name": "xcopy-template-test",
+                "guest_agent": True,
+                "clone": True,
+                "disk_type": "thin",
+                "add_disks": [
+                    {"size_gb": 10, "disk_mode": "persistent", "provision_type": "thin"},
+                    {"size_gb": 10, "disk_mode": "persistent", "provision_type": "thin"},
+                ],
+            },
+        ],
+        "warm_migration": False,
+        "copyoffload": True,
+        "disable_drs_for_vms": True,
+        "pin_to_non_dedicated_host": True,
+        "pin_first_vm_to_dedicated_host": True,
+        "vm_inflight_limit": 2,
+        "populator_inflight_limit": 1,
+        "require_cross_source_contention": True,
+        "inventory_timeout": 600,
+    },
     "test_copyoffload_dedicated_migration_host_invalid_id_migration": {
         "virtual_machines": [
             {
@@ -734,6 +746,7 @@ tests_params: dict = {
             },
         ],
         "warm_migration": False,
+        # "pre_copy_source_disks": True,
         "target_power_state": "on",
         "preserve_static_ips": True,
         "enable_nested_virtualization": False,
@@ -926,6 +939,16 @@ tests_params: dict = {
     },
     "test_warm_di_concerns": {
         "virtual_machines": [{"name": "mtv-test-di-concern-bypath-fstab", "source_vm_power": "on"}],
+        "warm_migration": True,
+    },
+    "test_resume_conversion_warm": {
+        "virtual_machines": [
+            {
+                "name": "mtv-tests-rhel8",
+                "source_vm_power": "on",
+                "guest_agent": True,
+            },
+        ],
         "warm_migration": True,
     },
 }
