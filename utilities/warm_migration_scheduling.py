@@ -20,7 +20,7 @@ from utilities.worker_node_selection import (
 )
 
 if TYPE_CHECKING:
-    from kubernetes.dynamic import DynamicClient
+    from kubernetes.dynamic import DynamicClient, ResourceInstance
 
 _IMPORTER_POD_LABEL_SELECTOR = "app=containerized-data-importer,cdi.kubevirt.io=importer"
 _CONVERSION_POD_LABEL_SELECTOR = "forklift.app=virt-v2v"
@@ -30,7 +30,7 @@ _UNSCHEDULABLE_REASON = "Unschedulable"
 _FALSE_CONDITION_STATUS = "False"
 
 
-def get_importer_pods(client: DynamicClient, namespace: str, migration_uid: str) -> list[Pod]:
+def get_importer_pods(client: DynamicClient, namespace: str, migration_uid: str) -> list[ResourceInstance]:
     """List CDI importer pods in a migration's target namespace.
 
     Args:
@@ -39,35 +39,35 @@ def get_importer_pods(client: DynamicClient, namespace: str, migration_uid: str)
         migration_uid (str): UID of the Migration owning the importer pods.
 
     Returns:
-        list[Pod]: CDI importer pods found in the namespace.
+        list[ResourceInstance]: CDI importer pod snapshots found in the namespace.
     """
     return list(
         Pod.get(
             client=client,
             namespace=namespace,
             label_selector=f"{_IMPORTER_POD_LABEL_SELECTOR},migration={migration_uid}",
+            raw=True,
         )
     )
 
 
-def _get_pod_scheduling_details(pods: list[Pod]) -> list[dict[str, Any]]:
+def _get_pod_scheduling_details(pods: list[ResourceInstance]) -> list[dict[str, Any]]:
     """Collect scheduler-relevant Pod fields for failure diagnostics.
 
     Pod instances are unstructured Kubernetes API payloads, so their field values remain dynamically typed.
 
     Args:
-        pods (list[Pod]): Pods whose scheduling state should be reported.
+        pods (list[ResourceInstance]): Pod snapshots whose scheduling state should be reported.
 
     Returns:
         list[dict[str, Any]]: Pod selectors, constraints, and PodScheduled conditions.
     """
     pod_details = []
-    for pod in pods:
-        pod_instance = pod.instance
+    for pod_instance in pods:
         pod_spec = pod_instance.get("spec", {})
         pod_status = pod_instance.get("status", {})
         pod_details.append({
-            "name": pod.name,
+            "name": pod_instance.metadata.name,
             "phase": pod_status.get("phase"),
             "nodeName": pod_spec.get("nodeName"),
             "nodeSelector": pod_spec.get("nodeSelector"),
@@ -90,7 +90,7 @@ def wait_for_importer_pods_pending(
     migration_uid: str,
     selector: dict[str, str],
     timeout: int = TIMEOUT_10MINUTES,
-) -> list[Pod]:
+) -> list[ResourceInstance]:
     """Wait until all DiskTransfer importer pods are stably unschedulable.
 
     Args:
@@ -100,7 +100,7 @@ def wait_for_importer_pods_pending(
         timeout (int): Maximum wait time in seconds, including preflight inspection.
 
     Returns:
-        list[Pod]: All DiskTransfer importer pods Pending with PodScheduled=Unschedulable.
+        list[ResourceInstance]: All DiskTransfer importer pod snapshots Pending with PodScheduled=Unschedulable.
 
     Raises:
         AssertionError: If importer pods do not inherit the selector and become unschedulable before timeout.
@@ -110,11 +110,11 @@ def wait_for_importer_pods_pending(
     expected_importer_count = 0
 
     # Poll live Plan and Pod state until every DiskTransfer importer is stably unschedulable.
-    def _all_importer_pods_unschedulable() -> list[Pod]:
+    def _all_importer_pods_unschedulable() -> list[ResourceInstance]:
         """Return every DiskTransfer importer pod after two stable unschedulable samples.
 
         Returns:
-            list[Pod]: All importer pods when their count matches DiskTransfer tasks and their
+            list[ResourceInstance]: All importer pod snapshots when their count matches DiskTransfer tasks and their
                 names are stable across polls; otherwise an empty list.
 
         Raises:
@@ -134,17 +134,16 @@ def wait_for_importer_pods_pending(
             for step in vm_status.pipeline or []
             if step.name == _DISK_TRANSFER_STEP_NAME
         )
-        current_pod_names = {pod.name for pod in importer_pods}
-        pod_instances = [(pod, pod.instance) for pod in importer_pods]
-        for pod, pod_instance in pod_instances:
+        current_pod_names = {pod.metadata.name for pod in importer_pods}
+        for pod_instance in importer_pods:
             pod_spec = pod_instance.get("spec", {})
             pod_selector = pod_spec.get("nodeSelector") or {}
             assert all(pod_selector.get(key) == value for key, value in selector.items()), (
-                f"Importer pod '{pod.name}' does not contain Plan selector {selector}: {pod_selector}"
+                f"Importer pod '{pod_instance.metadata.name}' does not contain Plan selector {selector}: {pod_selector}"
             )
             pod_status = pod_instance.get("status", {})
             assert not pod_spec.get("nodeName") and pod_status.get("phase") == Pod.Status.PENDING, (
-                f"Importer pod '{pod.name}' scheduled before the test labeled a matching worker; "
+                f"Importer pod '{pod_instance.metadata.name}' scheduled before the test labeled a matching worker; "
                 f"observed status: {pod_status}"
             )
 
@@ -152,7 +151,7 @@ def wait_for_importer_pods_pending(
             expected_importer_count > 0
             and len(importer_pods) == expected_importer_count
             and current_pod_names == previous_pod_names
-            and all(_is_unschedulable(status=pod_instance.get("status", {})) for _, pod_instance in pod_instances)
+            and all(_is_unschedulable(status=pod_instance.get("status", {})) for pod_instance in importer_pods)
         ):
             return importer_pods
         previous_pod_names = current_pod_names
@@ -227,7 +226,7 @@ def run_selector_recovery_migration(
         importer_pods=pending_importer_pods,
         selector=selector,
     )
-    initially_pending_names = {pod.name for pod in pending_importer_pods}
+    initially_pending_names = {pod.metadata.name for pod in pending_importer_pods}
     label_applied_at = monotonic()
     # Apply the selector label only for the recovery window, then restore the worker's prior labels.
     with ResourceEditor(patches={worker_node: {"metadata": {"labels": selector}}}):
@@ -247,7 +246,7 @@ def run_selector_recovery_migration(
                 migration_uid=migration_uid,
             )
             _record_pod_placements(
-                pods=importer_pods,
+                pod_instances=importer_pods,
                 observed_pod_names=importer_placements,
                 selector=selector,
                 expected_node=worker_node.name,
@@ -264,9 +263,10 @@ def run_selector_recovery_migration(
                 client=plan.client,
                 namespace=plan.instance.spec.targetNamespace,
                 label_selector=f"{_CONVERSION_POD_LABEL_SELECTOR},migration={migration_uid}",
+                raw=True,
             )
             _record_pod_placements(
-                pods=list(conversion_pods),
+                pod_instances=list(conversion_pods),
                 observed_pod_names=conversion_placements,
                 selector=selector,
                 expected_node=worker_node.name,
@@ -290,7 +290,7 @@ def run_selector_recovery_migration(
 
 
 def _record_pod_placements(
-    pods: list[Pod],
+    pod_instances: list[ResourceInstance],
     observed_pod_names: set[str],
     selector: dict[str, str],
     expected_node: str,
@@ -299,29 +299,35 @@ def _record_pod_placements(
     """Validate and record each newly scheduled pod.
 
     Args:
-        pods (list[Pod]): Pods to inspect.
+        pod_instances (list[ResourceInstance]): Pod snapshots to inspect.
         observed_pod_names (set[str]): Names already validated during migration polling.
         selector (dict[str, str]): Plan ConvertorNodeSelector.
         expected_node (str): Worker node selected for this migration.
         pod_type (str): Human-readable pod type for assertion messages.
 
+    The Pod list response provides a consistent snapshot for validating placement without
+    a second API read that could race with CDI deleting a completed importer pod.
+
     Raises:
         AssertionError: If a scheduled pod violates the Plan selector or selected worker.
     """
-    for pod in pods:
-        pod_instance = pod.instance
+    for pod_instance in pod_instances:
+        pod_name = pod_instance.metadata.name
+        if pod_name in observed_pod_names:
+            continue
+
         node_name = pod_instance.get("spec", {}).get("nodeName")
-        if not node_name or pod.name in observed_pod_names:
+        if not node_name:
             continue
 
         assert node_name == expected_node, (
-            f"{pod_type.capitalize()} pod '{pod.name}' ran on '{node_name}', expected '{expected_node}'"
+            f"{pod_type.capitalize()} pod '{pod_name}' ran on '{node_name}', expected '{expected_node}'"
         )
         pod_selector = pod_instance.get("spec", {}).get("nodeSelector") or {}
         assert all(pod_selector.get(key) == value for key, value in selector.items()), (
-            f"{pod_type.capitalize()} pod '{pod.name}' did not inherit Plan selector {selector}"
+            f"{pod_type.capitalize()} pod '{pod_name}' did not inherit Plan selector {selector}"
         )
-        observed_pod_names.add(pod.name)
+        observed_pod_names.add(pod_name)
 
 
 def _assert_observed_pod_names(
@@ -350,7 +356,7 @@ def _assert_observed_pod_names(
 def _select_compatible_worker_node(
     client: DynamicClient,
     candidate_worker_node_names: list[str],
-    importer_pods: list[Pod],
+    importer_pods: list[ResourceInstance],
     selector: dict[str, str],
 ) -> Node:
     """Choose an eligible worker that satisfies CDI's other node selectors.
@@ -358,7 +364,7 @@ def _select_compatible_worker_node(
     Args:
         client (DynamicClient): OpenShift client used for memory-based worker selection.
         candidate_worker_node_names (list[str]): Worker names eligible during preflight.
-        importer_pods (list[Pod]): Pending importer pods whose selectors must be honored.
+        importer_pods (list[ResourceInstance]): Pending importer pod snapshots whose selectors must be honored.
         selector (dict[str, str]): ConvertorNodeSelector to exclude when checking existing pod selectors.
 
     Returns:
@@ -368,8 +374,8 @@ def _select_compatible_worker_node(
         AssertionError: If no candidate worker satisfies CDI's other node selectors.
     """
     required_selectors: list[dict[str, str]] = []
-    for pod in importer_pods:
-        pod_selector = pod.instance.get("spec", {}).get("nodeSelector") or {}
+    for pod_instance in importer_pods:
+        pod_selector = pod_instance.get("spec", {}).get("nodeSelector") or {}
         required_selectors.append({key: value for key, value in pod_selector.items() if key not in selector})
 
     worker_name_set = set(candidate_worker_node_names)
