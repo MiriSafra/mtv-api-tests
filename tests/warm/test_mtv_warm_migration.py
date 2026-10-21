@@ -183,8 +183,8 @@ class TestSanityWarmMtvMigration:
         """Create MTV Plan CR resource.
 
         Args:
-            prepared_plan (dict[str, Any]): The prepared migration plan.
-            fixture_store (dict[str, Any]): Fixture store for resource tracking.
+            prepared_plan (dict[str, Any]): Heterogeneous per-test migration configuration.
+            fixture_store (dict[str, Any]): Heterogeneous fixture registry for resource tracking and teardown.
             ocp_admin_client (DynamicClient): OpenShift admin client.
             source_provider (BaseProvider): Source provider instance.
             destination_provider (OCPProvider): Destination provider instance.
@@ -215,6 +215,7 @@ class TestSanityWarmMtvMigration:
             convertor_node_selector=convertor_node_selector,
         )
         assert self.plan_resource, "Plan creation failed"
+        # The OpenShift wrapper returns the CR spec as an unstructured API mapping.
         plan_spec: dict[str, Any] = self.plan_resource.instance.to_dict()["spec"]
         if convertor_node_selector is None:
             assert "convertorNodeSelector" not in plan_spec, "Default Plan unexpectedly contains convertorNodeSelector"
@@ -235,7 +236,7 @@ class TestSanityWarmMtvMigration:
         """Execute warm migration with default scheduling or selector recovery.
 
         Args:
-            fixture_store (dict[str, Any]): Fixture store for resource tracking.
+            fixture_store (dict[str, Any]): Heterogeneous fixture registry for resource tracking and teardown.
             ocp_admin_client (DynamicClient): OpenShift admin client.
             target_namespace (Namespace): Target namespace for migration.
             source_provider (BaseProvider): Source provider, used to gate DI capture to vSphere.

@@ -40,31 +40,37 @@ def convertor_node_selector(
     source_provider: "BaseProvider",
     ocp_admin_client: "DynamicClient",
 ) -> dict[str, str] | None:
-    """Resolve selector coverage when a worker exists, otherwise use default scheduling.
+    """Resolve vSphere selector coverage when a matching worker can be labeled.
 
     Args:
         request (pytest.FixtureRequest): Class-scoped request for sharing worker candidates with test methods.
-        class_plan_config (dict[str, Any]): Test-specific plan configuration.
-        fixture_store (dict[str, Any]): Fixture store containing the unique session ID.
+        class_plan_config (dict[str, Any]): Heterogeneous, provider-specific test plan configuration.
+        fixture_store (dict[str, Any]): Heterogeneous resource registry containing the unique session ID.
         source_provider (BaseProvider): Source provider for the current migration.
         ocp_admin_client (DynamicClient): OpenShift admin client used to inspect worker Nodes.
 
     Returns:
-        dict[str, str] | None: Session-unique selector, or None when coverage is unconfigured, inapplicable to the
-            source provider, or no eligible worker exists.
+        dict[str, str] | None: Session-unique selector, or None when the source is not vSphere or no eligible worker
+            exists.
 
     Raises:
+        KeyError: If the required vSphere selector configuration is missing.
         ValueError: If the selector is invalid or already matches a Node.
     """
     request.cls.convertor_worker_nodes = None
-    configured_selector = class_plan_config.get("convertor_node_selector")
-    if configured_selector is None or source_provider.type != Provider.ProviderType.VSPHERE:
+    if source_provider.type != Provider.ProviderType.VSPHERE:
         return None
 
+    configured_selector = class_plan_config["convertor_node_selector"]
+    if not isinstance(configured_selector, dict):
+        raise ValueError("convertor_node_selector must be a mapping for vSphere selector coverage")
     if len(configured_selector) != 1:
         raise ValueError(f"convertor_node_selector must contain exactly one label, got {len(configured_selector)}")
 
     base_label_key, configured_value = next(iter(configured_selector.items()))
+    if not isinstance(base_label_key, str) or (configured_value is not None and not isinstance(configured_value, str)):
+        raise ValueError("convertor_node_selector must map a string label key to a string or None")
+
     session_uuid: str = fixture_store["session_uuid"]
     label_key = get_session_unique_label_key(label_key=base_label_key, session_uuid=session_uuid)
     label_value = session_uuid if configured_value is None else configured_value

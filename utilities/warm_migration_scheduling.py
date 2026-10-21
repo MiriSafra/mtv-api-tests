@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from kubernetes.dynamic import DynamicClient
 
 _IMPORTER_POD_LABEL_SELECTOR = "app=containerized-data-importer,cdi.kubevirt.io=importer"
-_CONVERSION_POD_LABEL_SELECTOR = "forklift.app=virt-v2v,plan-name={plan_name},plan-namespace={plan_namespace}"
+_CONVERSION_POD_LABEL_SELECTOR = "forklift.app=virt-v2v"
 _DISK_TRANSFER_STEP_NAME = "DiskTransfer"
 _POD_SCHEDULED_CONDITION_TYPE = "PodScheduled"
 _UNSCHEDULABLE_REASON = "Unschedulable"
@@ -52,6 +52,8 @@ def get_importer_pods(client: DynamicClient, namespace: str, migration_uid: str)
 
 def _get_pod_scheduling_details(pods: list[Pod]) -> list[dict[str, Any]]:
     """Collect scheduler-relevant Pod fields for failure diagnostics.
+
+    Pod instances are unstructured Kubernetes API payloads, so their field values remain dynamically typed.
 
     Args:
         pods (list[Pod]): Pods whose scheduling state should be reported.
@@ -107,6 +109,7 @@ def wait_for_importer_pods_pending(
     previous_pod_names: set[str] = set()
     expected_importer_count = 0
 
+    # Poll live Plan and Pod state until every DiskTransfer importer is stably unschedulable.
     def _all_importer_pods_unschedulable() -> list[Pod]:
         """Return every DiskTransfer importer pod after two stable unschedulable samples.
 
@@ -155,6 +158,7 @@ def wait_for_importer_pods_pending(
         previous_pod_names = current_pod_names
         return []
 
+    # Re-read current Pods when the readiness wait expires so the failure includes useful state.
     def _timeout_message() -> str:
         """Build diagnostics from importer pods observed when polling times out.
 
@@ -172,11 +176,13 @@ def wait_for_importer_pods_pending(
             f"{timeout}s; observed: {_get_pod_scheduling_details(pods=importer_pods)}"
         )
 
+    # Retry only incomplete readiness states; selector and placement assertions must fail immediately.
     try:
         for importer_pods in TimeoutSampler(
             wait_timeout=timeout,
             sleep=TIMEOUT_5SEC,
             func=_all_importer_pods_unschedulable,
+            exceptions_dict={},
         ):
             if importer_pods:
                 return importer_pods
@@ -214,6 +220,7 @@ def run_selector_recovery_migration(
         migration_uid=migration_uid,
         selector=selector,
     )
+    # Select a Ready worker that satisfies the importer Pods' other scheduling constraints.
     worker_node = _select_compatible_worker_node(
         client=plan.client,
         candidate_worker_node_names=candidate_worker_node_names,
@@ -222,6 +229,7 @@ def run_selector_recovery_migration(
     )
     initially_pending_names = {pod.name for pod in pending_importer_pods}
     label_applied_at = monotonic()
+    # Apply the selector label only for the recovery window, then restore the worker's prior labels.
     with ResourceEditor(patches={worker_node: {"metadata": {"labels": selector}}}):
 
         def _observe_recovery(status: str) -> None:
@@ -255,10 +263,7 @@ def run_selector_recovery_migration(
             conversion_pods = Pod.get(
                 client=plan.client,
                 namespace=plan.instance.spec.targetNamespace,
-                label_selector=_CONVERSION_POD_LABEL_SELECTOR.format(
-                    plan_name=plan.name,
-                    plan_namespace=plan.namespace,
-                ),
+                label_selector=f"{_CONVERSION_POD_LABEL_SELECTOR},migration={migration_uid}",
             )
             _record_pod_placements(
                 pods=list(conversion_pods),
@@ -272,6 +277,7 @@ def run_selector_recovery_migration(
 
         wait_for_migration_complate(plan=plan, on_status_poll=_observe_recovery)
 
+    # Verify placement samples after ResourceEditor restores the worker's original labels.
     _assert_observed_pod_names(
         observed_pod_names=importer_placements,
         pod_type="CDI importer",
@@ -394,7 +400,7 @@ def _is_unschedulable(status: dict[str, Any]) -> bool:
     """Check whether an importer pod is Pending because the scheduler cannot place it.
 
     Args:
-        status (dict[str, Any]): Current Pod status.
+        status (dict[str, Any]): Unstructured Kubernetes Pod status payload.
 
     Returns:
         bool: Whether the pod has PodScheduled=False with reason Unschedulable.
