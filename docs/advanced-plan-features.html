@@ -323,7 +323,7 @@ place. In this project you declare them under <code>tests_params</code> in <code
 <tr>
 <td>Plan-level options</td>
 <td>top level of a <code>tests_params</code> entry</td>
-<td><code>preserve_static_ips</code>, <code>xfs_compatibility</code>, <code>per_nic_network_map</code></td>
+<td><code>preserve_static_ips</code>, <code>xfs_compatibility</code>, <code>skip_guest_conversion</code></td>
 </tr>
 <tr>
 <td>Test-verification options</td>
@@ -422,6 +422,12 @@ keyword argument to <code>create_plan_resource()</code>. Preparation-only option
 <td><code>True</code></td>
 </tr>
 <tr>
+<td><code>skip_guest_conversion</code></td>
+<td>Skip the guest-conversion pipeline stages</td>
+<td>Plan CR field</td>
+<td><code>True</code></td>
+</tr>
+<tr>
 <td><code>rdm_as_lun</code></td>
 <td>Map RDM disks as SCSI LUN devices instead of virtio</td>
 <td>Plan CR field</td>
@@ -489,6 +495,16 @@ keyword argument to <code>create_plan_resource()</code>. Preparation-only option
 </tr>
 </tbody>
 </table></div>
+<h2 id="skip-guest-conversion">Skip guest conversion</h2>
+<p><code>skip_guest_conversion: True</code> sets <code>spec.skipGuestConversion</code> on the Plan. Forklift then omits the guest-conversion
+pipeline stages and does not create a <code>virt-v2v</code> pod for that Plan. On vSphere, the Plan default
+<code>useCompatibilityMode: true</code> still selects SATA disks, E1000E NICs, and USB input devices to help the guest boot.
+Setting <code>useCompatibilityMode: false</code> instead selects VirtIO devices, which requires VirtIO drivers to be installed
+in the guest already.</p>
+<p><code>tests/cold/test_cold_migration_skip_guest_conversion.py</code> covers this behavior as a separate vSphere Tier 1 cold
+migration. It follows the standard five-step flow, checks the Plan field, watches for Plan-labeled <code>virt-v2v</code> pods during
+migration, and validates the destination VM with the guest agent and SSH. It leaves <code>useCompatibilityMode</code> unset and
+checks the Plan API default of <code>true</code>. Existing default-mode tests continue to cover the regular conversion path.</p>
 <blockquote>
 <p><strong>Warning:</strong> <code>disable_drs_for_vms</code> raises <code>ValueError</code> for OVA providers and for any clone provider that is not
 <code>VMWareProvider</code>. <code>skip_clone</code> raises <code>ValueError</code> on providers whose <code>supports_skip_clone()</code> is <code>False</code> (RHV, whose
@@ -1386,6 +1402,7 @@ because a prime PVC may already be gone by the time a PostHook failure is raised
                     <div class="toc">
 <ul>
 <li><a href="#plan-level-options">Plan-level options</a></li>
+<li><a href="#skip-guest-conversion">Skip guest conversion</a></li>
 <li><a href="#vm-level-options">VM-level options</a><ul>
 <li><a href="#disk-provisioning-with-disk_type">Disk provisioning with disk_type</a></li>
 </ul>
