@@ -300,7 +300,8 @@ def _record_pod_placements(
 
     Args:
         pod_instances (list[ResourceInstance]): Pod snapshots to inspect.
-        observed_pod_names (set[str]): Names already validated during migration polling.
+        observed_pod_names (set[str]): Names already validated during migration polling; newly validated pod names
+            are added to this set in place.
         selector (dict[str, str]): Plan ConvertorNodeSelector.
         expected_node (str): Worker node selected for this migration.
         pod_type (str): Human-readable pod type for assertion messages.
