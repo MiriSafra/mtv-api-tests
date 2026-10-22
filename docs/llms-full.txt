@@ -2368,7 +2368,7 @@ Choose source VMs that match the scenario you plan to run. Do not point the suit
 - Python 3.12 or 3.13, and [`uv`](https://docs.astral.sh/uv/) for environment and test execution.
 - `oc` for cluster inspection, and for the `oc adm must-gather` call the data collector makes on failures.
 - Podman or Docker if you run the suite from the container image.
-- `virtctl` is not required. The suite downloads it from the cluster when it is missing from `PATH`.
+- `virtctl` is not required. The suite downloads it from the cluster; a `virtctl` installed on `PATH` is ignored so the binary always matches the cluster version.
 
 > **Note:** Jenkins and rootcoz are optional. Jenkins orchestration is used by the project team, but nothing in the
 > suite requires it. rootcoz is only used by the optional `--analyze-with-ai` flag; without it the suite logs a
@@ -3198,8 +3198,8 @@ The first step is to reuse an existing binary if one is already present:
 
 In practice, the `virtctl` flow works like this:
 
-- If `virtctl` is already on `PATH`, the suite reuses it
-- If not, it checks a shared cache under the system temp directory
+- A `virtctl` installed on `PATH` is **deliberately ignored** — the suite uses only the binary it downloads from the cluster, so the version always matches the cluster (issue #770)
+- It checks a shared cache under the system temp directory, keyed by cluster version
 - If there is no cached binary, it reads the cluster `ConsoleCLIDownload` named `virtctl-clidownloads-kubevirt-hyperconverged`
 - It picks the download URL that matches the local host OS and architecture
 - It downloads the archive, extracts the `virtctl` binary, makes it executable, and prepends its directory to `PATH`
@@ -3214,8 +3214,8 @@ parallel `pytest-xdist` workers do not all fetch the same binary at once.
 
 > **Warning:** Windows hosts are not covered by the current `virtctl` auto-detection logic. The downloader only maps `linux` and `darwin`.
 
-> **Tip:** If you want to force a fresh `virtctl` download, remove the `pytest-shared-virtctl/<cluster-version>` directory under your system temp directory, or place a different
-> `virtctl` earlier in `PATH`.
+> **Tip:** If you want to force a fresh `virtctl` download, remove the `pytest-shared-virtctl/<cluster-version>` directory under your system temp directory. A `virtctl` earlier in
+> `PATH` no longer overrides the downloaded binary — the cache directory is the only source.
 
 ## Optional but useful local tools
 
@@ -5160,6 +5160,16 @@ Plan CR is created.
 | `disable_drs_for_vms` | No | `True` disables vSphere DRS per VM after cloning. Not supported for OVA, and it requires a VMware clone provider. |
 | `skip_clone` | No | `True` skips the clone phase and uses the existing VMs directly. |
 | `per_nic_network_map` | No | `True` creates per-NIC network mappings, which allows duplicate source network entries in the NetworkMap. |
+| `network_map_overrides` | No | Requirement-based NetworkMap destinations: each entry matches a source network by its guest IP configuration. |
+
+`network_map_overrides` entries carry a `source_ip_config` requirement (`dhcp`, `static`, or
+`static-multiple`) and a `destination` mapping whose `type` is `pod`, `multus`, or `ignored`, plus an
+optional `network_ip_mode` (`preserve`, `dhcp`, or `none`). `network_ip_mode` is allowed on `pod` and
+`multus` destinations and rejected on `ignored` ones. Requirements are resolved against guest IP
+origins collected from the source VMs, so tests never hardcode network names;
+`resolve_network_map_overrides()` in `utilities/utils.py` performs the matching and raises when no
+unused source network satisfies a requirement. The overrides must also cover every source network
+of the VMs exactly once, otherwise NetworkMap generation raises `ValueError`.
 
 `pin_to_non_dedicated_host` needs `copyoffload.dedicated_migration_hosts` in the provider entry. Without it, the code raises a `ValueError`.
 
@@ -11058,6 +11068,7 @@ Most test authors never import these modules directly. They consume them through
 | `utilities/resources.py` | tracked creation of every OpenShift/MTV resource | `create_and_store_resource()`, `unregister_teardown_resource()`, `get_or_create_namespace()` |
 | `utilities/mtv_migration.py` | storage maps, network maps, plans, migrations | `get_storage_migration_map()`, `get_network_migration_map()`, `create_plan_resource()`, `execute_migration()`, `wait_for_migration_complate()` |
 | `utilities/post_migration.py` | end-to-end and focused VM validation | `check_vms()` plus the `check_*` / `verify_*` helpers |
+| `utilities/guest_ip_mode.py` | per-network guest IP mode verification on migrated VMs: `dhcp` (Windows and Linux) and `none` (Linux only); NetworkMap and DNS-data checks for overrides. `preserve` is verified by `check_static_ip_preservation()` | `verify_network_ip_modes()`, `verify_network_map_network_ip_mode()`, `verify_preserve_mode_dns_data()` |
 | `utilities/copyoffload_migration.py` | copy-offload orchestration and XCOPY verification | `execute_copyoffload_migration()`, `verify_xcopy_used()`, `verify_populator_throttling()`, `verify_dedicated_migration_host()` |
 | `utilities/deep_inspection.py` | Deep Inspection `Conversion` CR lifecycle | `create_conversion_resource()`, `wait_for_conversion_complete()`, `verify_di_results()` |
 | `utilities/shared_disk.py` | shared-disk verification on migrated VMs | `verify_shared_disk_data()`, `label_shared_disk_on_source_windows()`, `verify_shared_disk_data_windows()` |
@@ -11218,7 +11229,7 @@ SSH into migrated VMs through `virtctl` port-forward plus `python-rrmngmnt`, so 
 
 ### `utilities/virtctl.py`
 
-`download_virtctl_from_cluster()` fetches the matching `virtctl` binary and `add_to_path()` puts it on `PATH` for the session.
+`download_virtctl_from_cluster()` fetches the matching `virtctl` binary — a `virtctl` already on `PATH` is never reused, only a previously downloaded binary in the cluster-versioned cache — and `add_to_path()` puts the downloaded directory on `PATH` for the session.
 
 ### `utilities/vmware_guest_operations.py`
 
@@ -11617,15 +11628,18 @@ What this means in practice:
 - Deferral lets later methods contribute to the failed state before a single gather captures it. Collection precedes boundary cleanup, but resources explicitly deleted by earlier tests or fixtures may already be gone.
 - A standalone test attempts a gather into its worker-qualified node directory on each failing phase until one succeeds. A failed attempt is not queued for session-finish retry; an unexpected setup/call collector error stays in that item's typed stash until its teardown wrapper yields to pytest fixture finalizers, then propagates with the original traceback. Reporting that deferred error does not retry collection or mark success. A collector error first raised after teardown propagates immediately because finalizers have already run.
 - State lives on each worker's session object. Worker-qualified artifact names prevent workers from sharing a destination. At most one successful gather is recorded per class-plan instance per worker, including if scheduling later returns to that instance.
-- Both gather entry points report success. Missing collector resources and known command, filesystem, authentication, API and transport failures return `False`. Those operational failures stay pending for session-finish retry only for class-plan gathers; failed standalone attempts are not queued. Missing or invalid CSV deployments/containers/environment values, IDMS mirror entries/sources, channels or image digest separators raise `MustGatherImageError` and propagate instead of returning `False`. The class-plan pending entry remains queued after that error, so a later boundary or session-finish retry may attempt the gather again and propagate the metadata error again. The wrapper has no dedicated missing-API exception; only its `_get_api_version` discovery error for the three collector resource kinds is treated as operational. Malformed metadata structures and other programming or configuration errors also propagate with the class-plan entry left pending. `run_plan_must_gather()` takes the plan name and namespace; `run_must_gather()` is the full-collection path when no plan exists.
+- Both gather entry points report success. Missing collector resources and known command, filesystem, authentication, API and transport failures return `False`. Those operational failures stay pending for session-finish retry only for class-plan gathers; failed standalone attempts are not queued. Missing or invalid CSV deployments/containers/environment values, IDMS mirror entries/sources, channels or image digest separators raise `MustGatherImageError` and propagate instead of returning `False`. The class-plan pending entry remains queued after that error, so a later boundary or session-finish retry may attempt the gather again and propagate the metadata error again. The wrapper has no dedicated missing-API exception; only its `_get_api_version` discovery error for the Subscription and CSV kinds is treated as operational — IDMS API-unavailability falls back to the CSV image inside image resolution. Malformed metadata structures and other programming or configuration errors also propagate with the class-plan entry left pending. `run_plan_must_gather()` takes the plan name and namespace; `run_must_gather()` is the full-collection path when no plan exists.
 - A teardown failure on an earlier method is queued until the class-plan boundary when possible, so it does not prematurely mark the instance collected. A failure reported after boundary finalization gathers immediately only if no successful gather exists; it uses the bound pre-finalizer Plan context but necessarily sees post-finalizer cluster state. A successful pre-finalizer gather suppresses the repeat.
 - The modern `wrapper=True` teardown hook yields in `finally` before propagating collector errors. Fixture finalizer exceptions propagate naturally without an old-style pluggy teardown warning, with any collector error chained. A class-plan boundary collector error is stashed on the boundary item, raised once as that item's teardown error, and consumed by the exception-interaction hook instead of being retried there — a second raise inside that hook would abort the worker with an INTERNALERROR. The pending entry stays queued for the session-end flush, so a later boundary or session-finish retry may surface the error again. The session-finish wrapper runs the pending-gather flush, resource inventory writing, configured teardown and temporary-directory removal before it yields to pytest session hooks — the xdist worker reports completion from its own session-finish wrapper, and cleanup placed after that yield could be interrupted by worker shutdown mid-deletion — then runs the extra summary and enabled AI enrichment, which need other plugins' session-finish output. A cleanup error raised before the yield is stashed and re-raised after it, so later session-hook or cleanup failures take precedence with earlier errors chained, not silently discarded.
 - This guarantees independent cleanup attempts after collector, inventory or teardown errors, not successful cleanup. The existing inventory helper logs write failures. Session teardown failures are logged, trigger the configured full gather, and re-raise; if that gather raises too, its error propagates with the teardown error chained. Process crashes and forced termination remain outside this guarantee.
 - Session finish retries exceptional remaining pending gathers on a surviving worker using the bound context, but cannot promise pre-cleanup resources after interrupted hooks. If a boundary never bound the context, fallback reads the class attribute only for the still-active identity; otherwise it binds None and gathers fully rather than targeting another plan. It cannot recover in-memory pending state from a crashed worker. Artifacts are not guaranteed if retries fail.
 - If teardown leaves leftovers behind, an unscoped `run_must_gather()` runs at session finish as a fallback.
 
-> **Note:** The must-gather image is not hardcoded. The code resolves it from the installed MTV operator CSV and the ImageDigestMirrorSet, so the
-> gather matches the cluster’s installed MTV build.
+> **Note:** The must-gather image is not hardcoded. The code resolves it from the installed MTV operator CSV, so the
+> gather matches the cluster’s installed MTV build. The channel-derived `ImageDigestMirrorSet` is an optional
+> accelerator: when it is absent (GA/brew clusters) or its API is unavailable (older OpenShift), the fully-qualified
+> CSV `MUST_GATHER_IMAGE` is used verbatim — any cluster with direct registry access can pull it. Only its mirror
+> URL ever rewrites the registry prefix; the image itself is always the MTV one.
 >
 > **Note:** Only known operational collection failures are logged and returned as `False`. Unexpected programming and configuration errors remain visible.
 >

@@ -341,6 +341,11 @@
 <td><code>check_vms()</code> plus the <code>check_*</code> / <code>verify_*</code> helpers</td>
 </tr>
 <tr>
+<td><code>utilities/guest_ip_mode.py</code></td>
+<td>per-network guest IP mode verification on migrated VMs: <code>dhcp</code> (Windows and Linux) and <code>none</code> (Linux only); NetworkMap and DNS-data checks for overrides. <code>preserve</code> is verified by <code>check_static_ip_preservation()</code></td>
+<td><code>verify_network_ip_modes()</code>, <code>verify_network_map_network_ip_mode()</code>, <code>verify_preserve_mode_dns_data()</code></td>
+</tr>
+<tr>
 <td><code>utilities/copyoffload_migration.py</code></td>
 <td>copy-offload orchestration and XCOPY verification</td>
 <td><code>execute_copyoffload_migration()</code>, <code>verify_xcopy_used()</code>, <code>verify_populator_throttling()</code>, <code>verify_dedicated_migration_host()</code></td>
@@ -592,7 +597,7 @@ volume on the source through the VMware Guest Operations API before migration, a
 <p>SSH into migrated VMs through <code>virtctl</code> port-forward plus <code>python-rrmngmnt</code>, so it works when cluster nodes have no external IPs. <code>VMSSHConnection</code> wraps a connection,
 <code>SSHConnectionManager</code> manages one connection per VM for fixtures, <code>create_vm_ssh_connection()</code> builds a single connection, and <code>run_cmd_in_vm()</code> runs a command in the guest.</p>
 <h3 id="utilitiesvirtctlpy"><code>utilities/virtctl.py</code></h3>
-<p><code>download_virtctl_from_cluster()</code> fetches the matching <code>virtctl</code> binary and <code>add_to_path()</code> puts it on <code>PATH</code> for the session.</p>
+<p><code>download_virtctl_from_cluster()</code> fetches the matching <code>virtctl</code> binary — a <code>virtctl</code> already on <code>PATH</code> is never reused, only a previously downloaded binary in the cluster-versioned cache — and <code>add_to_path()</code> puts the downloaded directory on <code>PATH</code> for the session.</p>
 <h3 id="utilitiesvmware_guest_operationspy"><code>utilities/vmware_guest_operations.py</code></h3>
 <p>Commands executed inside vSphere guests via the Guest Operations API: <code>run_command_in_vmware_guest()</code>, <code>detect_vmware_ip_origins_via_guest_ops()</code>, <code>detect_guest_nic_names()</code>,
 <code>create_data_integrity_marker()</code>.</p>
