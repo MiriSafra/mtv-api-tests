@@ -9,8 +9,7 @@ from ocp_resources.node import Node
 from ocp_resources.plan import Plan
 from ocp_resources.pod import Pod
 from ocp_resources.resource import ResourceEditor
-from ocp_resources.utils.constants import TIMEOUT_2MINUTES, TIMEOUT_5SEC
-from timeout_sampler import TimeoutExpiredError, TimeoutSampler
+from ocp_resources.utils.constants import TIMEOUT_10MINUTES, TIMEOUT_2MINUTES
 
 from utilities.mtv_migration import get_migration_for_plan
 from utilities.worker_node_selection import (
@@ -81,7 +80,9 @@ class ConvertorPodPlacementObserver:
         self._importer_pod_names: set[str] = set()
         self._conversion_pod_names: set[str] = set()
         self._initial_importer_names: set[str] = set()
+        self._migration_observation_started_at: float | None = None
         self._first_importer_seen_at: float | None = None
+        self._worker_labeled_at: float | None = None
 
     def __call__(self, status: str) -> None:
         """Validate pod selectors and record pods scheduled during a status poll.
@@ -90,10 +91,17 @@ class ConvertorPodPlacementObserver:
             status (str): Current migration status.
 
         Raises:
-            AssertionError: If an importer or conversion pod omits the Plan selector or runs on another worker.
+            AssertionError: If importers do not appear or recover in time, or a pod omits the selector or runs on
+                another worker.
         """
         if self._on_status_poll is not None:
             self._on_status_poll(status)
+
+        if status == Plan.Status.FAILED:
+            return
+
+        if self._migration_observation_started_at is None:
+            self._migration_observation_started_at = monotonic()
 
         if self._migration_uid is None:
             migration = get_migration_for_plan(plan=self._plan)
@@ -110,6 +118,7 @@ class ConvertorPodPlacementObserver:
             namespace=namespace,
             label_selector=f"{_CONVERSION_POD_LABEL_SELECTOR},migration={self._migration_uid}",
         )
+        self._check_importer_readiness_deadline(importer_pods=importer_pods, status=status)
         if self._target.worker_node is None:
             self._recover_when_importer_unschedulable(importer_pods=importer_pods)
         self._record_placements(
@@ -122,6 +131,7 @@ class ConvertorPodPlacementObserver:
             observed_pod_names=self._conversion_pod_names,
             pod_type="virt-v2v conversion",
         )
+        self._check_recovery_scheduling_deadline()
 
     def assert_placements_observed(self) -> None:
         """Require unschedulable importer recovery and both pod types' placement to be observed.
@@ -145,7 +155,7 @@ class ConvertorPodPlacementObserver:
             importer_pods (list[ResourceInstance]): Current importer pod snapshots.
 
         Raises:
-            AssertionError: If no unschedulable importer appears in time or it schedules before label recovery.
+            AssertionError: If no importer becomes unschedulable in time or one schedules before label recovery.
         """
         for pod in importer_pods:
             self._assert_selector(pod=pod, pod_type="CDI importer")
@@ -158,16 +168,13 @@ class ConvertorPodPlacementObserver:
         if not importer_pods:
             return
 
-        if self._first_importer_seen_at is None:
-            self._first_importer_seen_at = monotonic()
-
         unschedulable_pods = [pod for pod in importer_pods if _is_unschedulable(pod=pod)]
         if unschedulable_pods:
             self._initial_importer_names.update(pod.metadata.name for pod in unschedulable_pods)
             self._label_compatible_worker(importer_pods=importer_pods)
-            self._wait_for_initial_importers_to_schedule()
             return
 
+        assert self._first_importer_seen_at is not None
         if monotonic() - self._first_importer_seen_at >= TIMEOUT_2MINUTES:
             raise AssertionError(
                 f"CDI importer pods appeared but none reported PodScheduled=Unschedulable within "
@@ -191,47 +198,51 @@ class ConvertorPodPlacementObserver:
             patches={worker_node: {"metadata": {"labels": self._target.selector}}}
         )
         self._target.label_editor.update(backup_resources=True)
+        self._worker_labeled_at = monotonic()
 
-    def _wait_for_initial_importers_to_schedule(self) -> None:
-        """Wait until every importer observed unschedulable has a node assignment.
+    def _check_importer_readiness_deadline(self, importer_pods: list[ResourceInstance], status: str) -> None:
+        """Fail if no importer appears within the migration readiness window.
+
+        Args:
+            importer_pods (list[ResourceInstance]): Current importer pod snapshots.
+            status (str): Current migration status.
 
         Raises:
-            AssertionError: If any initially unschedulable importer remains pending after labeling the worker.
+            AssertionError: If no importer pod is observed before the readiness deadline.
         """
+        if self._migration_observation_started_at is None or self._first_importer_seen_at is not None:
+            return
 
-        def _initial_importers_scheduled() -> bool:
-            """Refresh importer snapshots and record their recovered placement.
+        if importer_pods:
+            self._first_importer_seen_at = monotonic()
+            return
 
-            Returns:
-                bool: Whether all importer pods observed unschedulable now have a node assignment.
-            """
-            namespace = self._plan.instance.spec.targetNamespace
-            importer_pods = _get_pod_snapshots(
-                plan=self._plan,
-                namespace=namespace,
-                label_selector=f"{_IMPORTER_POD_LABEL_SELECTOR},migration={self._migration_uid}",
-            )
-            self._record_placements(
-                pods=importer_pods,
-                observed_pod_names=self._importer_pod_names,
-                pod_type="CDI importer",
-            )
-            return self._initial_importer_names <= self._importer_pod_names
-
-        try:
-            for sample in TimeoutSampler(
-                wait_timeout=TIMEOUT_2MINUTES,
-                sleep=TIMEOUT_5SEC,
-                func=_initial_importers_scheduled,
-            ):
-                if sample:
-                    return
-        except TimeoutExpiredError as err:
+        if monotonic() - self._migration_observation_started_at >= TIMEOUT_10MINUTES:
             raise AssertionError(
-                "Initially unschedulable CDI importer pod(s) did not schedule after applying "
-                f"ConvertorNodeSelector {self._target.selector} to worker "
-                f"'{self._target.worker_node.name if self._target.worker_node else '<unknown>'}'"
-            ) from err
+                f"No CDI importer pod was observed within {TIMEOUT_10MINUTES}s while Migration "
+                f"'{self._migration_uid}' had status '{status}'"
+            )
+
+    def _check_recovery_scheduling_deadline(self) -> None:
+        """Fail if initially unschedulable importer pods do not schedule after labeling a worker.
+
+        Raises:
+            AssertionError: If any initially unschedulable importer remains unassigned past the recovery deadline.
+        """
+        if (
+            self._worker_labeled_at is None
+            or self._initial_importer_names <= self._importer_pod_names
+            or monotonic() - self._worker_labeled_at < TIMEOUT_2MINUTES
+        ):
+            return
+
+        worker_name = self._target.worker_node.name if self._target.worker_node else "<unknown>"
+        missing_importers = sorted(self._initial_importer_names - self._importer_pod_names)
+        raise AssertionError(
+            f"Initially unschedulable CDI importer pod(s) {missing_importers} did not schedule within "
+            f"{TIMEOUT_2MINUTES}s after applying ConvertorNodeSelector {self._target.selector} to worker "
+            f"'{worker_name}'"
+        )
 
     def _record_placements(
         self,
