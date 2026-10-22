@@ -341,6 +341,11 @@
 <td><code>check_vms()</code> plus the <code>check_*</code> / <code>verify_*</code> helpers</td>
 </tr>
 <tr>
+<td><code>utilities/guest_ip_mode.py</code></td>
+<td>per-network guest IP mode verification on migrated VMs: <code>dhcp</code> (Windows and Linux) and <code>none</code> (Linux only); NetworkMap and DNS-data checks for overrides. <code>preserve</code> is verified by <code>check_static_ip_preservation()</code></td>
+<td><code>verify_network_ip_modes()</code>, <code>verify_network_map_network_ip_mode()</code>, <code>verify_preserve_mode_dns_data()</code></td>
+</tr>
+<tr>
 <td><code>utilities/copyoffload_migration.py</code></td>
 <td>copy-offload orchestration and XCOPY verification</td>
 <td><code>execute_copyoffload_migration()</code>, <code>verify_xcopy_used()</code>, <code>verify_populator_throttling()</code>, <code>verify_dedicated_migration_host()</code></td>
