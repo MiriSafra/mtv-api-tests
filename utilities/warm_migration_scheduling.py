@@ -11,6 +11,7 @@ from ocp_resources.pod import Pod
 from ocp_resources.resource import ResourceEditor
 from ocp_resources.utils.constants import TIMEOUT_10MINUTES, TIMEOUT_2MINUTES
 
+from exceptions.exceptions import MigrationNotFoundError
 from utilities.mtv_migration import get_migration_for_plan
 from utilities.worker_node_selection import (
     get_node_labels,
@@ -100,12 +101,15 @@ class ConvertorPodPlacementObserver:
         if status == Plan.Status.FAILED:
             return
 
+        if self._migration_uid is None:
+            try:
+                migration = get_migration_for_plan(plan=self._plan)
+            except MigrationNotFoundError:
+                return
+            self._migration_uid = migration.instance.metadata.uid
+
         if self._migration_observation_started_at is None:
             self._migration_observation_started_at = monotonic()
-
-        if self._migration_uid is None:
-            migration = get_migration_for_plan(plan=self._plan)
-            self._migration_uid = migration.instance.metadata.uid
 
         namespace = self._plan.instance.spec.targetNamespace
         importer_pods = _get_pod_snapshots(
