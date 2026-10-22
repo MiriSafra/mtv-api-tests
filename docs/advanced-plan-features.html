@@ -333,10 +333,11 @@ place. In this project you declare them under <code>tests_params</code> in <code
 </tbody>
 </table></div>
 <blockquote>
-<p><strong>Note:</strong> Plan-level keys are read with <code>plan.get(...)</code> in the preparation fixtures, but only a subset of them is forwarded as an explicit
-keyword argument to <code>create_plan_resource()</code>. Preparation-only options such as <code>inventory_timeout</code>, <code>clone_to_same_host</code>,
-<code>pin_to_non_dedicated_host</code> and <code>disable_drs_for_vms</code> are consumed while building the plan and never reach the MTV <code>Plan</code> CR, so passing them to
-<code>create_plan_resource()</code> raises <code>TypeError</code>. An option only affects the Plan when the test class passes it explicitly.</p>
+<p><strong>Note:</strong> Plan-level keys are read with <code>plan.get(...)</code> in the preparation fixtures. Plan fields supported directly by
+<code>create_plan_resource()</code> are forwarded as named arguments; additional Plan constructor fields can be passed through
+<code>additional_plan_options</code>. Preparation-only options such as <code>inventory_timeout</code>, <code>clone_to_same_host</code>,
+<code>pin_to_non_dedicated_host</code> and <code>disable_drs_for_vms</code> are consumed while building the plan and do not belong in
+<code>additional_plan_options</code>. Passing them as direct keywords to <code>create_plan_resource()</code> raises <code>TypeError</code>. An option only affects the Plan when the test class passes it explicitly.</p>
 </blockquote>
 <h2 id="plan-level-options">Plan-level options</h2>
 <div class="table-wrap"><table>
@@ -424,7 +425,7 @@ keyword argument to <code>create_plan_resource()</code>. Preparation-only option
 <tr>
 <td><code>skip_guest_conversion</code></td>
 <td>Skip the guest-conversion pipeline stages</td>
-<td>Plan CR field</td>
+<td>Plan CR field via <code>additional_plan_options</code></td>
 <td><code>True</code></td>
 </tr>
 <tr>
@@ -496,7 +497,7 @@ keyword argument to <code>create_plan_resource()</code>. Preparation-only option
 </tbody>
 </table></div>
 <h2 id="skip-guest-conversion">Skip guest conversion</h2>
-<p><code>skip_guest_conversion: True</code> sets <code>spec.skipGuestConversion</code> on the Plan. Forklift then omits the guest-conversion
+<p><code>additional_plan_options={"skip_guest_conversion": True}</code> sets <code>spec.skipGuestConversion</code> on the Plan. Forklift then omits the guest-conversion
 pipeline stages and does not create a <code>virt-v2v</code> pod for that Plan. On vSphere, the Plan default
 <code>useCompatibilityMode: true</code> still selects SATA disks, E1000E NICs, and USB input devices to help the guest boot.
 Setting <code>useCompatibilityMode: false</code> instead selects VirtIO devices, which requires VirtIO drivers to be installed

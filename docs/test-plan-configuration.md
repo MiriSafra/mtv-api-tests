@@ -588,7 +588,8 @@ Right before creating the MTV `Plan`, the tests add VM IDs from the Forklift inv
 
 `create_plan_resource()` accepts only the flags that map onto the Plan CR: `warm_migration`, `copyoffload`, `preserve_static_ips`, `pvc_name_template`,
 `pvc_name_template_use_generate_name`, `target_node_selector`, `target_labels`, `target_affinity`, `vm_target_namespace`, `migrate_shared_disks`, `target_power_state`,
-`enable_nested_virtualization`, `xfs_compatibility`, `run_preflight_inspection`, `rdm_as_lun`, and `skip_guest_conversion`. Everything else is consumed by fixtures or by post-migration checks.
+`enable_nested_virtualization`, `xfs_compatibility`, `run_preflight_inspection`, and `rdm_as_lun`. Additional Plan constructor fields can be passed through
+`additional_plan_options`; everything else is consumed by fixtures or by post-migration checks.
 
 ## Runtime Fields Added During Preparation
 

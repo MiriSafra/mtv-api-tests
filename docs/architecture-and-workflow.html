@@ -758,12 +758,12 @@ features become an MTV <code>Plan</code> custom resource.</p>
     <span class="n">xfs_compatibility</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">run_preflight_inspection</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">rdm_as_lun</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-    <span class="n">skip_guest_conversion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">additional_plan_options</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Plan</span><span class="p">:</span>
 </code></pre></div>
 
 <p>The excerpt above shows the signature only. The function itself carries a full docstring documenting every argument, the returned <code>Plan</code>, and the <code>ValueError</code>
-cases it raises — read <code>utilities/mtv_migration.py:216-240</code> for that contract.</p>
+cases it raises — read <code>utilities/mtv_migration.py:219-269</code> for that contract.</p>
 <p>The two <code>Any</code> types are deliberate, not laziness:</p>
 <ul>
 <li>
@@ -819,9 +819,6 @@ narrowly as its content allows.</p>
     <span class="k">if</span> <span class="n">rdm_as_lun</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">plan_kwargs</span><span class="p">[</span><span class="s2">"rdm_as_lun"</span><span class="p">]</span> <span class="o">=</span> <span class="n">rdm_as_lun</span>
 
-    <span class="k">if</span> <span class="n">skip_guest_conversion</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">plan_kwargs</span><span class="p">[</span><span class="s2">"skip_guest_conversion"</span><span class="p">]</span> <span class="o">=</span> <span class="n">skip_guest_conversion</span>
-
     <span class="c1"># Add copy-offload specific parameters if enabled</span>
     <span class="k">if</span> <span class="n">copyoffload</span><span class="p">:</span>
         <span class="c1"># Set PVC naming template for copy-offload migrations</span>
@@ -834,6 +831,15 @@ narrowly as its content allows.</p>
 
     <span class="k">if</span> <span class="n">run_preflight_inspection</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">plan_kwargs</span><span class="p">[</span><span class="s2">"run_preflight_inspection"</span><span class="p">]</span> <span class="o">=</span> <span class="n">run_preflight_inspection</span>
+
+    <span class="k">if</span> <span class="n">additional_plan_options</span><span class="p">:</span>
+        <span class="n">duplicate_options</span> <span class="o">=</span> <span class="n">plan_kwargs</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span> <span class="o">&amp;</span> <span class="n">additional_plan_options</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">duplicate_options</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"Additional Plan options cannot override options already set by create_plan_resource: "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">duplicate_options</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="n">plan_kwargs</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">additional_plan_options</span><span class="p">)</span>
 </code></pre></div>
 
 <p>A few things to notice:</p>
@@ -935,7 +941,7 @@ contains a wrong-passphrase class that expects the migration to fail.</p>
 <p><strong>XFS compatibility</strong> is covered by <code>tests/cold/test_cold_migration_xfs.py</code> and <code>tests/warm/test_warm_migration_xfs.py</code>. Both set
 <code>xfs_compatibility: True</code> on the Plan and then run <code>xfs_info</code> inside the migrated guest to validate the filesystem version.</p>
 <p><strong>Skip guest conversion</strong> is covered by <code>tests/cold/test_cold_migration_skip_guest_conversion.py</code>. The test sets
-<code>skip_guest_conversion: True</code>, verifies no Plan-labeled <code>virt-v2v</code> pod appears during migration, and checks that the
+<code>skip_guest_conversion: True</code> through <code>additional_plan_options</code>, verifies no Plan-labeled <code>virt-v2v</code> pod appears during migration, and checks that the
 destination guest boots and accepts SSH connections.</p>
 <p><strong>Shared disks</strong> are covered by <code>tests/shared_disk/</code>. The Linux test mounts, writes, and reads a marker from both migrated VMs. The
 Windows test first labels the shared NTFS volume on the source VM through the VMware Guest Operations API, then verifies
