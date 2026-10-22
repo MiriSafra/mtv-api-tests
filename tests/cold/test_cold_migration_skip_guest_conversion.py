@@ -205,7 +205,7 @@ class TestColdMigrationSkipGuestConversion:
             target_namespace=target_namespace,
             target_power_state=prepared_plan["target_power_state"],
             warm_migration=prepared_plan["warm_migration"],
-            skip_guest_conversion=prepared_plan["skip_guest_conversion"],
+            additional_plan_options={"skip_guest_conversion": prepared_plan["skip_guest_conversion"]},
         )
         assert self.__class__.plan_resource, "Plan creation failed"
         assert self.__class__.plan_resource.instance.spec.skipGuestConversion is True

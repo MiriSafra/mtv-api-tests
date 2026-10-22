@@ -397,7 +397,7 @@ inventory IDs into the VM list. The Plan is not built from names alone.
 `utilities/mtv_migration.py:create_plan_resource()` is the assembly point where providers, maps, VM IDs, and optional plan
 features become an MTV `Plan` custom resource.
 
-```187:216:utilities/mtv_migration.py
+```187:218:utilities/mtv_migration.py
 def create_plan_resource(
     ocp_admin_client: DynamicClient,
     fixture_store: dict[str, Any],
@@ -427,12 +427,12 @@ def create_plan_resource(
     xfs_compatibility: bool = False,
     run_preflight_inspection: bool | None = None,
     rdm_as_lun: bool | None = None,
-    skip_guest_conversion: bool | None = None,
+    additional_plan_options: dict[str, Any] | None = None,
 ) -> Plan:
 ```
 
 The excerpt above shows the signature only. The function itself carries a full docstring documenting every argument, the returned `Plan`, and the `ValueError`
-cases it raises — read `utilities/mtv_migration.py:216-240` for that contract.
+cases it raises — read `utilities/mtv_migration.py:219-269` for that contract.
 
 The two `Any` types are deliberate, not laziness:
 
@@ -470,7 +470,7 @@ narrowly as its content allows.
 
 Optional features are only added when requested, so an unset flag never lands on the `Plan` CR:
 
-```307:341:utilities/mtv_migration.py
+```307:358:utilities/mtv_migration.py
     if target_node_selector:
         plan_kwargs["target_node_selector"] = target_node_selector
 
@@ -489,9 +489,6 @@ Optional features are only added when requested, so an unset flag never lands on
     if rdm_as_lun is not None:
         plan_kwargs["rdm_as_lun"] = rdm_as_lun
 
-    if skip_guest_conversion is not None:
-        plan_kwargs["skip_guest_conversion"] = skip_guest_conversion
-
     # Add copy-offload specific parameters if enabled
     if copyoffload:
         # Set PVC naming template for copy-offload migrations
@@ -504,6 +501,15 @@ Optional features are only added when requested, so an unset flag never lands on
 
     if run_preflight_inspection is not None:
         plan_kwargs["run_preflight_inspection"] = run_preflight_inspection
+
+    if additional_plan_options:
+        duplicate_options = plan_kwargs.keys() & additional_plan_options.keys()
+        if duplicate_options:
+            raise ValueError(
+                f"Additional Plan options cannot override options already set by create_plan_resource: "
+                f"{sorted(duplicate_options)}"
+            )
+        plan_kwargs.update(additional_plan_options)
 ```
 
 A few things to notice:
@@ -612,7 +618,7 @@ contains a wrong-passphrase class that expects the migration to fail.
 `xfs_compatibility: True` on the Plan and then run `xfs_info` inside the migrated guest to validate the filesystem version.
 
 **Skip guest conversion** is covered by `tests/cold/test_cold_migration_skip_guest_conversion.py`. The test sets
-`skip_guest_conversion: True`, verifies no Plan-labeled `virt-v2v` pod appears during migration, and checks that the
+`skip_guest_conversion: True` through `additional_plan_options`, verifies no Plan-labeled `virt-v2v` pod appears during migration, and checks that the
 destination guest boots and accepts SSH connections.
 
 **Shared disks** are covered by `tests/shared_disk/`. The Linux test mounts, writes, and reads a marker from both migrated VMs. The

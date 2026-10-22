@@ -214,7 +214,7 @@ def create_plan_resource(
     run_preflight_inspection: bool | None = None,
     rdm_as_lun: bool | None = None,
     pre_copy_source_disks: bool = False,
-    skip_guest_conversion: bool | None = None,
+    additional_plan_options: dict[str, Any] | None = None,
 ) -> Plan:
     """Create MTV Plan CR resource.
 
@@ -257,13 +257,15 @@ def create_plan_resource(
             on the target VM. Only applies to vSphere source providers. Defaults to None.
         pre_copy_source_disks (bool): Enable two-phase Hyper-V disk transfer (VHDX to raw via
             qemu-img, then in-place virt-v2v). Only applies to Hyper-V migrations. Defaults to False.
-        skip_guest_conversion (bool | None): Whether to skip guest conversion. Defaults to None.
+        additional_plan_options (dict[str, Any] | None): Additional Plan constructor options not already handled by
+            this helper. Defaults to None.
 
     Returns:
         Plan: The created Plan CR resource.
 
     Raises:
-        ValueError: If source_provider or destination_provider ocp_resource is not set.
+        ValueError: If either provider resource is not set or additional_plan_options conflicts with options already
+            set by this helper.
         TimeoutExpiredError: If Plan fails to reach Ready status within timeout.
     """
     if not source_provider.ocp_resource:
@@ -333,9 +335,6 @@ def create_plan_resource(
     if pre_copy_source_disks:
         plan_kwargs["pre_copy_source_disks"] = pre_copy_source_disks
 
-    if skip_guest_conversion is not None:
-        plan_kwargs["skip_guest_conversion"] = skip_guest_conversion
-
     # Add copy-offload specific parameters if enabled
     if copyoffload:
         # Set PVC naming template for copy-offload migrations
@@ -348,6 +347,15 @@ def create_plan_resource(
 
     if run_preflight_inspection is not None:
         plan_kwargs["run_preflight_inspection"] = run_preflight_inspection
+
+    if additional_plan_options:
+        duplicate_options = plan_kwargs.keys() & additional_plan_options.keys()
+        if duplicate_options:
+            raise ValueError(
+                f"Additional Plan options cannot override options already set by create_plan_resource: "
+                f"{sorted(duplicate_options)}"
+            )
+        plan_kwargs.update(additional_plan_options)
 
     plan = create_and_store_resource(**plan_kwargs)
 
