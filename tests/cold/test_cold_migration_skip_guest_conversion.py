@@ -16,6 +16,17 @@ from utilities.mtv_migration import (
 from utilities.post_migration import check_vms
 from utilities.utils import populate_vm_ids
 
+# These fixture contracts intentionally use Any because prepared_plan is composed from
+# scenario-specific configuration and provider-derived VM data.
+PreparedPlan = dict[str, Any]
+
+# pytest-harvest stores metadata and cleanup records for different resource types.
+FixtureStore = dict[str, Any]
+
+# Provider configuration keys differ by provider type and providers_schema.json.
+ProviderData = dict[str, Any]
+
+
 if TYPE_CHECKING:
     from kubernetes.dynamic import DynamicClient
 
@@ -84,8 +95,8 @@ class TestColdMigrationSkipGuestConversion:
 
     def test_create_storagemap(
         self,
-        prepared_plan: dict[str, Any],
-        fixture_store: dict[str, Any],
+        prepared_plan: PreparedPlan,
+        fixture_store: FixtureStore,
         ocp_admin_client: "DynamicClient",
         source_provider: "BaseProvider",
         destination_provider: "OCPProvider",
@@ -116,12 +127,12 @@ class TestColdMigrationSkipGuestConversion:
             target_namespace=target_namespace,
             vms=vms,
         )
-        assert self.storage_map, "StorageMap creation failed"
+        assert self.__class__.storage_map, "StorageMap creation failed"
 
     def test_create_networkmap(
         self,
-        prepared_plan: dict[str, Any],
-        fixture_store: dict[str, Any],
+        prepared_plan: PreparedPlan,
+        fixture_store: FixtureStore,
         ocp_admin_client: "DynamicClient",
         source_provider: "BaseProvider",
         destination_provider: "OCPProvider",
@@ -155,12 +166,12 @@ class TestColdMigrationSkipGuestConversion:
             multus_network_name=multus_network_name,
             vms=vms,
         )
-        assert self.network_map, "NetworkMap creation failed"
+        assert self.__class__.network_map, "NetworkMap creation failed"
 
     def test_create_plan(
         self,
-        prepared_plan: dict[str, Any],
-        fixture_store: dict[str, Any],
+        prepared_plan: PreparedPlan,
+        fixture_store: FixtureStore,
         ocp_admin_client: "DynamicClient",
         source_provider: "BaseProvider",
         destination_provider: "OCPProvider",
@@ -188,21 +199,21 @@ class TestColdMigrationSkipGuestConversion:
             fixture_store=fixture_store,
             source_provider=source_provider,
             destination_provider=destination_provider,
-            storage_map=self.storage_map,
-            network_map=self.network_map,
+            storage_map=self.__class__.storage_map,
+            network_map=self.__class__.network_map,
             virtual_machines_list=prepared_plan["virtual_machines"],
             target_namespace=target_namespace,
             target_power_state=prepared_plan["target_power_state"],
             warm_migration=prepared_plan["warm_migration"],
             skip_guest_conversion=prepared_plan["skip_guest_conversion"],
         )
-        assert self.plan_resource, "Plan creation failed"
-        assert self.plan_resource.instance.spec.skipGuestConversion is True
-        assert self.plan_resource.instance.spec.useCompatibilityMode is True
+        assert self.__class__.plan_resource, "Plan creation failed"
+        assert self.__class__.plan_resource.instance.spec.skipGuestConversion is True
+        assert self.__class__.plan_resource.instance.spec.useCompatibilityMode is True
 
     def test_migrate_vms(
         self,
-        fixture_store: dict[str, Any],
+        fixture_store: FixtureStore,
         ocp_admin_client: "DynamicClient",
         target_namespace: str,
     ) -> None:
@@ -217,8 +228,8 @@ class TestColdMigrationSkipGuestConversion:
             AssertionError: If a guest-conversion pod is present at a status poll.
             MigrationPlanExecError: If the migration fails or times out.
         """
-        plan_uid = self.plan_resource.instance.metadata.uid
-        plan_namespace = self.plan_resource.namespace
+        plan_uid = self.__class__.plan_resource.instance.metadata.uid
+        plan_namespace = self.__class__.plan_resource.namespace
 
         def assert_no_guest_conversion_pod(_status: str) -> None:
             """Assert this Plan has no guest-conversion pod at the current poll.
@@ -237,24 +248,24 @@ class TestColdMigrationSkipGuestConversion:
                 )
             )
             assert not conversion_pods, (
-                f"Guest conversion pod(s) present at a migration status poll for Plan '{self.plan_resource.name}': "
+                f"Guest conversion pod(s) present at a migration status poll for Plan '{self.__class__.plan_resource.name}': "
                 f"{[pod.name for pod in conversion_pods]}"
             )
 
         execute_migration(
             ocp_admin_client=ocp_admin_client,
             fixture_store=fixture_store,
-            plan=self.plan_resource,
+            plan=self.__class__.plan_resource,
             target_namespace=target_namespace,
             on_status_poll=assert_no_guest_conversion_pod,
         )
 
     def test_check_vms(
         self,
-        prepared_plan: dict[str, Any],
+        prepared_plan: PreparedPlan,
         source_provider: "BaseProvider",
         destination_provider: "OCPProvider",
-        source_provider_data: dict[str, Any],
+        source_provider_data: ProviderData,
         source_vms_namespace: str,
         source_provider_inventory: "ForkliftInventory",
         vm_ssh_connections: "SSHConnectionManager",
@@ -274,8 +285,8 @@ class TestColdMigrationSkipGuestConversion:
             plan=prepared_plan,
             source_provider=source_provider,
             destination_provider=destination_provider,
-            network_map_resource=self.network_map,
-            storage_map_resource=self.storage_map,
+            network_map_resource=self.__class__.network_map,
+            storage_map_resource=self.__class__.storage_map,
             source_provider_data=source_provider_data,
             source_vms_namespace=source_vms_namespace,
             source_provider_inventory=source_provider_inventory,
