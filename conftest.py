@@ -456,11 +456,6 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> Generator[
         try:
             reporter = session.config.pluginmanager.get_plugin("terminalreporter")
             reporter.summary_stats()
-            selector_coverage_notes = _session_store.get("selector_coverage_not_run", [])
-            if selector_coverage_notes:
-                reporter.write_sep("=", "ConvertorNodeSelector coverage not exercised")
-                for note in selector_coverage_notes:
-                    reporter.write_line(note)
         finally:
             if session.config.getoption("analyze_with_ai"):
                 if exitstatus == 0:
