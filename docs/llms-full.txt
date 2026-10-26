@@ -1545,6 +1545,8 @@ features become an MTV `Plan` custom resource.
         xfs_compatibility: bool = False,
         run_preflight_inspection: bool | None = None,
         rdm_as_lun: bool | None = None,
+        pre_copy_source_disks: bool = False,
+        convertor_node_selector: dict[str, str] | None = None,
         additional_plan_options: dict[str, Any] | None = None,
     ) -> Plan:
 ```
