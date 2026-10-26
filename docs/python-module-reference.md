@@ -183,7 +183,9 @@ SSH into migrated VMs through `virtctl` port-forward plus `python-rrmngmnt`, so 
 ### `utilities/vmware_guest_operations.py`
 
 Commands executed inside vSphere guests via the Guest Operations API: `run_command_in_vmware_guest()`, `detect_vmware_ip_origins_via_guest_ops()`, `detect_guest_nic_names()`,
-`create_data_integrity_marker()`.
+`create_data_integrity_marker()`, and `find_alternate_linux_os_root()`. The latter requires a Linux guest and root Guest Operations credentials, reads the active OS identity and `lsblk` device inventory in separate Guest Operations calls, and inspects supported ext/XFS single-letter `/dev/sd` partitions read-only. Partition inspection and `umount` use guest-side timeouts; an EXIT trap also attempts to remove the temporary mount directory. It uses `lsblk --pairs`, available in util-linux 2.23.2; JSON output was added in util-linux 2.27. The helper returns a `LinuxOSRoot` with the unique alternate device path, OS ID, and version. The current Forklift vSphere mapper does not translate NVMe or LVM paths to the corresponding disk index.
+
+`run_command_in_vmware_guest()` terminates a Guest Operations process that exceeds its timeout. Callers may provide a timeout cleanup command for guest resources that need explicit cleanup after process termination.
 
 ### `utilities/worker_node_selection.py`
 

@@ -120,6 +120,7 @@ Each item in `virtual_machines` describes one source VM or template.
 | `snapshots` | No | Number of source snapshots to create before migration. |
 | `target_datastore_id` | No | VMware target datastore for the cloned VM. |
 | `target_esxi_host` | No | Pin the clone to a specific ESXi host. Set automatically by `clone_to_same_host` and `pin_to_non_dedicated_host` unless you set it yourself. |
+| `rootDisk` | No | Root disk path for this VM, passed through as the Plan API field `spec.vms[].rootDisk` (for example, `/dev/sdb2`). Use the API spelling and casing. Tests may set it on `prepared_plan` at runtime after source inspection when the path is discovered dynamically. |
 | `luks` | No | `True` when the VM has a LUKS-encrypted disk. Consumed by the LUKS fixture and replaced with a Secret reference. |
 | `luks_passphrase` | No | Per-VM LUKS passphrase. Overrides the provider-level `luks_passphrase`. |
 | `migrate_shared_disks` | No | `True` for the owner VM in a shared-disk pair. Overrides the plan-level value for that VM. |

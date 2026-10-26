@@ -985,6 +985,17 @@ tests_params: dict = {
             "expected_output": "crc=0",
         },
     },
+    "test_cold_migration_root_disk": {
+        "virtual_machines": [
+            {
+                "name": "mtv-tests-rhel-2os",
+                "source_vm_power": "on",
+                "guest_agent": True,
+            },
+        ],
+        "warm_migration": False,
+        "target_power_state": "on",
+    },
     "test_plan_archive_pvc_cleanup": {
         "virtual_machines": [
             {"name": "mtv-tests-rhel8", "source_vm_power": "on", "guest_agent": True},
