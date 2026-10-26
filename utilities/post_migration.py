@@ -1845,6 +1845,47 @@ def check_ssl_configuration(source_provider: BaseProvider) -> None:
     LOGGER.info(f"SSL configuration verified: insecureSkipVerify='{actual_value}' matches config")
 
 
+def get_vm_command_output(
+    vm: dict[str, Any],
+    vm_ssh_connections: SSHConnectionManager,
+    source_vm_info: dict[str, Any],
+    source_provider_data: dict[str, Any],
+    command: list[str],
+) -> str:
+    """Execute a command on a migrated VM via SSH and return its stdout.
+
+    Args:
+        vm: VM dict from plan["virtual_machines"]
+        vm_ssh_connections: SSH connections fixture manager
+        source_vm_info: Source VM information from source_provider.vm_dict()
+        source_provider_data: Provider configuration from .providers.json
+        command: Command to execute
+
+    Returns:
+        Command stdout.
+
+    Raises:
+        ValueError: If VM is Windows (Linux-only feature)
+    """
+    vm_name = vm["name"]
+    destination_vm_name = resolve_destination_vm_name(vm)
+
+    if source_vm_info.get("win_os", False):
+        raise ValueError(
+            f"Command output verification is only supported on Linux guests. VM '{vm_name}' is a Windows guest."
+        )
+
+    LOGGER.info(f"Running command on VM {destination_vm_name}: {' '.join(command)}")
+
+    ssh_username, ssh_password = get_ssh_credentials_from_provider_config(source_provider_data, source_vm_info)
+    ssh_conn = vm_ssh_connections.create(vm_name=destination_vm_name, username=ssh_username, password=ssh_password)
+
+    with ssh_conn:
+        stdout = run_cmd_in_vm(ssh_conn, command, f"Command on VM {destination_vm_name}")
+        LOGGER.info(f"Command output:\n{stdout}")
+        return stdout
+
+
 def check_vm_command_output(
     vm: dict[str, Any],
     vm_ssh_connections: SSHConnectionManager,
@@ -1867,29 +1908,21 @@ def check_vm_command_output(
         ValueError: If VM is Windows (Linux-only feature)
         AssertionError: If expected_output not found in command stdout
     """
-    vm_name = vm["name"]
     destination_vm_name = resolve_destination_vm_name(vm)
+    stdout = get_vm_command_output(
+        vm=vm,
+        vm_ssh_connections=vm_ssh_connections,
+        source_vm_info=source_vm_info,
+        source_provider_data=source_provider_data,
+        command=command,
+    )
 
-    if source_vm_info.get("win_os", False):
-        raise ValueError(
-            f"Command output verification is only supported on Linux guests. VM '{vm_name}' is a Windows guest."
+    if expected_output not in stdout:
+        raise AssertionError(
+            f"Expected '{expected_output}' not found in command output on VM {destination_vm_name}. "
+            f"Command: {' '.join(command)}\n"
+            f"Output: {stdout}"
         )
-
-    LOGGER.info(f"Running command on VM {destination_vm_name}: {' '.join(command)}")
-
-    ssh_username, ssh_password = get_ssh_credentials_from_provider_config(source_provider_data, source_vm_info)
-    ssh_conn = vm_ssh_connections.create(vm_name=destination_vm_name, username=ssh_username, password=ssh_password)
-
-    with ssh_conn:
-        stdout = run_cmd_in_vm(ssh_conn, command, f"Command on VM {destination_vm_name}")
-        LOGGER.info(f"Command output:\n{stdout}")
-
-        if expected_output not in stdout:
-            raise AssertionError(
-                f"Expected '{expected_output}' not found in command output on VM {destination_vm_name}. "
-                f"Command: {' '.join(command)}\n"
-                f"Output: {stdout}"
-            )
 
 
 def _verify_warm_vsphere_di(

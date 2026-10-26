@@ -5346,20 +5346,22 @@ The fixture copies the selected config, resolves a mapping-form `pvc_name_templa
 
 Unless `skip_clone` is set, each VM is cloned, the plan-level placement flags are applied, and shared disks are relinked between clones:
 
-```1272:1291:conftest.py
-            skip_clone = plan.get("skip_clone", False)
-
+```1720:1745:conftest.py
             if skip_clone:
                 if not source_provider.supports_skip_clone():
                     raise ValueError(
                         f"skip_clone=True is not supported for provider type '{source_provider.type}'; "
                         "VMs must be cloned from templates."
                     )
-                skip_clone_incompatible = ["disable_drs_for_vms", "clone_to_same_host"]
-                is_esxi_vsphere = (
-                    source_provider.type == Provider.ProviderType.VSPHERE
-                    and source_provider_data.get("endpoint_type") == VSPHERE_ESXI_ENDPOINT_TYPE
-                )
+                skip_clone_incompatible = [
+                    "disable_drs_for_vms",
+                    "clone_to_same_host",
+                    "pin_to_non_dedicated_host",
+                    "pin_first_vm_to_dedicated_host",
+                ]
+                # Only ESXi provider supports IPv6 currently, but it doesn't support VM cloning
+                # Allow skip_clone: true to work with ESXi provider
+                is_esxi_vsphere = is_direct_esxi_connection(source_provider_data)
                 if not (is_esxi_vsphere or source_provider.type == Provider.ProviderType.HYPERV):
                     skip_clone_incompatible.append("preserve_static_ips")
                 conflicting = [flag for flag in skip_clone_incompatible if plan.get(flag)]

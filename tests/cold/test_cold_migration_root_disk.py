@@ -12,9 +12,9 @@ from utilities.mtv_migration import (
     get_network_migration_map,
     get_storage_migration_map,
 )
-from utilities.post_migration import check_vm_command_output, check_vms
+from utilities.post_migration import check_vms, get_vm_command_output
 from utilities.utils import populate_vm_ids
-from utilities.vmware_guest_operations import LinuxOSRoot, find_alternate_linux_os_root
+from utilities.vmware_guest_operations import LinuxOSRoot, find_alternate_linux_os_root, parse_linux_os_release
 
 if TYPE_CHECKING:
     from kubernetes.dynamic import DynamicClient
@@ -264,22 +264,20 @@ class TestColdMigrationRootDiskSelection:
             # argv quoting), which does not protect "$". A quoted multi-word command referencing
             # a shell variable gets that variable expanded by the login shell before the inner
             # "bash -c" ever runs, so "$ID"/"$VERSION_ID" always resolve empty. Read the raw file
-            # instead of relying on remote variable expansion.
-            check_vm_command_output(
+            # and parse it instead of relying on remote variable expansion or a loose substring
+            # match, which could accept an unrelated field (e.g. BUILD_ID="rhel") or reject a
+            # correct OS whose os-release uses unquoted/single-quoted values.
+            raw_os_release = get_vm_command_output(
                 vm=vm,
                 vm_ssh_connections=vm_ssh_connections,
                 source_vm_info=source_vm_info,
                 source_provider_data=source_provider_data,
                 command=["cat", "/etc/os-release"],
-                expected_output=f'ID="{expected_os["os_id"]}"',
             )
-            check_vm_command_output(
-                vm=vm,
-                vm_ssh_connections=vm_ssh_connections,
-                source_vm_info=source_vm_info,
-                source_provider_data=source_provider_data,
-                command=["cat", "/etc/os-release"],
-                expected_output=f'VERSION_ID="{expected_os["version_id"]}"',
+            actual_os = parse_linux_os_release(raw_os_release)
+            assert (actual_os["os_id"], actual_os["version_id"]) == (expected_os["os_id"], expected_os["version_id"]), (
+                f"Migrated VM {vm['name']} booted {actual_os['os_id']} {actual_os['version_id']}, "
+                f"expected the discovered alternate root {expected_os['os_id']} {expected_os['version_id']}"
             )
 
     def test_check_vms(

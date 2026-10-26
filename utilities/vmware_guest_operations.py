@@ -46,7 +46,7 @@ _READ_ONLY_MOUNT_OPTIONS = {
     "ext2": "ro",
     "ext3": "ro,noload",
     "ext4": "ro,noload",
-    "xfs": "ro,norecovery",
+    "xfs": "ro,norecovery,nouuid",
 }
 # Forklift's vSphere rootDisk mapper derives the disk index from one letter after /dev/sd.
 _SUPPORTED_ROOT_DEVICE = re.compile(r"^/dev/sd[a-z][0-9]+$")
@@ -69,7 +69,7 @@ class LinuxBlockDevice(TypedDict):
     mountpoint: str | None
 
 
-def _parse_linux_os_release(output: str) -> dict[str, str]:
+def parse_linux_os_release(output: str) -> dict[str, str]:
     """Extract the Linux distribution ID and version from os-release content.
 
     Args:
@@ -183,7 +183,7 @@ def _get_linux_root_inventory(
         raise ValueError(f"Root OS discovery requires root Guest Operations credentials for VM {vm.name}")
 
     active_root_device = guest_detail_lines[1]
-    active_os = _parse_linux_os_release("\n".join(guest_detail_lines[2:]))
+    active_os = parse_linux_os_release("\n".join(guest_detail_lines[2:]))
     if not _SUPPORTED_ROOT_DEVICE.fullmatch(active_root_device):
         raise ValueError(
             f"Unsupported active root device {active_root_device!r} for VM {vm.name}; "
@@ -235,15 +235,14 @@ def _read_linux_os_release_from_partition(
         mount_options = _READ_ONLY_MOUNT_OPTIONS[filesystem]
         mount_dir = f"/tmp/mtv-root-inspection-{uuid4().hex}"
         quoted_mount_dir = shlex.quote(mount_dir)
-        # util-linux's `mountpoint -q` exits 1 when the path is simply not mounted (expected,
-        # not an error here) but 32 when the check itself failed (e.g. bad path/permissions),
-        # which must still be reported as a cleanup failure.
+        # `mountpoint -q`'s exit code for "not mounted" differs across util-linux versions
+        # (e.g. 1 on this guest's RHEL 8), so any non-zero result means there is simply
+        # nothing to unmount here rather than a cleanup failure.
         cleanup_script = (
             "cleanup_status=0; "
             f'if {_GUEST_CLEANUP_COMMAND_TIMEOUT} mountpoint -q "$1"; then '
             f'{_GUEST_MOUNT_CLEANUP_TIMEOUT_COMMAND} umount "$1" || cleanup_status=$?; '
-            "else mountpoint_status=$?; "
-            'if [ "$mountpoint_status" -ne 32 ]; then cleanup_status=$mountpoint_status; fi; fi; '
+            "fi; "
             f'if [ -d "$1" ]; then {_GUEST_CLEANUP_COMMAND_TIMEOUT} rmdir "$1" || cleanup_status=$?; fi; '
             'exit "$cleanup_status"'
         )
@@ -274,7 +273,7 @@ def _read_linux_os_release_from_partition(
         vcenter_host=vcenter_host,
         timeout_cleanup_command=timeout_cleanup_command,
     ).strip()
-    return None if output == "__NO_OS_RELEASE__" else _parse_linux_os_release(output)
+    return None if output == "__NO_OS_RELEASE__" else parse_linux_os_release(output)
 
 
 def _find_alternate_linux_os_roots(
